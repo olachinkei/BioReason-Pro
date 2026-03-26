@@ -149,14 +149,13 @@ class ProteinLLMModel(nn.Module):
                 unified_go_encoder=unified_go_encoder,
             )
 
-            # Create projection layer for GO embeddings to text space
-            self.go_projection = nn.Sequential(
-                nn.Linear(go_embedding_dim, self.text_hidden_size),
-                nn.GELU(),
-                nn.Linear(self.text_hidden_size, self.text_hidden_size),
-            ).to(device=self.device, dtype=self.dtype)
-        else:
-            self.go_projection = None
+        # Always create projection layer — weights loaded from go_projection.pt later.
+        # Needed even without encoder when using cached go_embedding.pt.
+        self.go_projection = nn.Sequential(
+            nn.Linear(go_embedding_dim, self.text_hidden_size),
+            nn.GELU(),
+            nn.Linear(self.text_hidden_size, self.text_hidden_size),
+        ).to(device=self.device, dtype=self.dtype)
 
         # Create projection layer to map protein embeddings to text model's embedding space
         self.protein_projection = nn.Sequential(
@@ -247,7 +246,7 @@ class ProteinLLMModel(nn.Module):
                 print(f"⚠️ Error loading local protein model: {e} (keeping original)")
 
         # ===== GO encoder + projection =====
-        if self.go_encoder is not None and self.go_projection is not None:
+        if self.go_encoder is not None:
             # Load GO encoder weights
             go_encoder_path = os.path.join(llm_dir, "go_encoder.pt")
             if os.path.exists(go_encoder_path):
@@ -258,6 +257,7 @@ class ProteinLLMModel(nn.Module):
             else:
                 print(f"⚠️ GO encoder weights not found at {go_encoder_path}")
 
+        if self.go_projection is not None:
             # Load GO projection weights
             go_proj_path = os.path.join(llm_dir, "go_projection.pt")
             if os.path.exists(go_proj_path):
@@ -372,7 +372,9 @@ class ProteinLLMModel(nn.Module):
             or combined all aspects when aspect is None or "all".
             Returns None if no GO encoder is available.
         """
-        if self.go_encoder is None or go_aspects is None:
+        if go_aspects is None:
+            return None
+        if self.go_encoder is None and not self.go_embeddings_cache:
             return None
 
         batch_go_embeddings = []

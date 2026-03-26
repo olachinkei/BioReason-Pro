@@ -83,6 +83,83 @@ pip install -e .
 
 <br>
 
+## Inference
+
+`predict.py` is a single-file pipeline that runs InterPro, GO-GPT, and BioReason-Pro to predict protein function from sequence. It requires a single GPU (A100 80GB recommended).
+
+### Quick Start
+
+```bash
+python predict.py --input examples/test_proteins.tsv --output results.tsv --model_type rl
+```
+
+### Input Format
+
+A tab-separated file with a header row and three required columns:
+
+| Column | Description |
+|--------|-------------|
+| `protein_id` | Unique identifier for the protein |
+| `organism` | Organism name (see [`organism_list.txt`](organism_list.txt) for supported organisms) |
+| `sequence` | Amino acid sequence (whitespace and non-AA characters are automatically removed) |
+
+Example (`proteins.tsv`):
+```
+protein_id	organism	sequence
+P51864	Homo sapiens (Human)	MDCRKMVRFSYSVIWIMAISKAFELGLVA...
+P0A9K3	Escherichia coli (strain K12)	MNIDTREITLEPADNARLLSLCGPFDDNI...
+```
+
+### Output Format
+
+A tab-separated file with the same columns as the input plus additional results:
+
+| Column | Description |
+|--------|-------------|
+| `protein_id` | Same as input |
+| `organism` | Same as input |
+| `sequence` | Cleaned sequence |
+| `sequence_length` | Length of the cleaned sequence |
+| `interpro` | InterPro domain annotations |
+| `gogpt` | GO-GPT predicted GO terms |
+| `generated_response` | Full model output including reasoning (`<think>` block) and functional annotation |
+
+### How It Works
+
+The pipeline runs three sequential stages on a single GPU:
+
+1. **InterPro** (CPU/network) — Queries the EBI InterProScan online API to annotate protein domains. Runs in parallel using all available CPU threads.
+2. **GO-GPT** (GPU) — Loads the GO-GPT model to predict Gene Ontology terms. Unloads from GPU after completion.
+3. **BioReason-Pro** (GPU) — Downloads the selected model checkpoint from HuggingFace, loads it, and generates functional annotations in batches.
+
+Model checkpoints and GO embeddings are automatically downloaded from HuggingFace — no manual setup required.
+
+### Options
+
+```
+--model_type {sft,rl}   Model checkpoint to use (default: rl)
+--resume                Resume from checkpoints / skip completed proteins
+--batch_size N          Batch size for BioReason-Pro inference (default: 4)
+--max_new_tokens N      Maximum tokens to generate (default: 5000)
+--temperature F         Sampling temperature (default: 0.0)
+--top_p F               Top-p sampling (default: 0.95)
+```
+
+### Supported Organisms
+
+BioReason-Pro supports 200+ organisms. See [`organism_list.txt`](organism_list.txt) for the full list. Common examples:
+
+- `Homo sapiens (Human)`
+- `Mus musculus (Mouse)`
+- `Escherichia coli (strain K12)`
+- `Saccharomyces cerevisiae (strain ATCC 204508 / S288c) (Baker's yeast)`
+- `Arabidopsis thaliana (Mouse-ear cress)`
+- `Drosophila melanogaster (Fruit fly)`
+
+Organism names must match the format in `organism_list.txt` exactly. Unsupported organisms will still run but GO-GPT predictions may be less accurate.
+
+<br>
+
 ## Citation
 
 If you find this work useful, please cite our papers:
