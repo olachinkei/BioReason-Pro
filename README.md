@@ -47,45 +47,10 @@ Precomputed predictions for 240,000+ proteins (including the Human Protein Atlas
 
 <br>
 
-## Datasets
-
-The datasets used to train and evaluate BioReason-Pro comprise 133,492 proteins across 3,135 organisms curated from UniProt with experimental GO annotations, InterPro domains, STRING protein-protein interactions, and PDB structures. Temporal holdout follows the CAFA framework. Detailed download and usage instructions are available on our [HuggingFace collection](https://huggingface.co/collections/wanglab/bioreason-pro).
-
-<br>
-
-## Checkpoints
-
-Model weights are available on our [HuggingFace collection](https://huggingface.co/collections/wanglab/bioreason-pro):
-
-| Model | Link |
-|-------|------|
-| GO-GPT | [HuggingFace](https://huggingface.co/wanglab/gogpt) |
-| BioReason-Pro SFT | [HuggingFace](https://huggingface.co/wanglab/bioreason-pro-sft) |
-| BioReason-Pro RL | [HuggingFace](https://huggingface.co/wanglab/bioreason-pro-rl) |
-
-<br>
-
-## Installation
-
-### Prerequisites
-- Python 3.11+
-- CUDA/GPU for best performance
-
-### Installation Steps
-```bash
-# Clone the repository
-git clone https://github.com/bowang-lab/BioReason-Pro.git
-cd BioReason-Pro
-
-# Install package
-pip install -e .
-```
-
-<br>
-
 ## Inference
 
 `predict.py` is a single-file pipeline that runs InterPro, GO-GPT, and BioReason-Pro to predict protein function from sequence. It requires a single GPU (A100 80GB recommended).
+You can use both the SFT model (more hypothesis, more hallucinations) or the RL model (more accurate, less mechnistically deep).
 
 ### Quick Start
 
@@ -159,6 +124,43 @@ BioReason-Pro supports 200+ organisms. See [`organism_list.txt`](organism_list.t
 Organism names must match the format in `organism_list.txt` exactly. Unsupported organisms will still run but GO-GPT predictions may be less accurate.
 
 <br>
+
+## Datasets
+
+The datasets used to train and evaluate BioReason-Pro comprise 133,492 proteins across 3,135 organisms curated from UniProt with experimental GO annotations, InterPro domains, STRING protein-protein interactions, and PDB structures. Temporal holdout follows the CAFA framework. Detailed download and usage instructions are available on our [HuggingFace collection](https://huggingface.co/collections/wanglab/bioreason-pro).
+
+<br>
+
+## Checkpoints
+
+Model weights are available on our [HuggingFace collection](https://huggingface.co/collections/wanglab/bioreason-pro):
+
+| Model | Link |
+|-------|------|
+| GO-GPT | [HuggingFace](https://huggingface.co/wanglab/gogpt) |
+| BioReason-Pro SFT | [HuggingFace](https://huggingface.co/wanglab/bioreason-pro-sft) |
+| BioReason-Pro RL | [HuggingFace](https://huggingface.co/wanglab/bioreason-pro-rl) |
+
+<br>
+
+## Installation
+
+### Prerequisites
+- Python 3.11+
+- CUDA/GPU for best performance
+
+### Installation Steps
+```bash
+# Clone the repository
+git clone https://github.com/bowang-lab/BioReason-Pro.git
+cd BioReason-Pro
+
+# Install package
+pip install -e .
+```
+
+<br>
+
 
 ## Citation
 
