@@ -24,6 +24,7 @@ dependencies = [
     "pytorch_lightning",
     "wandb",
     "trl[vllm]",
+    "vllm>=0.9.0",
     "bitsandbytes",
     "deepspeed",
     "esm>=3.2.0",
@@ -37,6 +38,11 @@ dependencies = [
     "torch_geometric",
     "networkx",
     "obonet",
+    "huggingface_hub",
+    "safetensors",
+    "requests",
+    "tqdm",
+    "pandas",
 ]
 
 [project.optional-dependencies]
