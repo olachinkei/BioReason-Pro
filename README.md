@@ -21,22 +21,6 @@ Protein function annotation is fundamental to understanding biological mechanism
 
 <br>
 
-## Key Contributions
-
-• **First multimodal reasoning LLM for protein function**: BioReason-Pro deeply integrates ESM3 protein embeddings, a GO graph encoder, and biological context within a unified LLM to generate structured reasoning traces and functional annotations.
-
-• **Autoregressive GO term prediction (GO-GPT)**: A novel autoregressive transformer that treats Gene Ontology prediction as a sequence generation task, capturing hierarchical and cross-aspect dependencies that discriminative methods miss, achieving state-of-the-art weighted F_max of 0.65–0.70.
-
-• **Expert-level functional reasoning**: Human protein experts preferred BioReason-Pro annotations over curated UniProt entries in 79% of evaluated cases, with an LLM judge score of 8.03/10 across five evaluation axes.
-
-• **De novo structural predictions**: BioReason-Pro predicted experimentally validated binding partners (e.g., SBP2 for eEFSec) with per-residue attention localizing to the exact contact interfaces resolved in cryo-EM structures.
-
-• **Structural reasoning beyond domain transfer**: The model performs contextual architectural reasoning that overrides misleading superfamily-level annotations, as demonstrated for CFAP61's non-enzymatic scaffolding role.
-
-• **Broad-scale release**: All model weights, training code, curated datasets, a web interface, and precomputed predictions for 240,000+ proteins including the Human Protein Atlas are publicly available.
-
-<br>
-
 ## Web Interface
 
 Try BioReason-Pro directly through our web-based inference server:
@@ -158,6 +142,23 @@ cd BioReason-Pro
 # Install package
 pip install -e .
 ```
+
+<br>
+
+## Key Contributions
+
+• **First multimodal reasoning LLM for protein function**: BioReason-Pro deeply integrates ESM3 protein embeddings, a GO graph encoder, and biological context within a unified LLM to generate structured reasoning traces and functional annotations.
+
+• **Autoregressive GO term prediction (GO-GPT)**: A novel autoregressive transformer that treats Gene Ontology prediction as a sequence generation task, capturing hierarchical and cross-aspect dependencies that discriminative methods miss, achieving state-of-the-art weighted F_max of 0.65–0.70.
+
+• **Expert-level functional reasoning**: Human protein experts preferred BioReason-Pro annotations over curated UniProt entries in 79% of evaluated cases, with an LLM judge score of 8.03/10 across five evaluation axes.
+
+• **De novo structural predictions**: BioReason-Pro predicted experimentally validated binding partners (e.g., SBP2 for eEFSec) with per-residue attention localizing to the exact contact interfaces resolved in cryo-EM structures.
+
+• **Structural reasoning beyond domain transfer**: The model performs contextual architectural reasoning that overrides misleading superfamily-level annotations, as demonstrated for CFAP61's non-enzymatic scaffolding role.
+
+• **Broad-scale release**: All model weights, training code, curated datasets, a web interface, and precomputed predictions for 240,000+ proteins including the Human Protein Atlas are publicly available.
+
 
 <br>
 
