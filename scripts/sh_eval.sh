@@ -34,7 +34,7 @@ cd "$(dirname "$0")/.."
 export PYTHONUNBUFFERED=1
 export PYTHONDONTWRITEBYTECODE=1
 
-EVALS_DIR="./evals"
+EVALS_DIR=${EVALS_DIR:-"./evals"}
 mkdir -p "$EVALS_DIR"
 
 export TRANSFORMERS_CACHE="$EVALS_DIR/transformers"
@@ -49,19 +49,19 @@ mkdir -p "$TRANSFORMERS_CACHE"
 # MODEL_PATH="/path/to/bioreason-pro-sft"
 
 # RL checkpoint — download from https://huggingface.co/wanglab/bioreason-pro-rl
-MODEL_PATH="/path/to/bioreason-pro-rl"
+MODEL_PATH=${MODEL_PATH:-"/path/to/bioreason-pro-rl"}
 
 # ===================================================================================================
 # Paths: Set these to your local directories
 # ===================================================================================================
-PROTEIN_MODEL_NAME="esm3_sm_open_v1"
-GO_OBO_PATH=""                      # e.g., /path/to/go-basic.obo
-GO_EMBEDDINGS_PATH=""               # e.g., /data/bioreason/go_embeddings
-DATASET_CACHE_DIR=""                # e.g., /data/bioreason/data
-STRUCTURE_DIR=""                    # e.g., /data/bioreason/structures
+PROTEIN_MODEL_NAME=${PROTEIN_MODEL_NAME:-"esm3_sm_open_v1"}
+GO_OBO_PATH=${GO_OBO_PATH:-""}                      # e.g., /path/to/go-basic.obo
+GO_EMBEDDINGS_PATH=${GO_EMBEDDINGS_PATH:-""}       # e.g., /data/bioreason/go_embeddings
+DATASET_CACHE_DIR=${DATASET_CACHE_DIR:-""}         # e.g., /data/bioreason/data
+STRUCTURE_DIR=${STRUCTURE_DIR:-""}                 # e.g., /data/bioreason/structures
 
 EVAL_SCRIPT="eval.py"
-EVALS_PATH="$EVALS_DIR/results"
+EVALS_PATH=${EVALS_PATH:-"$EVALS_DIR/results"}
 
 # Chunking parameters (can be overridden via command line)
 NUM_CHUNKS=${NUM_CHUNKS:-1}
@@ -88,8 +88,8 @@ GO_NUM_REDUCED_EMBEDDINGS=200
 GO_EMBEDDING_DIM=2560
 
 # Dataset configuration
-DATASET_NAME="interlabel_test_dataset_with_gogpt_memorized_copy"
-REASONING_DATASET_NAME="interlabel_test_dataset_with_gogpt_memorized_copy"
+DATASET_NAME=${DATASET_NAME:-"interlabel_test_dataset_with_gogpt_memorized_copy"}
+REASONING_DATASET_NAME=${REASONING_DATASET_NAME:-"interlabel_test_dataset_with_gogpt_memorized_copy"}
 SPLIT_GO_ASPECTS=False
 INTERPRO_IN_PROMPT=True
 PREDICT_INTERPRO=False
