@@ -25,6 +25,7 @@ NAMESPACE_TO_ASPECT = {
     'biological_process': 'BP', 
     'cellular_component': 'CC'
 }
+METRICS_SUMMARY_FILE = "metrics_summary.json"
 
 
 
@@ -508,6 +509,34 @@ def extract_metrics_summary(results) -> Dict[str, float]:
     return metrics
 
 
+def normalize_metrics_for_logging(metrics: Dict[str, float]) -> Dict[str, float]:
+    """Add stable Fmax-style aliases for downstream logging."""
+    normalized = dict(metrics)
+    alias_map = {
+        "molecular_function_f1": "fmax_mf",
+        "biological_process_f1": "fmax_bp",
+        "cellular_component_f1": "fmax_cc",
+        "overall_mean_f1": "overall_mean_fmax",
+        "molecular_function_weighted_f1": "weighted_fmax_mf",
+        "biological_process_weighted_f1": "weighted_fmax_bp",
+        "cellular_component_weighted_f1": "weighted_fmax_cc",
+        "overall_mean_weighted_f1": "overall_mean_weighted_fmax",
+    }
+    for source_key, alias_key in alias_map.items():
+        if source_key in normalized and alias_key not in normalized:
+            normalized[alias_key] = normalized[source_key]
+    return normalized
+
+
+def write_metrics_summary(metrics: Dict[str, float], output_dir: str) -> str:
+    """Persist a machine-readable metrics summary JSON."""
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, METRICS_SUMMARY_FILE)
+    with open(output_path, "w") as f:
+        json.dump(normalize_metrics_for_logging(metrics), f, indent=4, sort_keys=True)
+    return output_path
+
+
 def print_results_summary(metrics: Dict[str, float]):
     """Print formatted results summary."""
     print("\n" + "=" * 60)
@@ -648,6 +677,8 @@ def main():
         # Step 4: Extract and display metrics
         metrics = extract_metrics_summary(results)
         print_results_summary(metrics)
+        metrics_summary_path = write_metrics_summary(metrics, OUTPUT_DIR)
+        print(f"Metrics summary saved to: {metrics_summary_path}")
 
         # Step 5: Save detailed results
         evaluation_df, best_scores_dict = results

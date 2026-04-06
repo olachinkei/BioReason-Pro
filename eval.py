@@ -19,7 +19,7 @@ import csv
 import json
 import os
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 import torch
 from tqdm import tqdm
 import traceback
@@ -28,12 +28,24 @@ from bioreason2.models.protein_vllm import ProteinLLMModel
 from bioreason2.dataset.cafa5.load import load_cafa5_dataset
 from bioreason2.utils import str2bool
 
+try:
+    import wandb
+except ImportError:  # pragma: no cover - optional dependency at runtime
+    wandb = None
+
+try:
+    import weave
+except ImportError:  # pragma: no cover - optional dependency at runtime
+    weave = None
+
 # Constants
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 STOP_TOKENS = ["<|im_end|>"]
 ERROR_LOG_FILE = "evaluation_errors.json"
 RUN_SUMMARY_FILE = "run_summary.json"
 SAMPLE_TABLE_FILE = "sample_results.tsv"
+REASONING_OPEN_TAG = "<think>"
+REASONING_CLOSE_TAG = "</think>"
 
 # GO Aspect mapping for cleaner filenames
 GO_ASPECT_CODES = {"molecular_function": "MF", "cellular_component": "CC", "biological_process": "BP"}
@@ -56,6 +68,62 @@ def _get_ground_truth(sample: Dict[str, Any]) -> str:
                     answer = content[0].get("text", "")
                 return f"{reasoning}\n\n{answer}" if reasoning and answer else reasoning or answer
     return sample.get("answer", "")
+
+
+def parse_result_filename(filename: str) -> Optional[Tuple[str, str]]:
+    """Parse saved eval filenames while preserving protein IDs with underscores."""
+    if not filename.endswith(".json"):
+        return None
+
+    base_name = filename[:-5]
+    if "_k" in base_name and base_name.rsplit("_k", 1)[1].isdigit():
+        base_name = base_name.rsplit("_k", 1)[0]
+
+    if "_" not in base_name:
+        return None
+
+    protein_id, go_aspect_code = base_name.rsplit("_", 1)
+    if not protein_id or not go_aspect_code:
+        return None
+    return protein_id, go_aspect_code
+
+
+def _normalize_text_for_match(text: str) -> str:
+    """Normalize whitespace for lightweight exact-match notes."""
+    return " ".join((text or "").split())
+
+
+def extract_reasoning_fields(text: str) -> Dict[str, str]:
+    """Split a reasoning response into trace and final-answer fields."""
+    raw_text = (text or "").strip()
+    if not raw_text:
+        return {
+            "reasoning_excerpt": "",
+            "reasoning_full": "",
+            "final_answer": "",
+            "intermediate_trace": "",
+        }
+
+    reasoning_full = ""
+    final_answer = raw_text
+
+    if REASONING_CLOSE_TAG in raw_text:
+        reasoning_part, final_part = raw_text.split(REASONING_CLOSE_TAG, 1)
+        if REASONING_OPEN_TAG in reasoning_part:
+            reasoning_full = reasoning_part.split(REASONING_OPEN_TAG, 1)[1].strip()
+        else:
+            reasoning_full = reasoning_part.strip()
+        final_answer = final_part.strip()
+    elif REASONING_OPEN_TAG in raw_text:
+        reasoning_full = raw_text.split(REASONING_OPEN_TAG, 1)[1].strip()
+        final_answer = ""
+
+    return {
+        "reasoning_excerpt": reasoning_full[:500],
+        "reasoning_full": reasoning_full,
+        "final_answer": final_answer,
+        "intermediate_trace": reasoning_full,
+    }
 
 
 def initialize_model(args) -> ProteinLLMModel:
@@ -172,10 +240,10 @@ def filter_unprocessed_samples(samples, evals_path: str) -> List[Dict[str, Any]]
             if filename.endswith(".json"):
                 if filename in {ERROR_LOG_FILE, RUN_SUMMARY_FILE}:
                     continue
-                # Parse filename: {protein_id}_{go_aspect_code}_k{i:02d}.json
-                parts = filename.split("_")
-                if len(parts) >= 2:
-                    processed_unique_id = f"{parts[0]}_{parts[1]}"
+                parsed = parse_result_filename(filename)
+                if parsed is not None:
+                    protein_id, go_aspect_code = parsed
+                    processed_unique_id = f"{protein_id}_{go_aspect_code}"
                     processed_ids.add(processed_unique_id)
         
         print(f"🔄 Found {len(processed_ids)} samples with at least one result file.")
@@ -249,6 +317,155 @@ def collect_result_rows(evals_path: str) -> List[Dict[str, Any]]:
     return rows
 
 
+def build_sample_table_rows(args, result_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Convert saved JSON rows into richer sample rows for tracking backends."""
+    rows: List[Dict[str, Any]] = []
+    model_name = resolve_model_name(args)
+
+    for row in result_rows:
+        prediction_fields = extract_reasoning_fields(row.get("generated_response", ""))
+        ground_truth_fields = extract_reasoning_fields(row.get("ground_truth", ""))
+        predicted_final = _normalize_text_for_match(prediction_fields["final_answer"])
+        expected_final = _normalize_text_for_match(ground_truth_fields["final_answer"])
+        exact_match = bool(predicted_final and expected_final and predicted_final == expected_final)
+
+        rows.append(
+            {
+                "protein_id": row.get("protein_id", ""),
+                "go_aspect": row.get("go_aspect", ""),
+                "split": args.eval_split,
+                "model_name": model_name,
+                "prompt": row.get("input_prompt", ""),
+                "prediction": row.get("generated_response", ""),
+                "expected_output": row.get("ground_truth", ""),
+                "accuracy_or_match_note": f"success={bool(row.get('success', False))}; exact_match={exact_match}",
+                "reasoning_excerpt": prediction_fields["reasoning_excerpt"],
+                "reasoning_full": prediction_fields["reasoning_full"],
+                "final_answer": prediction_fields["final_answer"],
+                "intermediate_trace": prediction_fields["intermediate_trace"],
+                "success": bool(row.get("success", False)),
+            }
+        )
+
+    return rows
+
+
+def normalize_metrics_summary(metrics_summary: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Add stable logging aliases for metric summaries when available."""
+    normalized = dict(metrics_summary or {})
+    alias_map = {
+        "molecular_function_f1": "fmax_mf",
+        "biological_process_f1": "fmax_bp",
+        "cellular_component_f1": "fmax_cc",
+        "overall_mean_f1": "overall_mean_fmax",
+        "molecular_function_weighted_f1": "weighted_fmax_mf",
+        "biological_process_weighted_f1": "weighted_fmax_bp",
+        "cellular_component_weighted_f1": "weighted_fmax_cc",
+        "overall_mean_weighted_f1": "overall_mean_weighted_fmax",
+    }
+    for source_key, alias_key in alias_map.items():
+        if source_key in normalized and alias_key not in normalized:
+            normalized[alias_key] = normalized[source_key]
+    return normalized
+
+
+def load_metrics_summary(metrics_summary_path: Optional[str]) -> Dict[str, Any]:
+    """Load an optional metrics summary JSON for downstream tracking."""
+    if not metrics_summary_path:
+        return {}
+    if not os.path.exists(metrics_summary_path):
+        print(f"⚠️  Metrics summary not found, skipping metric logging: {metrics_summary_path}")
+        return {}
+
+    try:
+        with open(metrics_summary_path, "r") as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"⚠️  Failed to load metrics summary {metrics_summary_path}: {exc}")
+        return {}
+
+    if not isinstance(payload, dict):
+        print(f"⚠️  Metrics summary must be a JSON object: {metrics_summary_path}")
+        return {}
+    return normalize_metrics_summary(payload)
+
+
+def resolve_model_name(args) -> str:
+    """Resolve a stable model name for tracking outputs."""
+    explicit_name = getattr(args, "model_name", None)
+    if explicit_name:
+        return explicit_name
+
+    ckpt_dir = getattr(args, "ckpt_dir", "")
+    normalized = os.path.basename(os.path.normpath(ckpt_dir))
+    return normalized or "unknown_model"
+
+
+def resolve_benchmark_version(args) -> str:
+    """Resolve a benchmark identifier for tracking configs."""
+    explicit_version = getattr(args, "benchmark_version", None)
+    if explicit_version:
+        return explicit_version
+    return args.reasoning_dataset_name or args.cafa5_dataset_name
+
+
+def build_eval_summary_row(args, run_summary: Dict[str, Any], metrics_summary: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the one-row summary table payload described in the spec."""
+    metrics_summary = normalize_metrics_summary(metrics_summary)
+    return {
+        "model_name": resolve_model_name(args),
+        "dataset_config": args.cafa5_dataset_name,
+        "split": args.eval_split,
+        "benchmark_version": resolve_benchmark_version(args),
+        "fmax_mf": metrics_summary.get("fmax_mf"),
+        "fmax_bp": metrics_summary.get("fmax_bp"),
+        "fmax_cc": metrics_summary.get("fmax_cc"),
+        "macro_note": (
+            f"loaded={run_summary['loaded_samples']}, "
+            f"processed={run_summary['newly_processed_samples']}, "
+            f"result_files={run_summary['result_files_total']}, "
+            f"metrics_loaded={bool(metrics_summary)}"
+        ),
+    }
+
+
+def build_tracking_config(args, run_summary: Dict[str, Any], metrics_summary: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a shared config payload for W&B tracking."""
+    config = {
+        "job_type": "eval",
+        "benchmark_version": resolve_benchmark_version(args),
+        "step0_artifact": getattr(args, "step0_artifact", None),
+        "dataset_config": args.cafa5_dataset_name,
+        "reasoning_dataset_config": args.reasoning_dataset_name,
+        "dataset_artifact": getattr(args, "dataset_artifact", None),
+        "shortlist_query": getattr(args, "shortlist_query", None),
+        "shortlist_mode": getattr(args, "shortlist_mode", None),
+        "train_start_release": getattr(args, "train_start_release", None),
+        "train_end_release": getattr(args, "train_end_release", None),
+        "dev_end_release": getattr(args, "dev_end_release", None),
+        "test_end_release": getattr(args, "test_end_release", None),
+        "base_checkpoint": args.ckpt_dir,
+        "model_artifact": getattr(args, "model_artifact", None),
+        "output_dir": args.evals_path,
+        "seed": args.seed,
+        "eval_split": args.eval_split,
+        "pass_at_k": args.pass_at_k,
+        "max_samples": args.max_samples,
+        "metrics_summary_path": getattr(args, "metrics_summary_path", None),
+        "result_files_total": run_summary.get("result_files_total"),
+        "unique_sample_keys_total": run_summary.get("unique_sample_keys_total"),
+        "successful_result_files_total": run_summary.get("successful_result_files_total"),
+    }
+    config.update(
+        {
+            key: value
+            for key, value in normalize_metrics_summary(metrics_summary).items()
+            if isinstance(value, (int, float))
+        }
+    )
+    return {key: value for key, value in config.items() if value not in (None, "")}
+
+
 def write_sample_results_table(rows: List[Dict[str, Any]], evals_path: str) -> str:
     """Write a sample-level TSV that mirrors the saved JSON results."""
     output_path = os.path.join(evals_path, SAMPLE_TABLE_FILE)
@@ -309,8 +526,197 @@ def write_run_summary(summary: Dict[str, Any], evals_path: str) -> str:
     return output_path
 
 
-def log_error(error_type: str, protein_id: str, go_aspect: str, go_bp: str, go_mf: str, go_cc: str, go_bp_leaf: str, go_mf_leaf: str, go_cc_leaf: str, error_msg: str = "") -> None:
+def build_wandb_table(rows: List[Dict[str, Any]]):
+    """Build a W&B table if the SDK is available."""
+    if wandb is None or not rows:
+        return None
+    columns = list(rows[0].keys())
+    data = [[row.get(column) for column in columns] for row in rows]
+    return wandb.Table(columns=columns, data=data)
+
+
+def maybe_init_wandb_run(args, run_summary: Dict[str, Any], metrics_summary: Dict[str, Any]):
+    """Initialize an optional W&B eval run."""
+    if wandb is None:
+        return None
+
+    project = (getattr(args, "wandb_project", None) or os.getenv("WANDB_PROJECT") or "").strip()
+    if not project:
+        return None
+
+    init_kwargs = {
+        "project": project,
+        "entity": (getattr(args, "wandb_entity", None) or os.getenv("WANDB_ENTITY") or None),
+        "dir": args.evals_path,
+        "name": getattr(args, "wandb_run_name", None) or f"eval-{resolve_model_name(args)}-{args.eval_split}",
+        "job_type": "eval",
+        "config": build_tracking_config(args, run_summary, metrics_summary),
+        "reinit": "finish_previous",
+    }
+    wandb_mode = getattr(args, "wandb_mode", None)
+    if wandb_mode:
+        init_kwargs["mode"] = wandb_mode
+
+    try:
+        return wandb.init(**init_kwargs)
+    except Exception as exc:
+        print(f"⚠️  W&B init failed, continuing without W&B tracking: {exc}")
+        return None
+
+
+def log_eval_outputs_to_wandb(
+    run,
+    args,
+    run_summary: Dict[str, Any],
+    metrics_summary: Dict[str, Any],
+    sample_rows: List[Dict[str, Any]],
+) -> bool:
+    """Log eval metrics, tables, and artifacts to W&B."""
+    if run is None or wandb is None:
+        return False
+
+    metrics_to_log = {
+        key: value for key, value in normalize_metrics_summary(metrics_summary).items() if isinstance(value, (int, float))
+    }
+    if metrics_to_log:
+        wandb.log(metrics_to_log)
+
+    summary_row = build_eval_summary_row(args, run_summary, metrics_summary)
+    summary_table = build_wandb_table([summary_row])
+    if summary_table is not None:
+        wandb.log({"eval_summary": summary_table})
+
+    sample_table = build_wandb_table(sample_rows)
+    if sample_table is not None:
+        wandb.log({"eval_samples": sample_table})
+
+    artifact_name = getattr(args, "wandb_artifact_name", None) or f"eval-results-{resolve_model_name(args)}-{args.eval_split}"
+    artifact_name = artifact_name.replace("/", "-").replace(" ", "-")
+    artifact = wandb.Artifact(
+        artifact_name,
+        type="evaluation",
+        metadata={
+            "job_type": "eval",
+            "eval_split": args.eval_split,
+            "benchmark_version": resolve_benchmark_version(args),
+        },
+    )
+    artifact.add_dir(args.evals_path)
+    run.log_artifact(artifact)
+    return True
+
+
+def maybe_log_eval_to_weave(
+    args,
+    run_summary: Dict[str, Any],
+    metrics_summary: Dict[str, Any],
+    sample_rows: List[Dict[str, Any]],
+) -> bool:
+    """Track eval rows with Weave Evaluation when configured."""
+    if weave is None or not sample_rows:
+        return False
+
+    weave_project = (getattr(args, "weave_project", None) or "").strip()
+    if not weave_project:
+        wandb_entity = (getattr(args, "wandb_entity", None) or os.getenv("WANDB_ENTITY") or "").strip()
+        wandb_project = (getattr(args, "wandb_project", None) or os.getenv("WANDB_PROJECT") or "").strip()
+        if wandb_entity and wandb_project:
+            weave_project = f"{wandb_entity}/{wandb_project}"
+    if not weave_project:
+        return False
+
+    try:
+        weave.init(weave_project)
+
+        @weave.op
+        def replay_prediction(
+            prediction: str,
+            reasoning_full: str = "",
+            final_answer: str = "",
+            intermediate_trace: str = "",
+        ) -> Dict[str, str]:
+            return {
+                "prediction": prediction,
+                "reasoning_full": reasoning_full,
+                "final_answer": final_answer,
+                "intermediate_trace": intermediate_trace,
+            }
+
+        @weave.op
+        def exact_match_score(expected_output: str, model_output: Dict[str, str]) -> Dict[str, Any]:
+            expected_final = extract_reasoning_fields(expected_output).get("final_answer", "")
+            predicted_final = model_output.get("final_answer", "")
+            return {
+                "exact_match": _normalize_text_for_match(expected_final) == _normalize_text_for_match(predicted_final)
+            }
+
+        evaluation = weave.Evaluation(
+            name=getattr(args, "weave_eval_name", None) or f"eval-{resolve_model_name(args)}-{args.eval_split}",
+            dataset=sample_rows,
+            scorers=[exact_match_score],
+            preprocess_model_input=lambda row: {
+                "prediction": row.get("prediction", ""),
+                "reasoning_full": row.get("reasoning_full", ""),
+                "final_answer": row.get("final_answer", ""),
+                "intermediate_trace": row.get("intermediate_trace", ""),
+            },
+            metadata={
+                "job_type": "eval",
+                "benchmark_version": resolve_benchmark_version(args),
+                "eval_split": args.eval_split,
+                "result_files_total": run_summary.get("result_files_total"),
+                "metrics_loaded": bool(metrics_summary),
+            },
+        )
+        evaluation.evaluate(replay_prediction)
+        return True
+    except Exception as exc:
+        print(f"⚠️  Weave eval logging failed, continuing without Weave tracking: {exc}")
+        return False
+
+
+def log_eval_tracking(
+    args,
+    run_summary: Dict[str, Any],
+    result_rows: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Log optional W&B / Weave tracking for the completed eval run."""
+    metrics_summary = load_metrics_summary(getattr(args, "metrics_summary_path", None))
+    sample_rows = build_sample_table_rows(args, result_rows)
+    tracking_status = {
+        "metrics_loaded": bool(metrics_summary),
+        "wandb_logged": False,
+        "weave_logged": False,
+    }
+
+    wandb_run = maybe_init_wandb_run(args, run_summary, metrics_summary)
+    try:
+        tracking_status["wandb_logged"] = log_eval_outputs_to_wandb(
+            run=wandb_run,
+            args=args,
+            run_summary=run_summary,
+            metrics_summary=metrics_summary,
+            sample_rows=sample_rows,
+        )
+    finally:
+        if wandb_run is not None:
+            finish = getattr(wandb_run, "finish", None)
+            if callable(finish):
+                finish()
+
+    tracking_status["weave_logged"] = maybe_log_eval_to_weave(
+        args=args,
+        run_summary=run_summary,
+        metrics_summary=metrics_summary,
+        sample_rows=sample_rows,
+    )
+    return tracking_status
+
+
+def log_error(evals_path: str, error_type: str, protein_id: str, go_aspect: str, go_bp: str, go_mf: str, go_cc: str, go_bp_leaf: str, go_mf_leaf: str, go_cc_leaf: str, error_msg: str = "") -> None:
     """Log errors to a centralized JSON file."""
+    os.makedirs(evals_path, exist_ok=True)
+    error_log_path = os.path.join(evals_path, ERROR_LOG_FILE)
     error_record = {
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "error_type": error_type,
@@ -327,9 +733,9 @@ def log_error(error_type: str, protein_id: str, go_aspect: str, go_bp: str, go_m
 
     # Load existing errors or create new list
     errors = []
-    if os.path.exists(ERROR_LOG_FILE):
+    if os.path.exists(error_log_path):
         try:
-            with open(ERROR_LOG_FILE, "r") as f:
+            with open(error_log_path, "r") as f:
                 errors = json.load(f)
         except (json.JSONDecodeError, Exception):
             errors = []
@@ -338,7 +744,7 @@ def log_error(error_type: str, protein_id: str, go_aspect: str, go_bp: str, go_m
     errors.append(error_record)
 
     # Save back to file
-    with open(ERROR_LOG_FILE, "w") as f:
+    with open(error_log_path, "w") as f:
         json.dump(errors, f, indent=4)
 
 
@@ -483,13 +889,36 @@ def run_local_inference(args):
 
                 except torch.cuda.OutOfMemoryError:
                     print(f"CUDA Out of Memory on sample ID: {protein_id}, k={k_idx}. Skipping this k iteration.")
-                    log_error("oom", protein_id, go_aspect, go_bp, go_mf, go_cc, go_bp_leaf, go_mf_leaf, go_cc_leaf)
+                    log_error(
+                        args.evals_path,
+                        "oom",
+                        protein_id,
+                        go_aspect,
+                        go_bp,
+                        go_mf,
+                        go_cc,
+                        go_bp_leaf,
+                        go_mf_leaf,
+                        go_cc_leaf,
+                    )
                     torch.cuda.empty_cache()
                     continue
 
                 except Exception as e:
                     print(f"Unexpected error on sample ID {protein_id}, k={k_idx}: {e}")
-                    log_error("other", protein_id, go_aspect, go_bp, go_mf, go_cc, go_bp_leaf, go_mf_leaf, go_cc_leaf, str(e))
+                    log_error(
+                        args.evals_path,
+                        "other",
+                        protein_id,
+                        go_aspect,
+                        go_bp,
+                        go_mf,
+                        go_cc,
+                        go_bp_leaf,
+                        go_mf_leaf,
+                        go_cc_leaf,
+                        str(e),
+                    )
                     traceback.print_exc()
                     continue
 
@@ -507,9 +936,17 @@ def run_local_inference(args):
             total_time=dt,
             result_rows=result_rows,
         )
+        tracking_status = log_eval_tracking(args, run_summary, result_rows)
+        run_summary.update(tracking_status)
         summary_path = write_run_summary(run_summary, args.evals_path)
         print(f"🧾 Sample-level TSV saved to: {sample_table_path}")
         print(f"🧾 Run summary saved to: {summary_path}")
+        print(
+            "🧾 Tracking status: "
+            f"W&B={run_summary['wandb_logged']}, "
+            f"Weave={run_summary['weave_logged']}, "
+            f"metrics_loaded={run_summary['metrics_loaded']}"
+        )
 
     except Exception as e:
         print(f"Critical Error: {e}")
@@ -667,6 +1104,32 @@ def setup_argument_parser() -> argparse.ArgumentParser:
     output_group.add_argument(
         "--evals_path", type=str, required=True, help="Directory path to save individual evaluation results."
     )
+
+    tracking_group = parser.add_argument_group("Tracking Configuration")
+    tracking_group.add_argument("--benchmark_version", type=str, default=None)
+    tracking_group.add_argument("--model_name", type=str, default=None)
+    tracking_group.add_argument("--step0_artifact", type=str, default=None)
+    tracking_group.add_argument("--dataset_artifact", type=str, default=None)
+    tracking_group.add_argument("--model_artifact", type=str, default=None)
+    tracking_group.add_argument("--shortlist_query", type=str, default=None)
+    tracking_group.add_argument("--shortlist_mode", type=str, default=None)
+    tracking_group.add_argument("--train_start_release", type=str, default=None)
+    tracking_group.add_argument("--train_end_release", type=str, default=None)
+    tracking_group.add_argument("--dev_end_release", type=str, default=None)
+    tracking_group.add_argument("--test_end_release", type=str, default=None)
+    tracking_group.add_argument("--metrics_summary_path", type=str, default=None)
+    tracking_group.add_argument("--wandb_project", type=str, default=None)
+    tracking_group.add_argument("--wandb_entity", type=str, default=None)
+    tracking_group.add_argument("--wandb_run_name", type=str, default=None)
+    tracking_group.add_argument("--wandb_artifact_name", type=str, default=None)
+    tracking_group.add_argument(
+        "--wandb_mode",
+        type=str,
+        choices=["online", "offline", "disabled", "shared"],
+        default=None,
+    )
+    tracking_group.add_argument("--weave_project", type=str, default=None)
+    tracking_group.add_argument("--weave_eval_name", type=str, default=None)
 
     return parser
 

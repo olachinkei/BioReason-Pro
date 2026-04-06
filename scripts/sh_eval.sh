@@ -103,6 +103,16 @@ MIN_GO_BP_FREQ=1
 MIN_GO_CC_FREQ=1
 APPLY_GO_FILTERING_TO_VAL_TEST=False
 EVAL_SPLIT=${EVAL_SPLIT:-validation}
+BENCHMARK_VERSION=${BENCHMARK_VERSION:-}
+MODEL_NAME=${MODEL_NAME:-}
+METRICS_SUMMARY_PATH=${METRICS_SUMMARY_PATH:-}
+WANDB_PROJECT=${WANDB_PROJECT:-}
+WANDB_ENTITY=${WANDB_ENTITY:-}
+WANDB_RUN_NAME=${WANDB_RUN_NAME:-}
+WANDB_ARTIFACT_NAME=${WANDB_ARTIFACT_NAME:-}
+WANDB_MODE=${WANDB_MODE:-}
+WEAVE_PROJECT=${WEAVE_PROJECT:-}
+WEAVE_EVAL_NAME=${WEAVE_EVAL_NAME:-}
 
 # ===================================================================================================
 # Execute Evaluation
@@ -119,6 +129,38 @@ CHUNK_ARGS=""
 if [ "$NUM_CHUNKS" -gt 1 ]; then
     CHUNK_ARGS="--num_chunks $NUM_CHUNKS --chunk_id $CHUNK_ID"
     echo "Processing chunk $((CHUNK_ID + 1))/$NUM_CHUNKS"
+fi
+
+TRACKING_ARGS=()
+if [ -n "$BENCHMARK_VERSION" ]; then
+    TRACKING_ARGS+=(--benchmark_version "$BENCHMARK_VERSION")
+fi
+if [ -n "$MODEL_NAME" ]; then
+    TRACKING_ARGS+=(--model_name "$MODEL_NAME")
+fi
+if [ -n "$METRICS_SUMMARY_PATH" ]; then
+    TRACKING_ARGS+=(--metrics_summary_path "$METRICS_SUMMARY_PATH")
+fi
+if [ -n "$WANDB_PROJECT" ]; then
+    TRACKING_ARGS+=(--wandb_project "$WANDB_PROJECT")
+fi
+if [ -n "$WANDB_ENTITY" ]; then
+    TRACKING_ARGS+=(--wandb_entity "$WANDB_ENTITY")
+fi
+if [ -n "$WANDB_RUN_NAME" ]; then
+    TRACKING_ARGS+=(--wandb_run_name "$WANDB_RUN_NAME")
+fi
+if [ -n "$WANDB_ARTIFACT_NAME" ]; then
+    TRACKING_ARGS+=(--wandb_artifact_name "$WANDB_ARTIFACT_NAME")
+fi
+if [ -n "$WANDB_MODE" ]; then
+    TRACKING_ARGS+=(--wandb_mode "$WANDB_MODE")
+fi
+if [ -n "$WEAVE_PROJECT" ]; then
+    TRACKING_ARGS+=(--weave_project "$WEAVE_PROJECT")
+fi
+if [ -n "$WEAVE_EVAL_NAME" ]; then
+    TRACKING_ARGS+=(--weave_eval_name "$WEAVE_EVAL_NAME")
 fi
 
 python "$EVAL_SCRIPT" \
@@ -159,6 +201,7 @@ python "$EVAL_SCRIPT" \
     --pass_at_k $PASS_AT_K \
     --repetition_penalty $REPETITION_PENALTY \
     --evals_path "$EVALS_PATH" \
+    "${TRACKING_ARGS[@]}" \
     $CHUNK_ARGS
 
 echo "Evaluation finished. Results are in $EVALS_PATH"

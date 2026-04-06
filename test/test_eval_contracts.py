@@ -46,6 +46,8 @@ def install_eval_test_stubs():
     cafa5_module = types.ModuleType("bioreason2.dataset.cafa5")
     cafa5_load_module = types.ModuleType("bioreason2.dataset.cafa5.load")
     utils_module = types.ModuleType("bioreason2.utils")
+    wandb_module = types.ModuleType("wandb")
+    weave_module = types.ModuleType("weave")
 
     class ProteinLLMModel:
         pass
@@ -61,6 +63,93 @@ def install_eval_test_stubs():
     protein_vllm_module.ProteinLLMModel = ProteinLLMModel
     cafa5_load_module.load_cafa5_dataset = load_cafa5_dataset
     utils_module.str2bool = str2bool
+
+    class FakeTable:
+        def __init__(self, columns=None, data=None):
+            self.columns = list(columns or [])
+            self.data = list(data or [])
+
+    class FakeArtifact:
+        def __init__(self, name, type, metadata=None):
+            self.name = name
+            self.type = type
+            self.metadata = metadata or {}
+            self.added_dirs = []
+
+        def add_dir(self, path):
+            self.added_dirs.append(path)
+
+    class FakeRun:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.artifacts = []
+            self.finished = False
+
+        def log_artifact(self, artifact):
+            self.artifacts.append(artifact)
+
+        def finish(self):
+            self.finished = True
+
+    wandb_module.Table = FakeTable
+    wandb_module.Artifact = FakeArtifact
+    wandb_module.init_calls = []
+    wandb_module.logged_payloads = []
+    wandb_module.last_run = None
+
+    def wandb_init(**kwargs):
+        wandb_module.init_calls.append(kwargs)
+        wandb_module.last_run = FakeRun(**kwargs)
+        return wandb_module.last_run
+
+    def wandb_log(payload):
+        wandb_module.logged_payloads.append(payload)
+
+    wandb_module.init = wandb_init
+    wandb_module.log = wandb_log
+
+    def weave_op(func=None, **kwargs):
+        if func is None:
+            return lambda actual: actual
+        return func
+
+    class FakeEvaluation:
+        instances = []
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.dataset = kwargs.get("dataset", [])
+            self.scorers = kwargs.get("scorers", [])
+            self.preprocess_model_input = kwargs.get("preprocess_model_input", lambda row: row)
+            self.last_result = None
+            FakeEvaluation.instances.append(self)
+
+        def evaluate(self, model):
+            rows = []
+            for row in self.dataset:
+                model_inputs = self.preprocess_model_input(row)
+                model_output = model(**model_inputs)
+                scorer_outputs = []
+                for scorer in self.scorers:
+                    scorer_outputs.append(
+                        scorer(
+                            expected_output=row.get("expected_output", ""),
+                            model_output=model_output,
+                        )
+                    )
+                rows.append({"row": row, "model_output": model_output, "scores": scorer_outputs})
+            self.last_result = {"rows": rows}
+            return self.last_result
+
+    weave_module.init_calls = []
+    weave_module.op = weave_op
+    weave_module.Evaluation = FakeEvaluation
+
+    def weave_init(project_name):
+        weave_module.init_calls.append(project_name)
+        return types.SimpleNamespace(project=project_name)
+
+    weave_module.init = weave_init
 
     sys.modules["torch"] = torch_module
     try:
@@ -87,6 +176,8 @@ def install_eval_test_stubs():
     sys.modules["bioreason2.dataset.cafa5"] = cafa5_module
     sys.modules["bioreason2.dataset.cafa5.load"] = cafa5_load_module
     sys.modules["bioreason2.utils"] = utils_module
+    sys.modules["wandb"] = wandb_module
+    sys.modules["weave"] = weave_module
 
 
 def load_eval_module():
@@ -167,6 +258,25 @@ def make_eval_args(**overrides):
         num_chunks=1,
         chunk_id=0,
         evals_path="/tmp/evals",
+        benchmark_version=None,
+        model_name=None,
+        step0_artifact=None,
+        dataset_artifact=None,
+        model_artifact=None,
+        shortlist_query=None,
+        shortlist_mode=None,
+        train_start_release=None,
+        train_end_release=None,
+        dev_end_release=None,
+        test_end_release=None,
+        metrics_summary_path=None,
+        wandb_project=None,
+        wandb_entity=None,
+        wandb_run_name=None,
+        wandb_artifact_name=None,
+        wandb_mode=None,
+        weave_project=None,
+        weave_eval_name=None,
     )
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -277,6 +387,116 @@ class EvalContractTests(unittest.TestCase):
             written_summary = json.loads(Path(summary_path).read_text(encoding="utf-8"))
             self.assertEqual(written_summary["job_type"], "eval")
             self.assertEqual(written_summary["eval_split"], "test")
+
+    def test_filter_unprocessed_samples_handles_protein_ids_with_underscores(self):
+        samples = [
+            {"protein_id": "P_12345", "go_aspect": "molecular_function"},
+            {"protein_id": "Q99999", "go_aspect": "biological_process"},
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            (tmp_path / "P_12345_MF_k00.json").write_text("{}", encoding="utf-8")
+
+            remaining = EVAL.filter_unprocessed_samples(samples, str(tmp_path))
+
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0]["protein_id"], "Q99999")
+
+    def test_log_error_uses_requested_evals_directory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            EVAL.log_error(
+                tmpdir,
+                "other",
+                "P12345",
+                "molecular_function",
+                "",
+                "GO:0001111",
+                "",
+                "",
+                "GO:0001111",
+                "",
+                "boom",
+            )
+
+            error_path = Path(tmpdir) / EVAL.ERROR_LOG_FILE
+            self.assertTrue(error_path.exists())
+            payload = json.loads(error_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload[0]["protein_id"], "P12345")
+            self.assertEqual(payload[0]["error_message"], "boom")
+
+    def test_log_eval_tracking_uses_optional_wandb_and_weave(self):
+        EVAL.wandb.init_calls.clear()
+        EVAL.wandb.logged_payloads.clear()
+        EVAL.wandb.last_run = None
+        EVAL.weave.init_calls.clear()
+        EVAL.weave.Evaluation.instances.clear()
+
+        result_rows = [
+            {
+                "protein_id": "P12345",
+                "go_aspect": "molecular_function",
+                "success": True,
+                "input_prompt": "prompt",
+                "ground_truth": "<think>gold trace</think>\nGO:0001111",
+                "generated_response": "<think>model trace</think>\nGO:0001111",
+                "sequence_length": 321,
+            }
+        ]
+        run_summary = {
+            "job_type": "eval",
+            "loaded_samples": 1,
+            "newly_processed_samples": 1,
+            "result_files_total": 1,
+            "unique_sample_keys_total": 1,
+            "successful_result_files_total": 1,
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            metrics_path = Path(tmpdir) / "metrics_summary.json"
+            metrics_path.write_text(
+                json.dumps(
+                    {
+                        "biological_process_f1": 0.2,
+                        "molecular_function_f1": 0.9,
+                        "cellular_component_f1": 0.7,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = make_eval_args(
+                eval_split="test",
+                evals_path=tmpdir,
+                metrics_summary_path=str(metrics_path),
+                benchmark_version="disease_temporal_hc_v1",
+                model_name="BioReason-Pro-SFT",
+                wandb_project="bioreason-pro",
+                wandb_entity="demo-entity",
+                weave_project="demo-entity/bioreason-pro",
+            )
+
+            tracking_status = EVAL.log_eval_tracking(args, run_summary, result_rows)
+            sample_rows = EVAL.build_sample_table_rows(args, result_rows)
+
+        self.assertTrue(tracking_status["metrics_loaded"])
+        self.assertTrue(tracking_status["wandb_logged"])
+        self.assertTrue(tracking_status["weave_logged"])
+        self.assertEqual(len(sample_rows), 1)
+        self.assertEqual(sample_rows[0]["reasoning_full"], "model trace")
+        self.assertEqual(sample_rows[0]["final_answer"], "GO:0001111")
+        self.assertIn("exact_match=True", sample_rows[0]["accuracy_or_match_note"])
+
+        self.assertEqual(EVAL.wandb.init_calls[0]["job_type"], "eval")
+        self.assertEqual(EVAL.wandb.init_calls[0]["config"]["benchmark_version"], "disease_temporal_hc_v1")
+        self.assertTrue(EVAL.wandb.last_run.finished)
+        self.assertEqual(EVAL.wandb.last_run.artifacts[0].added_dirs, [tmpdir])
+        self.assertTrue(any("fmax_mf" in payload for payload in EVAL.wandb.logged_payloads))
+        self.assertTrue(any("eval_summary" in payload for payload in EVAL.wandb.logged_payloads))
+        self.assertTrue(any("eval_samples" in payload for payload in EVAL.wandb.logged_payloads))
+
+        self.assertEqual(EVAL.weave.init_calls[0], "demo-entity/bioreason-pro")
+        self.assertEqual(len(EVAL.weave.Evaluation.instances), 1)
+        self.assertEqual(len(EVAL.weave.Evaluation.instances[0].dataset), 1)
 
 
 if __name__ == "__main__":
