@@ -6,7 +6,7 @@
 # ===================================================================================================
 # #SBATCH --job-name=train_protein_qwen_staged
 # #SBATCH --partition=your_gpu_partition
-# #SBATCH --time=120:00:00
+# #SBATCH --time=12:00:00
 # #SBATCH --gpus=8
 # #SBATCH --ntasks-per-node=4
 # #SBATCH --nodes=2

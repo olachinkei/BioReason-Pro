@@ -196,3 +196,6 @@ cython_debug/
 *.out
 *.err
 trainer_output/
+
+# Specification artifacts
+domain/specification/busiless-rules/artifacts/
