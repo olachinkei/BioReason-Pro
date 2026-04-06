@@ -45,7 +45,15 @@ from bioreason2.models.protein_llm import (
     ProteinLLMModel,
     _get_target_modules,
 )
-from bioreason2.utils import str2bool
+from bioreason2.utils import (
+    SFT_SAMPLE_TABLE_COLUMNS,
+    build_checkpoint_artifact_metadata,
+    build_sft_sample_row,
+    build_training_tracking_config,
+    maybe_log_directory_artifact,
+    str2bool,
+    sync_run_config,
+)
 
 # Set start method to 'spawn' for CUDA compatibility with multiprocessing
 torch.multiprocessing.set_sharing_strategy("file_system")
@@ -519,26 +527,13 @@ class ProteinLLMFineTuner(pl.LightningModule):
             timestamp = time.time()
             step_id = f"gen_{self.global_step}-{timestamp}"
             wandb_logger = self.logger.experiment
+            sample_row = build_sft_sample_row(batch=batch, prefix=prefix, result=result, example_idx=example_idx)
             wandb_logger.log(
                 {
                     step_id: wandb.Table(
-                        columns=[
-                            "timestamp",
-                            "prefix",
-                            "batch_idx",
-                            "user_input",
-                            "generation",
-                            "ground_truth",
-                        ],
+                        columns=["timestamp", "prefix", "batch_idx"] + SFT_SAMPLE_TABLE_COLUMNS,
                         data=[
-                            [
-                                timestamp,
-                                prefix,
-                                batch_idx,
-                                result["user_input"],
-                                result["generation"],
-                                result["ground_truth"],
-                            ]
+                            [timestamp, prefix, batch_idx] + [sample_row[column] for column in SFT_SAMPLE_TABLE_COLUMNS]
                         ],
                     )
                 }
@@ -833,6 +828,7 @@ def main(args: ArgumentParser):
         run_name = args.run_name
     else:
         run_name = f"{args.wandb_project}-{args.dataset_type}-{args.text_model_name.split('/')[-1]}"
+    tracking_config = build_training_tracking_config(args=args, run_name=run_name)
 
     # Initialize model with pre-loaded datasets
     model = ProteinLLMFineTuner(
@@ -890,7 +886,9 @@ def main(args: ArgumentParser):
         name=run_name,
         resume="allow" if is_resuming else None,  # Allow resuming existing run
         log_model=False,
+        job_type=args.wandb_job_type,
     )
+    sync_run_config(logger.experiment, tracking_config)
 
     # Configure Lightning AdvancedProfiler (simple and robust)
     profiler = None
@@ -949,6 +947,25 @@ def main(args: ArgumentParser):
             print(f"Saving GO encoder weights to {go_encoder_weights_path}")
             torch.save(model.model.go_encoder.state_dict(), go_encoder_weights_path)
             print("✓ GO encoder weights saved.")
+
+    if trainer.global_rank == 0:
+        checkpoint_artifact_status = maybe_log_directory_artifact(
+            run=logger.experiment,
+            wandb_module=wandb,
+            artifact_name=tracking_config["model_artifact"],
+            artifact_type="model",
+            directory=args.checkpoint_dir,
+            aliases=args.checkpoint_artifact_aliases,
+            metadata=build_checkpoint_artifact_metadata(args, run_name, tracking_config=tracking_config),
+        )
+        if checkpoint_artifact_status["logged"]:
+            sync_run_config(
+                logger.experiment,
+                {
+                    "model_artifact": checkpoint_artifact_status["artifact_name"],
+                    "model_artifact_aliases": checkpoint_artifact_status["aliases"],
+                },
+            )
 
     # trainer.test(model, ckpt_path=args.ckpt_path if args.ckpt_path else "best")
 
@@ -1036,6 +1053,34 @@ if __name__ == "__main__":
         type=str,
         default="adibvafa",
         help="WandB entity (username or team).",
+    )
+    parser.add_argument(
+        "--wandb_job_type",
+        type=str,
+        default="train_sft",
+        choices=["train_sft", "train_rl"],
+        help="Logical W&B job type for this training phase.",
+    )
+    parser.add_argument("--benchmark_version", type=str, default=None)
+    parser.add_argument("--step0_artifact", type=str, default=None)
+    parser.add_argument("--dataset_config", type=str, default=None)
+    parser.add_argument("--reasoning_dataset_config", type=str, default=None)
+    parser.add_argument("--dataset_artifact", type=str, default=None)
+    parser.add_argument("--shortlist_query", type=str, default=None)
+    parser.add_argument("--shortlist_mode", type=str, default=None)
+    parser.add_argument("--train_start_release", type=int, default=None)
+    parser.add_argument("--train_end_release", type=int, default=None)
+    parser.add_argument("--dev_end_release", type=int, default=None)
+    parser.add_argument("--test_end_release", type=int, default=None)
+    parser.add_argument("--base_checkpoint", type=str, default=None)
+    parser.add_argument("--model_artifact", type=str, default=None)
+    parser.add_argument("--job_time_limit", type=str, default="12:00:00")
+    parser.add_argument("--checkpoint_artifact_name", type=str, default=None)
+    parser.add_argument(
+        "--checkpoint_artifact_aliases",
+        type=str,
+        default="latest",
+        help="Comma-separated aliases to associate with the output checkpoint artifact.",
     )
     parser.add_argument(
         "--dataset_type",

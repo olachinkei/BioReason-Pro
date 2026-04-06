@@ -60,6 +60,21 @@ INCLUDE_GROUND_TRUTH_IN_FINAL_ANSWER=False
 ADD_UNIPROT_SUMMARY=True
 IS_SWISSPROT=False
 
+# --- Benchmark / Tracking Configuration ---
+BENCHMARK_VERSION="213 -> 221 -> 225 -> 228"
+STEP0_ARTIFACT="domain/specification/busiless-rules/artifacts/step0_human_ub_20260406"
+DATASET_CONFIG="disease_temporal_hc_v1"
+REASONING_DATASET_CONFIG="disease_temporal_hc_reasoning_v1"
+DATASET_ARTIFACT=""                 # e.g., wandb artifact or HF dataset version string
+BASE_CHECKPOINT=""                  # e.g., a base model artifact alias or absolute path
+SHORTLIST_MODE="high-confidence"
+SHORTLIST_QUERY="reviewed:true AND organism_id:9606 AND cc_disease:* AND (xref:mim-* OR xref:orphanet-*) AND (go_exp:* OR go_ida:* OR go_ipi:* OR go_igi:* OR go_imp:* OR go_iep:* OR go_ic:* OR go_tas:*)"
+TRAIN_START_RELEASE=213
+TRAIN_END_RELEASE=221
+DEV_END_RELEASE=225
+TEST_END_RELEASE=228
+JOB_TIME_LIMIT="12:00:00"
+
 # --- Model Configuration ---
 MAX_LENGTH_TEXT=10000
 MAX_LENGTH_PROTEIN=2000
@@ -76,6 +91,20 @@ PPI_IN_PROMPT=True
 BASE_COMMAND="srun python train_protein_llm.py \
     --cache_dir $CACHE_DIR \
     --wandb_entity adibvafa \
+    --wandb_job_type train_sft \
+    --benchmark_version "$BENCHMARK_VERSION" \
+    --step0_artifact "$STEP0_ARTIFACT" \
+    --dataset_config "$DATASET_CONFIG" \
+    --reasoning_dataset_config "$REASONING_DATASET_CONFIG" \
+    --dataset_artifact "$DATASET_ARTIFACT" \
+    --shortlist_query "$SHORTLIST_QUERY" \
+    --shortlist_mode "$SHORTLIST_MODE" \
+    --train_start_release $TRAIN_START_RELEASE \
+    --train_end_release $TRAIN_END_RELEASE \
+    --dev_end_release $DEV_END_RELEASE \
+    --test_end_release $TEST_END_RELEASE \
+    --base_checkpoint "$BASE_CHECKPOINT" \
+    --job_time_limit "$JOB_TIME_LIMIT" \
     --text_model_name ${TEXT_MODEL_NAME} \
     --protein_model_name esm3_sm_open_v1 \
     --strategy ddp_find_unused_parameters_false \
@@ -152,6 +181,7 @@ mkdir -p $STAGE1_CHECKPOINT_DIR
 
 stdbuf -oL -eL $BASE_COMMAND \
   --run_name "${WANDB_RUN_NAME_S1}" \
+  --checkpoint_artifact_name "${WANDB_RUN_NAME_S1}-checkpoints" \
   --cafa5_dataset_name $STAGE1_DATASET_NAME \
   --training_stage 1 \
   --max_epochs 1 \
@@ -204,6 +234,7 @@ fi
 
 stdbuf -oL -eL $BASE_COMMAND \
     --run_name "${WANDB_RUN_NAME_S2}" \
+    --checkpoint_artifact_name "${WANDB_RUN_NAME_S2}-checkpoints" \
     --cafa5_dataset_name $STAGE2_DATASET_NAME \
     --training_stage 2 \
     --max_epochs 10 \

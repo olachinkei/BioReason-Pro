@@ -79,6 +79,17 @@ def _truncate_after_assistant_start(text: str) -> str:
     return text
 
 
+def _stringify_metadata_value(value):
+    """Convert optional dataset metadata to a stable string form."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple, set)):
+        return ", ".join(str(item) for item in value if item not in (None, ""))
+    return str(value)
+
+
 def qwen_protein_collate_fn(
     examples: List[Dict],
     processor: PLProcessor,
@@ -242,6 +253,15 @@ def qwen_protein_collate_fn(
     # Add answer to batch
     if return_answer_in_batch:
         batch["answer"] = [example["answer"].strip() for example in examples]
+
+    # Carry lightweight sample metadata so train-time logging can follow the benchmark spec.
+    batch["protein_ids"] = [_stringify_metadata_value(example.get("protein_id")) for example in examples]
+    batch["sample_splits"] = [_stringify_metadata_value(example.get("split")) for example in examples]
+    batch["go_bp_targets"] = [_stringify_metadata_value(example.get("go_bp")) for example in examples]
+    batch["go_mf_targets"] = [_stringify_metadata_value(example.get("go_mf")) for example in examples]
+    batch["go_cc_targets"] = [_stringify_metadata_value(example.get("go_cc")) for example in examples]
+    batch["reasoning_targets"] = [_stringify_metadata_value(example.get("reasoning")) for example in examples]
+    batch["final_answers"] = [_stringify_metadata_value(example.get("final_answer")) for example in examples]
 
     # -------------------------------------------------------------------
     # Inference mode: truncate after assistant start marker
