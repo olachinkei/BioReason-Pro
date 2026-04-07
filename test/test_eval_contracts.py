@@ -62,6 +62,19 @@ def install_eval_test_stubs():
             return value
         return str(value).lower() in {"1", "true", "yes", "y"}
 
+    def maybe_use_artifact_refs(run, artifact_refs, artifact_types=None):
+        if run is None:
+            return {}
+        statuses = {}
+        for key, value in artifact_refs.items():
+            if value:
+                artifact_type = None if artifact_types is None else artifact_types.get(key)
+                run.use_artifact(value, type=artifact_type)
+                statuses[key] = {"used": True, "artifact_ref": value, "artifact_type": artifact_type}
+            else:
+                statuses[key] = {"used": False, "artifact_ref": value, "artifact_type": None}
+        return statuses
+
     def select_dataset_subset(dataset, max_samples, seed, strategy="stratified_aspect_profile"):
         if max_samples is None or max_samples < 0 or len(dataset) <= max_samples:
             return dataset, {
@@ -79,6 +92,7 @@ def install_eval_test_stubs():
     cafa5_load_module.load_cafa5_dataset = load_cafa5_dataset
     cafa5_subset_module.select_dataset_subset = select_dataset_subset
     utils_module.str2bool = str2bool
+    utils_module.maybe_use_artifact_refs = maybe_use_artifact_refs
 
     class FakeTable:
         def __init__(self, columns=None, data=None):
@@ -99,10 +113,14 @@ def install_eval_test_stubs():
         def __init__(self, **kwargs):
             self.kwargs = kwargs
             self.artifacts = []
+            self.used_artifact_refs = []
             self.finished = False
 
         def log_artifact(self, artifact):
             self.artifacts.append(artifact)
+
+        def use_artifact(self, artifact_ref, type=None):
+            self.used_artifact_refs.append({"artifact_ref": artifact_ref, "type": type})
 
         def finish(self):
             self.finished = True
@@ -826,6 +844,9 @@ class EvalContractTests(unittest.TestCase):
                 wandb_project="bioreason-pro",
                 wandb_entity="demo-entity",
                 weave_project="demo-entity/bioreason-pro",
+                temporal_split_artifact="demo-entity/bioreason-pro/disease-temporal-split:production",
+                dataset_artifact="demo-entity/bioreason-pro/disease-temporal-reasoning:production",
+                model_artifact="demo-entity/bioreason-pro/bioreason-pro-rl:production",
             )
 
             tracking_status = EVAL.log_eval_tracking(args, run_summary, result_rows)
@@ -839,6 +860,14 @@ class EvalContractTests(unittest.TestCase):
         self.assertEqual(EVAL.wandb.init_calls[0]["config"]["benchmark_version"], "disease_temporal_hc_reasoning_v1")
         self.assertTrue(EVAL.wandb.last_run.finished)
         self.assertEqual(EVAL.wandb.last_run.artifacts, [])
+        self.assertEqual(
+            EVAL.wandb.last_run.used_artifact_refs,
+            [
+                {"artifact_ref": "demo-entity/bioreason-pro/disease-temporal-split:production", "type": "dataset"},
+                {"artifact_ref": "demo-entity/bioreason-pro/disease-temporal-reasoning:production", "type": "dataset"},
+                {"artifact_ref": "demo-entity/bioreason-pro/bioreason-pro-rl:production", "type": "model"},
+            ],
+        )
         self.assertTrue(any("fmax_mf" in payload for payload in EVAL.wandb.logged_payloads))
         self.assertTrue(any("eval_summary" in payload for payload in EVAL.wandb.logged_payloads))
         self.assertTrue(any("eval_samples" in payload for payload in EVAL.wandb.logged_payloads))

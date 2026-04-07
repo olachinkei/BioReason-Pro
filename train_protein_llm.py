@@ -687,30 +687,21 @@ class ProteinLLMFineTuner(pl.LightningModule):
                 f"\n=== Sample Generation {prefix} (step {self.global_step} / {self.trainer.estimated_stepping_batches}) ==="
             )
 
-        restore_unsloth_training = False
-        try:
-            if self.use_unsloth and hasattr(FastLanguageModel, "for_inference"):
-                FastLanguageModel.for_inference(self.model.text_model)
-                restore_unsloth_training = True
-
-            result = generate_single_response(
-                model=self.model,
-                tokenizer=self.tokenizer,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-                protein_sequences=protein_sequences,
-                structure_coords=structure_coords,
-                batch_idx_map=batch_idx_map,
-                go_aspects=go_aspects,
-                example_idx=example_idx,
-                max_new_tokens=64,
-                do_sample=False,
-                prefer_original_generate=True,
-            )
-        finally:
-            if restore_unsloth_training and hasattr(FastLanguageModel, "for_training"):
-                FastLanguageModel.for_training(self.model.text_model, use_gradient_checkpointing="unsloth")
+        result = generate_single_response(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            protein_sequences=protein_sequences,
+            structure_coords=structure_coords,
+            batch_idx_map=batch_idx_map,
+            go_aspects=go_aspects,
+            example_idx=example_idx,
+            max_new_tokens=64,
+            do_sample=False,
+            prefer_original_generate=True,
+        )
 
         sample_row = build_sft_sample_row(batch=batch, prefix=prefix, result=result, example_idx=example_idx)
         maybe_trace_sft_generation(

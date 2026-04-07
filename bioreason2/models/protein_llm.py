@@ -512,6 +512,7 @@ class ProteinLLMModel(nn.Module):
             Generated token IDs
         """
         prefer_original_generate = bool(generation_kwargs.pop("prefer_original_generate", False))
+        do_sample = bool(generation_kwargs.get("do_sample", False))
 
         # Ensure required inputs are available
         if input_ids is None or attention_mask is None:
@@ -596,6 +597,41 @@ class ProteinLLMModel(nn.Module):
         # Generation with embeddings
         text_inputs_embeds = text_inputs_embeds.to(input_ids.device)
         attention_mask = attention_mask.to(input_ids.device)
+
+        # Unsloth's patched generate path is brittle with prompt embeddings. For training-time
+        # sample traces we fall back to a small greedy decode loop driven by the regular forward pass.
+        if prefer_original_generate and not do_sample:
+            max_new_tokens = int(generation_kwargs.pop("max_new_tokens", 64))
+            eos_token_id = generation_kwargs.pop("eos_token_id", getattr(self.text_model.config, "eos_token_id", None))
+            if isinstance(eos_token_id, (list, tuple)):
+                eos_token_id = eos_token_id[0] if eos_token_id else None
+
+            generated_ids = input_ids.clone()
+            generated_attention_mask = attention_mask.clone()
+
+            for _ in range(max_new_tokens):
+                outputs = self.forward(
+                    input_ids=generated_ids,
+                    attention_mask=generated_attention_mask,
+                    protein_sequences=protein_sequences,
+                    batch_idx_map=batch_idx_map,
+                    structure_coords=structure_coords,
+                    go_aspects=go_aspects,
+                    use_cache=False,
+                )
+                next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                generated_ids = torch.cat([generated_ids, next_token], dim=1)
+                next_mask = torch.ones(
+                    (generated_attention_mask.size(0), 1),
+                    dtype=generated_attention_mask.dtype,
+                    device=generated_attention_mask.device,
+                )
+                generated_attention_mask = torch.cat([generated_attention_mask, next_mask], dim=1)
+
+                if eos_token_id is not None and torch.all(next_token.squeeze(-1) == eos_token_id):
+                    break
+
+            return generated_ids
 
         generate_fn = self.text_model.generate
         if prefer_original_generate:

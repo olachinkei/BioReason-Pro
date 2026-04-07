@@ -5,6 +5,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 TRAIN_PATH = ROOT / "train_protein_llm.py"
 WRAPPER_PATH = ROOT / "scripts" / "sh_train_protein_qwen_staged.sh"
+MODEL_PATH = ROOT / "bioreason2" / "models" / "protein_llm.py"
 
 
 class TrainProteinLLMTrackingContractsTest(unittest.TestCase):
@@ -12,8 +13,7 @@ class TrainProteinLLMTrackingContractsTest(unittest.TestCase):
         source = TRAIN_PATH.read_text()
         self.assertIn('@weave.op(name="train_sft_generation_trace")', source)
         self.assertIn("maybe_trace_sft_generation(", source)
-        self.assertIn("FastLanguageModel.for_inference", source)
-        self.assertIn("FastLanguageModel.for_training", source)
+        self.assertIn("prefer_original_generate=True", source)
         self.assertIn('"failure_reason"', source)
         self.assertIn('"assistant_marker_found"', source)
 
@@ -29,6 +29,12 @@ class TrainProteinLLMTrackingContractsTest(unittest.TestCase):
             '"trainer/global_step"',
         ]:
             self.assertIn(expected, source)
+
+    def test_prefer_original_generate_uses_manual_decode_for_sample_traces(self):
+        source = MODEL_PATH.read_text()
+        self.assertIn("if prefer_original_generate and not do_sample:", source)
+        self.assertIn("outputs = self.forward(", source)
+        self.assertIn("generated_ids = torch.cat([generated_ids, next_token], dim=1)", source)
 
     def test_sft_wrapper_passes_weave_and_logs_more_frequently(self):
         wrapper = WRAPPER_PATH.read_text()

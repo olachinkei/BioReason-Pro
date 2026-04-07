@@ -45,6 +45,9 @@ mkdir -p "$TRANSFORMERS_CACHE"
 # This is the low-level wrapper. Prefer scripts/run_registered_eval.py for registry-driven execution.
 # ===================================================================================================
 MODEL_PATH=${MODEL_PATH:-"/path/to/bioreason-pro-rl"}
+DATA_BUNDLE_RESOLVER=${DATA_BUNDLE_RESOLVER:-"scripts/materialize_data_bundle.py"}
+DATA_MANIFEST_PATH=${DATA_MANIFEST_PATH:-"configs/disease_benchmark/data_registry.json"}
+DATA_BUNDLE=${DATA_BUNDLE:-"main_production"}
 
 # ===================================================================================================
 # Paths: scratch + caches used during evaluation
@@ -145,6 +148,33 @@ echo "Model checkpoint: $MODEL_PATH"
 echo "Protein model: $PROTEIN_MODEL_NAME"
 echo "Evaluation split: $EVAL_SPLIT"
 echo "Scratch directory: $EVALS_PATH"
+
+DEFAULT_DATASET_SOURCE="wanglab/cafa5"
+if [ -n "$DATASET_ARTIFACT" ] && { [ -z "$CAFA5_DATASET" ] || [ "$CAFA5_DATASET" = "$DEFAULT_DATASET_SOURCE" ]; }; then
+    echo "--- Resolving reasoning dataset source for eval from W&B Artifact"
+    RESOLVED_REASONING_DATASET_DIR=$(python "$DATA_BUNDLE_RESOLVER" \
+        --data-manifest-path "$DATA_MANIFEST_PATH" \
+        --data-bundle "$DATA_BUNDLE" \
+        --asset-key reasoning_dataset \
+        --print-field local_dir)
+    if [ -z "$RESOLVED_REASONING_DATASET_DIR" ]; then
+        echo "Error: failed to resolve reasoning dataset source for eval"
+        exit 1
+    fi
+    CAFA5_DATASET="$RESOLVED_REASONING_DATASET_DIR"
+    if [ -z "$DATASET_NAME" ] || [ "$DATASET_NAME" = "interlabel_test_dataset_with_gogpt_memorized_copy" ]; then
+        RESOLVED_REASONING_DATASET_NAME=$(python "$DATA_BUNDLE_RESOLVER" \
+            --data-manifest-path "$DATA_MANIFEST_PATH" \
+            --data-bundle "$DATA_BUNDLE" \
+            --asset-key reasoning_dataset \
+            --print-field dataset_name)
+        if [ -n "$RESOLVED_REASONING_DATASET_NAME" ]; then
+            DATASET_NAME="$RESOLVED_REASONING_DATASET_NAME"
+            REASONING_DATASET_NAME="$RESOLVED_REASONING_DATASET_NAME"
+        fi
+    fi
+    echo "--- Reasoning dataset materialized at $CAFA5_DATASET"
+fi
 
 mkdir -p "$EVALS_PATH"
 mkdir -p "$WANDB_DIR"

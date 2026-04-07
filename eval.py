@@ -30,7 +30,7 @@ import traceback
 
 from bioreason2.models.protein_vllm import ProteinLLMModel
 from bioreason2.dataset.cafa5.load import load_cafa5_dataset
-from bioreason2.utils import str2bool
+from bioreason2.utils import maybe_use_artifact_refs, str2bool
 
 try:
     import wandb
@@ -740,7 +740,21 @@ def maybe_init_wandb_run(args, run_summary: Dict[str, Any], metrics_summary: Dic
         init_kwargs["mode"] = wandb_mode
 
     try:
-        return wandb.init(**init_kwargs)
+        run = wandb.init(**init_kwargs)
+        maybe_use_artifact_refs(
+            run,
+            {
+                "temporal_split_artifact": getattr(args, "temporal_split_artifact", None),
+                "dataset_artifact": getattr(args, "dataset_artifact", None),
+                "model_artifact": getattr(args, "model_artifact", None),
+            },
+            artifact_types={
+                "temporal_split_artifact": "dataset",
+                "dataset_artifact": "dataset",
+                "model_artifact": "model",
+            },
+        )
+        return run
     except Exception as exc:
         print(f"⚠️  W&B init failed, continuing without W&B tracking: {exc}")
         return None
