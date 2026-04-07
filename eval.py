@@ -15,8 +15,10 @@ Usage:
 """
 
 import argparse
+import asyncio
 import csv
 import importlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -859,7 +861,16 @@ def maybe_log_eval_to_weave(
                 "metrics_loaded": bool(metrics_summary),
             },
         )
-        evaluation.evaluate(replay_prediction)
+        evaluation_result = evaluation.evaluate(replay_prediction)
+        if inspect.isawaitable(evaluation_result):
+            try:
+                asyncio.run(evaluation_result)
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                try:
+                    loop.run_until_complete(evaluation_result)
+                finally:
+                    loop.close()
         if hasattr(client, "flush"):
             client.flush()
         return True

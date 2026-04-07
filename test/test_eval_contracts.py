@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import contextlib
 import csv
 import importlib.util
@@ -149,6 +150,7 @@ def install_eval_test_stubs():
 
     class FakeEvaluation:
         instances = []
+        async_mode = False
 
         def __init__(self, **kwargs):
             self.kwargs = kwargs
@@ -158,7 +160,7 @@ def install_eval_test_stubs():
             self.last_result = None
             FakeEvaluation.instances.append(self)
 
-        def evaluate(self, model):
+        def _run_evaluation(self, model):
             rows = []
             for row in self.dataset:
                 model_inputs = self.preprocess_model_input(row)
@@ -174,6 +176,14 @@ def install_eval_test_stubs():
                 rows.append({"row": row, "model_output": model_output, "scores": scorer_outputs})
             self.last_result = {"rows": rows}
             return self.last_result
+
+        def evaluate(self, model):
+            if self.async_mode:
+                async def _evaluate_async():
+                    return self._run_evaluation(model)
+
+                return _evaluate_async()
+            return self._run_evaluation(model)
 
     weave_module.init_calls = []
     weave_module.flush_calls = 0
@@ -802,6 +812,55 @@ class EvalContractTests(unittest.TestCase):
         self.assertEqual(sample_rows[0]["reasoning_full"], "model trace")
         self.assertEqual(sample_rows[0]["final_answer"], "GO:0001111")
         self.assertIn("exact_match=True", sample_rows[0]["accuracy_or_match_note"])
+
+    def test_log_eval_tracking_awaits_async_weave_evaluation(self):
+        EVAL.wandb.init_calls.clear()
+        EVAL.wandb.logged_payloads.clear()
+        EVAL.wandb.last_run = None
+        EVAL.weave.init_calls.clear()
+        EVAL.weave.flush_calls = 0
+        EVAL.weave.Evaluation.instances.clear()
+        EVAL.weave.Evaluation.async_mode = True
+        self.addCleanup(setattr, EVAL.weave.Evaluation, "async_mode", False)
+
+        result_rows = [
+            {
+                "protein_id": "P12345",
+                "go_aspect": "molecular_function",
+                "success": True,
+                "input_prompt": "prompt",
+                "ground_truth": "<think>gold trace</think>\nGO:0001111",
+                "generated_response": "<think>model trace</think>\nGO:0001111",
+                "sequence_length": 321,
+            }
+        ]
+        run_summary = {
+            "job_type": "eval",
+            "loaded_samples": 1,
+            "newly_processed_samples": 1,
+            "result_files_total": 1,
+            "unique_sample_keys_total": 1,
+            "successful_result_files_total": 1,
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            metrics_path = Path(tmpdir) / "metrics_summary.json"
+            metrics_path.write_text(json.dumps({"molecular_function_f1": 0.9}), encoding="utf-8")
+            args = make_eval_args(
+                eval_split="test",
+                evals_path=tmpdir,
+                metrics_summary_path=str(metrics_path),
+                wandb_project="bioreason-pro",
+                wandb_entity="demo-entity",
+                weave_project="demo-entity/bioreason-pro",
+            )
+
+            tracking_status = EVAL.log_eval_tracking(args, run_summary, result_rows)
+
+        self.assertTrue(tracking_status["weave_logged"])
+        self.assertEqual(EVAL.weave.flush_calls, 1)
+        self.assertEqual(len(EVAL.weave.Evaluation.instances), 1)
+        self.assertIsNotNone(EVAL.weave.Evaluation.instances[0].last_result)
 
     def test_log_eval_tracking_sets_default_weave_cache_dir(self):
         EVAL.wandb.init_calls.clear()
