@@ -314,7 +314,9 @@ if as_bool "$RUN_STAGE1"; then
   RUN_NAME_S1_DIR="${BASE_WANDB_PROJECT}-$(basename ${TEXT_MODEL_NAME})-stage1"
   TIMESTAMP_S1=$(date +%Y%m%d-%H%M%S)
   STAGE1_CHECKPOINT_DIR="${BASE_CHECKPOINT_DIR}/${RUN_NAME_S1_DIR}-${TIMESTAMP_S1}"
-  WANDB_RUN_NAME_S1="stage1-$(basename ${TEXT_MODEL_NAME})-${EXPERIMENT_NAME}"
+  WANDB_RUN_NAME_S1_DEFAULT="stage1-$(basename ${TEXT_MODEL_NAME})-${EXPERIMENT_NAME}"
+  WANDB_RUN_NAME_S1="${WANDB_RUN_NAME_S1:-${WANDB_RUN_NAME:-$WANDB_RUN_NAME_S1_DEFAULT}}"
+  STAGE1_CHECKPOINT_ARTIFACT_NAME="${STAGE1_CHECKPOINT_ARTIFACT_NAME:-${CHECKPOINT_ARTIFACT_NAME:-${WANDB_RUN_NAME_S1}-checkpoints}}"
   mkdir -p $STAGE1_CHECKPOINT_DIR
 
   stdbuf -oL -eL "${BASE_COMMAND[@]}" \
@@ -322,7 +324,7 @@ if as_bool "$RUN_STAGE1"; then
     ${BASE_MODEL_GO_PROJECTOR_WEIGHTS_PATH:+--go_projection_checkpoint_path "$BASE_MODEL_GO_PROJECTOR_WEIGHTS_PATH"} \
     ${BASE_MODEL_GO_ENCODER_WEIGHTS_PATH:+--go_encoder_checkpoint_path "$BASE_MODEL_GO_ENCODER_WEIGHTS_PATH"} \
     --run_name "${WANDB_RUN_NAME_S1}" \
-    --checkpoint_artifact_name "${WANDB_RUN_NAME_S1}-checkpoints" \
+    --checkpoint_artifact_name "${STAGE1_CHECKPOINT_ARTIFACT_NAME}" \
     --cafa5_dataset_name $STAGE1_DATASET_NAME \
     --training_stage 1 \
     --max_epochs 1 \
@@ -368,7 +370,8 @@ if [ -n "$STAGE2_RUN_LABEL" ]; then
 fi
 RUN_NAME_S2_DIR="${RUN_NAME_S2_DIR:-$RUN_NAME_S2_DIR_DEFAULT}"
 STAGE2_CHECKPOINT_DIR="${STAGE2_CHECKPOINT_DIR:-${BASE_CHECKPOINT_DIR}/${RUN_NAME_S2_DIR}}"
-WANDB_RUN_NAME_S2="${WANDB_RUN_NAME_S2:-$WANDB_RUN_NAME_S2_DEFAULT}"
+WANDB_RUN_NAME_S2="${WANDB_RUN_NAME_S2:-${WANDB_RUN_NAME:-$WANDB_RUN_NAME_S2_DEFAULT}}"
+STAGE2_CHECKPOINT_ARTIFACT_NAME="${STAGE2_CHECKPOINT_ARTIFACT_NAME:-${CHECKPOINT_ARTIFACT_NAME:-${WANDB_RUN_NAME_S2}-checkpoints}}"
 mkdir -p $STAGE2_CHECKPOINT_DIR
 
 CKPT_ARG=""
@@ -384,7 +387,7 @@ fi
 
 stdbuf -oL -eL "${BASE_COMMAND[@]}" \
     --run_name "${WANDB_RUN_NAME_S2}" \
-    --checkpoint_artifact_name "${WANDB_RUN_NAME_S2}-checkpoints" \
+    --checkpoint_artifact_name "${STAGE2_CHECKPOINT_ARTIFACT_NAME}" \
     --cafa5_dataset_name $STAGE2_DATASET_NAME \
     --training_stage 2 \
     --max_epochs "$STAGE2_MAX_EPOCHS" \

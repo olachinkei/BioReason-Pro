@@ -4,7 +4,12 @@ from bioreason2.models.protein_llm import ProteinLLMModel, _get_target_modules
 from pathlib import Path
 import argparse
 from bioreason2.utils.argparse_utils import str2bool
-from unsloth import FastLanguageModel
+try:
+    from unsloth import FastLanguageModel  # type: ignore
+except ImportError:
+    FastLanguageModel = None
+
+from peft import LoraConfig, get_peft_model
 
 
 def _setup_lora_for_checkpoint_loading(
@@ -12,26 +17,39 @@ def _setup_lora_for_checkpoint_loading(
     lora_rank: int = 128,
     lora_alpha: int = 256,
     lora_dropout: float = 0.05,
+    use_unsloth: bool = True,
 ):
-    """Setup LoRA using Unsloth (matching training setup)"""
-    print(f"🔧 Setting up Unsloth LoRA (rank={lora_rank}, alpha={lora_alpha})")
-    
+    """Setup LoRA adapters matching the training checkpoint layout."""
     target_modules = _get_target_modules(model)
-    
-    model.text_model = FastLanguageModel.get_peft_model(
-        model.text_model,
+
+    if use_unsloth and FastLanguageModel is not None:
+        print(f"🔧 Setting up Unsloth LoRA (rank={lora_rank}, alpha={lora_alpha})")
+        model.text_model = FastLanguageModel.get_peft_model(
+            model.text_model,
+            r=lora_rank,
+            target_modules=target_modules,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            bias="none",
+            use_gradient_checkpointing="unsloth",
+            random_state=42,
+            use_rslora=False,
+            loftq_config=None,
+        )
+        print("✅ Unsloth LoRA setup complete")
+        return
+
+    print(f"🔧 Setting up PEFT LoRA fallback (rank={lora_rank}, alpha={lora_alpha})")
+    peft_config = LoraConfig(
         r=lora_rank,
-        target_modules=target_modules,
         lora_alpha=lora_alpha,
+        target_modules=target_modules,
         lora_dropout=lora_dropout,
         bias="none",
-        use_gradient_checkpointing="unsloth",
-        random_state=42,
-        use_rslora=False,
-        loftq_config=None,
+        task_type="CAUSAL_LM",
     )
-    
-    print("✅ Unsloth LoRA setup complete")
+    model.text_model = get_peft_model(model.text_model, peft_config)
+    print("✅ PEFT LoRA setup complete")
 
 
 def _save_component_state_dict(module, save_path: str, label: str) -> bool:
@@ -59,9 +77,12 @@ def save_lightning_ckpt(args):
     print(f"📤 Extracted state_dict with {len(state_dict)} keys")
     print(f"📊 Epoch: {checkpoint.get('epoch', 'N/A')} | Global step: {checkpoint.get('global_step', 'N/A')}")
     
-    print("🔧 Building ProteinLLMModel with Unsloth...")
-    
-    # Create model with Unsloth (matching training setup)
+    use_unsloth_runtime = FastLanguageModel is not None
+    print(
+        "🔧 Building ProteinLLMModel with "
+        + ("Unsloth..." if use_unsloth_runtime else "standard PEFT fallback...")
+    )
+
     model = ProteinLLMModel(
         text_model_name=args.text_model_name,
         protein_model_name=args.protein_model_name,
@@ -72,7 +93,7 @@ def save_lightning_ckpt(args):
         protein_model_finetune=args.protein_model_finetune,
         protein_embedding_layer=args.protein_embedding_layer,
         go_model_finetune=True,
-        attn_implementation="flash_attention_2",
+        attn_implementation="flash_attention_2" if use_unsloth_runtime else "sdpa",
         go_obo_path=args.go_obo_path,
         precomputed_embeddings_path=args.precomputed_embeddings_path,
         go_hidden_dim=args.go_hidden_dim,
@@ -81,19 +102,20 @@ def save_lightning_ckpt(args):
         go_num_reduced_embeddings=args.go_num_reduced_embeddings,
         go_embedding_dim=args.go_embedding_dim,
         unified_go_encoder=args.unified_go_encoder,
-        use_unsloth=True,
+        use_unsloth=use_unsloth_runtime,
     )
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     print(f"📍 Model on {device}")
     
-    # Setup Unsloth LoRA
+    # Setup LoRA adapters matching the checkpoint layout.
     _setup_lora_for_checkpoint_loading(
         model,
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
+        use_unsloth=use_unsloth_runtime,
     )
     
     # Remap keys: Lightning saves with "model." prefix, we need to remove it

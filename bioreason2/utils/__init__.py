@@ -11,6 +11,7 @@ from .tracking import (
     maybe_use_artifact,
     maybe_use_artifact_refs,
     parse_artifact_aliases,
+    prepare_model_artifact_directory,
     sync_run_config,
 )
 
@@ -24,6 +25,7 @@ __all__ = [
     "maybe_use_artifact",
     "maybe_use_artifact_refs",
     "parse_artifact_aliases",
+    "prepare_model_artifact_directory",
     "str2bool",
     "sync_run_config",
 ]

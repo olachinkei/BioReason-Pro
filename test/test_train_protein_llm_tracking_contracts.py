@@ -57,6 +57,8 @@ class TrainProteinLLMTrackingContractsTest(unittest.TestCase):
         self.assertIn("WEAVE_TRACE_BUDGET=${WEAVE_TRACE_BUDGET:-64}", wrapper)
         self.assertIn('EXPECTED_WANDB_ENTITY=${EXPECTED_WANDB_ENTITY:-"wandb-healthcare"}', wrapper)
         self.assertIn('EXPECTED_WANDB_PROJECT=${EXPECTED_WANDB_PROJECT:-"bioreason-pro-custom"}', wrapper)
+        self.assertIn('WANDB_RUN_NAME_S2="${WANDB_RUN_NAME_S2:-${WANDB_RUN_NAME:-$WANDB_RUN_NAME_S2_DEFAULT}}"', wrapper)
+        self.assertIn('STAGE2_CHECKPOINT_ARTIFACT_NAME="${STAGE2_CHECKPOINT_ARTIFACT_NAME:-${CHECKPOINT_ARTIFACT_NAME:-${WANDB_RUN_NAME_S2}-checkpoints}}"', wrapper)
         self.assertIn("USE_UNSLOTH=${USE_UNSLOTH:-False}", wrapper)
         self.assertIn("ATTN_IMPLEMENTATION=${ATTN_IMPLEMENTATION:-sdpa}", wrapper)
         self.assertIn('STAGE2_LOG_EVERY_N_STEPS=${STAGE2_LOG_EVERY_N_STEPS:-10}', wrapper)
@@ -75,6 +77,8 @@ class TrainProteinLLMTrackingContractsTest(unittest.TestCase):
         self.assertIn('flush = getattr(weave_trace_state["client"], "flush", None)', source)
         self.assertIn('finalize = getattr(logger, "finalize", None)', source)
         self.assertIn('finalize("success")', source)
+        self.assertIn("prepare_model_artifact_directory(", source)
+        self.assertIn('"artifact_selected_checkpoint"', source)
 
     def test_directory_artifact_logging_does_not_block_before_finish(self):
         source = TRACKING_PATH.read_text()

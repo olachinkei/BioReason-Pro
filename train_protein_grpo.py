@@ -951,6 +951,7 @@ def train(args: argparse.Namespace) -> None:
         maybe_log_directory_artifact,
         maybe_use_artifact_refs,
         parse_artifact_aliases,
+        prepare_model_artifact_directory,
         sync_run_config,
     )
 
@@ -1287,14 +1288,32 @@ def train(args: argparse.Namespace) -> None:
         try:
             import wandb
 
+            artifact_export_dir = output_dir / "_artifact_export"
+            artifact_manifest = prepare_model_artifact_directory(
+                source_dir=str(output_dir),
+                export_dir=str(artifact_export_dir),
+            )
+            artifact_directory = (
+                artifact_manifest["export_dir"]
+                if artifact_manifest.get("prepared")
+                else str(output_dir)
+            )
             checkpoint_status = maybe_log_directory_artifact(
                 run=wandb_run,
                 wandb_module=wandb,
                 artifact_name=args.checkpoint_artifact_name,
                 artifact_type="model",
-                directory=str(output_dir),
+                directory=artifact_directory,
                 aliases=parse_artifact_aliases(args.checkpoint_artifact_aliases),
-                metadata=build_checkpoint_artifact_metadata(args, run_name, tracking_config=tracking_config),
+                metadata=build_checkpoint_artifact_metadata(
+                    args,
+                    run_name,
+                    tracking_config={
+                        **tracking_config,
+                        "artifact_export_mode": artifact_manifest.get("mode"),
+                        "artifact_selected_checkpoint": artifact_manifest.get("selected_checkpoint"),
+                    },
+                ),
             )
             if checkpoint_status["logged"]:
                 sync_run_config(

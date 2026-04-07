@@ -115,6 +115,8 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
 
         self.assertIn("maybe_use_artifact_refs(", source)
         self.assertIn("maybe_trace_generation(", source)
+        self.assertIn("prepare_model_artifact_directory(", source)
+        self.assertIn('"artifact_export_mode"', source)
         self.assertIn('"data_step_num_groups_submitted"', source)
         self.assertIn('"data_step_num_groups_trainable"', source)
         self.assertIn('"data_step_num_trajectories"', source)

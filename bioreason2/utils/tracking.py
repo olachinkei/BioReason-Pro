@@ -1,4 +1,7 @@
+import json
 import os
+import shutil
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 
@@ -310,6 +313,134 @@ def maybe_log_directory_artifact(
         "directory": resolved_directory,
         "aliases": resolved_aliases,
     }
+
+
+def _reset_directory(path: Path) -> Path:
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _link_or_copy_file(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
+
+def _copytree_with_links(src: Path, dst: Path) -> None:
+    shutil.copytree(src, dst, copy_function=lambda s, d: _link_or_copy_file(Path(s), Path(d)))
+
+
+def _select_checkpoint_file(source_dir: Path) -> Optional[Path]:
+    checkpoints = sorted(source_dir.rglob("*.ckpt"))
+    if not checkpoints:
+        return None
+
+    preferred_patterns = (
+        lambda path: path.name == "last.ckpt",
+        lambda path: "-best-" in path.name or "best" in path.name,
+        lambda path: "-recent-" in path.name or "recent" in path.name,
+    )
+    for predicate in preferred_patterns:
+        matches = [path for path in checkpoints if predicate(path)]
+        if matches:
+            return max(matches, key=lambda path: (path.stat().st_mtime, path.name))
+    return max(checkpoints, key=lambda path: (path.stat().st_mtime, path.name))
+
+
+def prepare_model_artifact_directory(
+    source_dir: str,
+    export_dir: str,
+) -> Dict[str, Any]:
+    """Create a minimal artifact payload for downstream training/eval.
+
+    - HF-style model dirs keep only the exported model files and drop raw checkpoint caches.
+    - Raw checkpoint dirs keep only one selected checkpoint plus small sidecar files.
+    """
+    source_path = Path(normalize_text(source_dir)).expanduser().resolve()
+    export_path = _reset_directory(Path(normalize_text(export_dir)).expanduser().resolve())
+
+    if not source_path.is_dir():
+        return {
+            "prepared": False,
+            "source_dir": str(source_path),
+            "export_dir": str(export_path),
+            "reason": "missing_source_dir",
+            "selected_checkpoint": "",
+            "mode": "",
+        }
+
+    manifest: Dict[str, Any] = {
+        "source_dir": str(source_path),
+        "export_dir": str(export_path),
+    }
+
+    if (source_path / "config.json").is_file():
+        copied_entries: List[str] = []
+        for child in sorted(source_path.iterdir()):
+            if child.name in {"raw_checkpoints", "_artifact_export", "weave_server_cache"}:
+                continue
+            target = export_path / child.name
+            if child.is_dir():
+                _copytree_with_links(child, target)
+            else:
+                _link_or_copy_file(child, target)
+            copied_entries.append(child.name)
+
+        manifest.update(
+            {
+                "prepared": True,
+                "mode": "hf_export",
+                "copied_entries": copied_entries,
+                "selected_checkpoint": "",
+            }
+        )
+    else:
+        checkpoint_path = _select_checkpoint_file(source_path)
+        if checkpoint_path is None:
+            return {
+                "prepared": False,
+                "source_dir": str(source_path),
+                "export_dir": str(export_path),
+                "reason": "no_checkpoint_found",
+                "selected_checkpoint": "",
+                "mode": "",
+            }
+
+        artifact_checkpoint = export_path / checkpoint_path.name
+        _link_or_copy_file(checkpoint_path, artifact_checkpoint)
+
+        copied_entries = [checkpoint_path.name]
+        for sidecar_name in [
+            "projector_weights.pt",
+            "protein_projection.pt",
+            "go_projection_weights.pt",
+            "go_projection.pt",
+            "go_encoder_weights.pt",
+            "go_encoder.pt",
+            "training_metadata.json",
+        ]:
+            sidecar = source_path / sidecar_name
+            if sidecar.is_file():
+                _link_or_copy_file(sidecar, export_path / sidecar_name)
+                copied_entries.append(sidecar_name)
+
+        manifest.update(
+            {
+                "prepared": True,
+                "mode": "raw_checkpoint",
+                "copied_entries": copied_entries,
+                "selected_checkpoint": checkpoint_path.name,
+            }
+        )
+
+    with open(export_path / "artifact_manifest.json", "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2, sort_keys=True)
+
+    return manifest
 
 
 def build_sft_sample_row(batch: Mapping[str, Any], prefix: str, result: Mapping[str, Any], example_idx: int = 0) -> Dict[str, str]:

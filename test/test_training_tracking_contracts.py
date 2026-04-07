@@ -221,6 +221,44 @@ class TrainingTrackingContractsTest(unittest.TestCase):
         self.assertEqual(run.artifacts[0].logged_aliases, ["latest", "best"])
         self.assertEqual(run.artifacts[0].metadata["run_name"], "demo-run")
 
+    def test_prepare_model_artifact_directory_selects_single_checkpoint(self):
+        with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as export:
+            source_path = Path(source)
+            (source_path / "last.ckpt").write_text("last", encoding="utf-8")
+            (source_path / "demo-best.ckpt").write_text("best", encoding="utf-8")
+            (source_path / "demo-recent.ckpt").write_text("recent", encoding="utf-8")
+            (source_path / "training_metadata.json").write_text("{}", encoding="utf-8")
+
+            manifest = TRACKING.prepare_model_artifact_directory(source, export)
+
+            self.assertTrue(manifest["prepared"])
+            self.assertEqual(manifest["mode"], "raw_checkpoint")
+            self.assertEqual(manifest["selected_checkpoint"], "last.ckpt")
+            exported = Path(export)
+            self.assertTrue((exported / "last.ckpt").is_file())
+            self.assertFalse((exported / "demo-best.ckpt").exists())
+            self.assertTrue((exported / "training_metadata.json").is_file())
+            self.assertTrue((exported / "artifact_manifest.json").is_file())
+
+    def test_prepare_model_artifact_directory_excludes_raw_checkpoints_for_hf_exports(self):
+        with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as export:
+            source_path = Path(source)
+            (source_path / "config.json").write_text("{}", encoding="utf-8")
+            (source_path / "tokenizer.json").write_text("{}", encoding="utf-8")
+            raw_dir = source_path / "raw_checkpoints"
+            raw_dir.mkdir()
+            (raw_dir / "checkpoint-1.bin").write_text("ignore", encoding="utf-8")
+
+            manifest = TRACKING.prepare_model_artifact_directory(source, export)
+
+            self.assertTrue(manifest["prepared"])
+            self.assertEqual(manifest["mode"], "hf_export")
+            exported = Path(export)
+            self.assertTrue((exported / "config.json").is_file())
+            self.assertTrue((exported / "tokenizer.json").is_file())
+            self.assertFalse((exported / "raw_checkpoints").exists())
+            self.assertTrue((exported / "artifact_manifest.json").is_file())
+
     def test_parse_artifact_aliases_deduplicates(self):
         aliases = TRACKING.parse_artifact_aliases("latest, best,latest")
         self.assertEqual(aliases, ["latest", "best"])

@@ -62,6 +62,7 @@ from bioreason2.utils import (
     build_training_tracking_config,
     maybe_log_directory_artifact,
     maybe_use_artifact_refs,
+    prepare_model_artifact_directory,
     str2bool,
     sync_run_config,
 )
@@ -1231,14 +1232,32 @@ def main(args: ArgumentParser):
 
     if trainer.global_rank == 0:
         try:
+            artifact_export_dir = os.path.join(args.checkpoint_dir, "_artifact_export")
+            artifact_manifest = prepare_model_artifact_directory(
+                source_dir=args.checkpoint_dir,
+                export_dir=artifact_export_dir,
+            )
+            artifact_directory = (
+                artifact_manifest["export_dir"]
+                if artifact_manifest.get("prepared")
+                else args.checkpoint_dir
+            )
             checkpoint_artifact_status = maybe_log_directory_artifact(
                 run=logger.experiment,
                 wandb_module=wandb,
                 artifact_name=tracking_config["model_artifact"],
                 artifact_type="model",
-                directory=args.checkpoint_dir,
+                directory=artifact_directory,
                 aliases=args.checkpoint_artifact_aliases,
-                metadata=build_checkpoint_artifact_metadata(args, run_name, tracking_config=tracking_config),
+                metadata=build_checkpoint_artifact_metadata(
+                    args,
+                    run_name,
+                    tracking_config={
+                        **tracking_config,
+                        "artifact_export_mode": artifact_manifest.get("mode"),
+                        "artifact_selected_checkpoint": artifact_manifest.get("selected_checkpoint"),
+                    },
+                ),
             )
             if checkpoint_artifact_status["logged"]:
                 sync_run_config(
