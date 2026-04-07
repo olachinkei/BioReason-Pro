@@ -57,6 +57,7 @@ DATASET_CACHE_DIR=${DATASET_CACHE_DIR:-"data/artifacts/hf_cache"}
 STRUCTURE_DIR=${STRUCTURE_DIR:-"data/structures"}
 KEEP_LOCAL_EVAL_OUTPUTS=${KEEP_LOCAL_EVAL_OUTPUTS:-0}
 WANDB_DIR=${WANDB_DIR:-"./wandb"}
+WEAVE_SERVER_CACHE_DIR=${WEAVE_SERVER_CACHE_DIR:-"$WANDB_DIR/weave_server_cache"}
 
 EVAL_SCRIPT="eval.py"
 EVALS_PATH=${EVALS_PATH:-"$EVALS_DIR/results"}
@@ -147,6 +148,8 @@ echo "Scratch directory: $EVALS_PATH"
 
 mkdir -p "$EVALS_PATH"
 mkdir -p "$WANDB_DIR"
+mkdir -p "$WEAVE_SERVER_CACHE_DIR"
+export WEAVE_SERVER_CACHE_DIR
 
 CHUNK_ARGS=""
 if [ "$NUM_CHUNKS" -gt 1 ]; then

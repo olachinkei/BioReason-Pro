@@ -19,6 +19,7 @@ import csv
 import importlib
 import json
 import os
+from pathlib import Path
 import shutil
 import time
 from collections import OrderedDict
@@ -699,6 +700,20 @@ def should_run_weave_evaluation(args) -> bool:
     return getattr(args, "eval_split", "validation") == "test"
 
 
+def ensure_weave_server_cache_dir(args) -> str:
+    """Provide a writable cache directory for Weave's disk-backed local cache."""
+    configured_dir = (os.getenv("WEAVE_SERVER_CACHE_DIR") or "").strip()
+    if configured_dir:
+        cache_dir = Path(configured_dir).expanduser()
+    else:
+        base_dir = (getattr(args, "wandb_dir", None) or getattr(args, "evals_path", None) or "wandb").strip()
+        cache_dir = Path(base_dir).expanduser() / "weave_server_cache"
+        os.environ["WEAVE_SERVER_CACHE_DIR"] = str(cache_dir.resolve())
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return str(cache_dir.resolve())
+
+
 def maybe_init_wandb_run(args, run_summary: Dict[str, Any], metrics_summary: Dict[str, Any]):
     """Initialize an optional W&B eval run."""
     if wandb is None:
@@ -786,7 +801,9 @@ def maybe_log_eval_to_weave(
         return False
 
     try:
-        weave.init(weave_project)
+        cache_dir = ensure_weave_server_cache_dir(args)
+        print(f"🧶 Using Weave cache directory: {cache_dir}")
+        client = weave.init(weave_project)
 
         @weave.op
         def replay_prediction(
@@ -829,6 +846,8 @@ def maybe_log_eval_to_weave(
             },
         )
         evaluation.evaluate(replay_prediction)
+        if hasattr(client, "flush"):
+            client.flush()
         return True
     except Exception as exc:
         print(f"⚠️  Weave eval logging failed, continuing without Weave tracking: {exc}")
