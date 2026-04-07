@@ -4,8 +4,11 @@ Protein encoder implementations for ESM3 and ESM-C models.
 This module provides a unified interface for protein embedding generation using different ESM models.
 """
 
+import os
+import shutil
 import torch
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import List, Optional
 
 # ESM imports
@@ -13,6 +16,51 @@ from esm.models.esm3 import ESM3
 from esm.models.esmc import ESMC
 from esm.sdk.api import ESMProtein, SamplingConfig, LogitsConfig
 from esm.utils.sampling import _BatchedESMProteinTensor
+
+
+LOCAL_ESM3_MODEL_NAME = "esm3_sm_open_v1"
+LOCAL_ESM3_WEIGHT_RELATIVE_PATH = Path("data/weights/esm3_sm_open_v1.pth")
+LOCAL_ESM3_RESIDUE_CSV_RELATIVE_PATH = Path(
+    "data/uniref90_and_mgnify90_residue_annotations_gt_1k_proteins.csv"
+)
+
+
+def _prepare_local_esm3_runtime(model_dir: Path) -> str:
+    """Materialize the minimum ESM3 local runtime layout from a bundled checkpoint."""
+    weight_source = model_dir / "pytorch_model.bin"
+    if not weight_source.exists():
+        raise FileNotFoundError(f"Expected bundled ESM3 weights at {weight_source}")
+
+    runtime_root = Path.cwd()
+    weight_target = runtime_root / LOCAL_ESM3_WEIGHT_RELATIVE_PATH
+    residue_csv_target = runtime_root / LOCAL_ESM3_RESIDUE_CSV_RELATIVE_PATH
+
+    weight_target.parent.mkdir(parents=True, exist_ok=True)
+    residue_csv_target.parent.mkdir(parents=True, exist_ok=True)
+
+    if weight_target.exists() or weight_target.is_symlink():
+        try:
+            if weight_target.samefile(weight_source):
+                pass
+            else:
+                weight_target.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            if weight_target.is_file():
+                weight_target.unlink()
+    if not weight_target.exists():
+        try:
+            weight_target.symlink_to(weight_source.resolve())
+        except OSError:
+            shutil.copy2(weight_source, weight_target)
+
+    if not residue_csv_target.exists():
+        residue_csv_target.write_text("label,label_clean,count\n", encoding="utf-8")
+
+    os.environ.setdefault("INFRA_PROVIDER", "local")
+    print(f"📁 Prepared local ESM3 runtime under {runtime_root / 'data'}")
+    return LOCAL_ESM3_MODEL_NAME
 
 
 class ProteinEncoder(ABC):
@@ -421,6 +469,14 @@ def create_protein_encoder(model_name: str, inference_mode: bool = True, embeddi
     Returns:
         Appropriate protein encoder instance
     """
+    model_path = Path(model_name).expanduser()
+    if model_path.exists():
+        if model_path.is_dir() and (model_path / "pytorch_model.bin").exists():
+            prepared_model_name = _prepare_local_esm3_runtime(model_path)
+            return ESM3Encoder(prepared_model_name, inference_mode, embedding_layer)
+        print(f"📁 Using local protein encoder weights from {model_path}")
+        return ESM3Encoder(str(model_path), inference_mode, embedding_layer)
+
     model_name_lower = model_name.lower()
 
     # ESM-C models (efficient representation learning)

@@ -120,8 +120,14 @@ class ProteinLLMModel(nn.Module):
         # self.text_model.resize_token_embeddings(len(self.text_tokenizer))
 
         # Load the protein encoder (ESM3 or ESM-C)
+        resolved_protein_model_name = protein_model_name
+        checkpoint_protein_model = os.path.join(ckpt_dir, "protein_model")
+        if os.path.isdir(checkpoint_protein_model):
+            resolved_protein_model_name = checkpoint_protein_model
+            print(f"📁 Using checkpoint-bundled protein model from {checkpoint_protein_model}")
+
         self.protein_encoder = create_protein_encoder(
-            protein_model_name, 
+            resolved_protein_model_name,
             inference_mode=not protein_model_finetune,
             embedding_layer=protein_embedding_layer
         )

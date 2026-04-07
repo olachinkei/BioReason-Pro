@@ -151,12 +151,13 @@ def extract_reasoning_fields(text: str) -> Dict[str, str]:
 def initialize_model(args) -> ProteinLLMModel:
     """Initialize and return the ProteinLLMModel."""
     print(f"📥 Loading ProteinLLMModel from checkpoint: {args.ckpt_dir}...")
+    precomputed_embeddings_path = getattr(args, "precomputed_embeddings_path", None) or None
     model = ProteinLLMModel(
         ckpt_dir=args.ckpt_dir,
         protein_model_name=args.protein_model_name,
         protein_embedding_layer=args.protein_embedding_layer,
         go_obo_path=args.go_obo_path,
-        precomputed_embeddings_path=args.precomputed_embeddings_path,
+        precomputed_embeddings_path=precomputed_embeddings_path,
         max_length_protein=args.max_length_protein,
         max_length_text=args.max_model_len,
         max_model_len=args.max_model_len,
@@ -452,7 +453,7 @@ def load_metrics_summary(metrics_summary_path: Optional[str]) -> Dict[str, Any]:
 
 
 def maybe_compute_metrics_summary(args) -> Tuple[Dict[str, Any], Optional[str]]:
-    """Compute Fmax metrics from eval outputs when an IA file is available."""
+    """Compute Fmax metrics from eval outputs, using IA when available."""
     metrics_summary_path = getattr(args, "metrics_summary_path", None)
     if metrics_summary_path:
         loaded_metrics = load_metrics_summary(metrics_summary_path)
@@ -467,12 +468,11 @@ def maybe_compute_metrics_summary(args) -> Tuple[Dict[str, Any], Optional[str]]:
         return {}, None
 
     ia_file_path = getattr(args, "ia_file_path", None)
-    if not ia_file_path:
-        print("⚠️  IA file path not provided; skipping automatic Fmax computation.")
-        return {}, None
-    if not os.path.exists(ia_file_path):
-        print(f"⚠️  IA file not found; skipping automatic Fmax computation: {ia_file_path}")
-        return {}, None
+    if ia_file_path and not os.path.exists(ia_file_path):
+        print(f"⚠️  IA file not found; computing automatic Fmax without IA weighting: {ia_file_path}")
+        ia_file_path = None
+    elif not ia_file_path:
+        print("ℹ️  IA file path not provided; computing automatic Fmax without IA weighting.")
 
     try:
         cafa_metrics = importlib.import_module("evals.cafa_evals")
@@ -522,9 +522,11 @@ def maybe_compute_metrics_summary(args) -> Tuple[Dict[str, Any], Optional[str]]:
         metrics_summary_path = cafa_metrics.write_metrics_summary(metrics_summary, metrics_output_dir)
 
         evaluation_df, best_scores_dict = results
-        evaluation_df.to_csv(os.path.join(metrics_output_dir, "evaluation_results.tsv"), sep="\t")
+        if hasattr(evaluation_df, "to_csv"):
+            evaluation_df.to_csv(os.path.join(metrics_output_dir, "evaluation_results.tsv"), sep="\t")
         for metric_name, metric_df in best_scores_dict.items():
-            metric_df.to_csv(os.path.join(metrics_output_dir, f"best_{metric_name}.tsv"), sep="\t")
+            if hasattr(metric_df, "to_csv"):
+                metric_df.to_csv(os.path.join(metrics_output_dir, f"best_{metric_name}.tsv"), sep="\t")
 
         print(f"📈 Automatic Fmax metrics saved to: {metrics_summary_path}")
         return metrics_summary, metrics_summary_path
@@ -1174,8 +1176,11 @@ def setup_argument_parser() -> argparse.ArgumentParser:
     model_group.add_argument(
         "--precomputed_embeddings_path",
         type=str,
-        required=True,
-        help="Path to directory with precomputed GO embeddings.",
+        default=None,
+        help=(
+            "Optional path to directory with precomputed GO embeddings. "
+            "If omitted, evaluation falls back to the checkpoint-bundled go_embedding.pt cache."
+        ),
     )
     model_group.add_argument(
         "--unified_go_encoder",

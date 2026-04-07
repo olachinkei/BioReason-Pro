@@ -68,7 +68,7 @@ CHUNK_ID=${CHUNK_ID:-0}
 # ===================================================================================================
 # Evaluation Parameters
 # ===================================================================================================
-MAX_SAMPLES=-1
+MAX_SAMPLES=${MAX_SAMPLES:-1}
 MAX_LENGTH_PROTEIN=2000
 MAX_NEW_TOKENS=5000
 TEMPERATURE=0
@@ -124,6 +124,10 @@ WANDB_MODE=${WANDB_MODE:-}
 WEAVE_PROJECT=${WEAVE_PROJECT:-}
 WEAVE_EVAL_NAME=${WEAVE_EVAL_NAME:-}
 
+if [ -z "${WANDB_MODE// }" ]; then
+    unset WANDB_MODE
+fi
+
 # ===================================================================================================
 # Execute Evaluation
 # ===================================================================================================
@@ -143,6 +147,7 @@ if [ "$NUM_CHUNKS" -gt 1 ]; then
 fi
 
 TRACKING_ARGS=()
+MODEL_OPTIONAL_ARGS=()
 if [ -n "$BENCHMARK_VERSION" ]; then
     TRACKING_ARGS+=(--benchmark_version "$BENCHMARK_VERSION")
 fi
@@ -207,6 +212,9 @@ fi
 if [ -n "$WEAVE_EVAL_NAME" ]; then
     TRACKING_ARGS+=(--weave_eval_name "$WEAVE_EVAL_NAME")
 fi
+if [ -n "$GO_EMBEDDINGS_PATH" ]; then
+    MODEL_OPTIONAL_ARGS+=(--precomputed_embeddings_path "$GO_EMBEDDINGS_PATH")
+fi
 case "${KEEP_LOCAL_EVAL_OUTPUTS,,}" in
     1|true|yes)
         TRACKING_ARGS+=(--keep_local_eval_outputs)
@@ -219,7 +227,6 @@ python "$EVAL_SCRIPT" \
     --protein_embedding_layer "$PROTEIN_EMBEDDING_LAYER" \
     --go_obo_path "$GO_OBO_PATH" \
     --ia_file_path "$IA_FILE_PATH" \
-    --precomputed_embeddings_path "$GO_EMBEDDINGS_PATH" \
     --unified_go_encoder "$UNIFIED_GO_ENCODER" \
     --go_hidden_dim $GO_HIDDEN_DIM \
     --go_num_gat_layers $GO_NUM_GAT_LAYERS \
@@ -253,6 +260,7 @@ python "$EVAL_SCRIPT" \
     --pass_at_k $PASS_AT_K \
     --repetition_penalty $REPETITION_PENALTY \
     --evals_path "$EVALS_PATH" \
+    "${MODEL_OPTIONAL_ARGS[@]}" \
     "${TRACKING_ARGS[@]}" \
     $CHUNK_ARGS
 

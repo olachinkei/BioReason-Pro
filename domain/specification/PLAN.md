@@ -25,15 +25,15 @@
 | temporal split artifact 作成 | 完了 | `wandb-healthcare/bioreason-pro-custom/disease-temporal-split:production` |
 | reasoning dataset 作成 | 完了 | `wandb-healthcare/bioreason-pro-custom/disease-temporal-reasoning:production` |
 | comparison model artifact 確定 | 完了 | `wandb-healthcare/bioreason-pro-custom/bioreason-pro-rl:production` |
-| CoreWeave 実行フロー整理 | 準備済み | `srun` ベースの実行手順は文書化済み、実機 run は未実施 |
-| comparison model の validation 評価 | 未着手 | 次の実行対象 |
+| CoreWeave 実行フロー整理 | 完了 | `srun` ベースの実行、remote env、artifact 解決、1-sample smoke まで確認済み |
+| comparison model の validation 評価 | 実行中 | `comparison-family` の `validation` run を CoreWeave で実行中 |
 | SFT | 未着手 | wrapper と tracking は用意済み、run は未実施 |
 | RL | 準備済み | `train_protein_grpo.py` と `scripts/sh_train_protein_grpo.sh` は実装済み、run は未実施 |
 
 ### 0.3 いま次にやること
 
-次の実行対象は **comparison-family を `validation` split で評価すること** である。  
-その前提として CoreWeave 側で `.env`、`wandb_registry_paths.env`、GPU 環境を揃える。
+次の実行対象は **実行中の `comparison-family` validation を完走させ、W&B 上の結果を確認すること** である。  
+その後、SFT に進む。
 
 ## 1. データの準備
 
@@ -91,7 +91,7 @@ uv run --active python scripts/run_temporal_split_artifact_pipeline.py \
 
 ## 2. GPU へのアクセス
 
-状態: **準備済み、実行は未了**
+状態: **完了**
 
 ### 2.1 やること
 
@@ -170,7 +170,7 @@ cp configs/disease_benchmark/wandb_asset_sources.env.example \
 
 ## 3. 比較モデルの評価
 
-状態: **未着手**
+状態: **実行中**
 
 ### 3.1 目的
 
@@ -182,7 +182,7 @@ cp configs/disease_benchmark/wandb_asset_sources.env.example \
 - `tuned-family`: `train-sft-output`, `train-rl-output`
 - `spec-comparison`: 上記すべて
 
-この段階で実際に回すのは `comparison-family` のみでよい。
+この段階で実際に回しているのは `comparison-family` のみである。
 
 ### 3.3 実行コマンド
 
@@ -218,6 +218,8 @@ W&B 上に次が見えていれば完了とする。
 - `eval_summary` table
 - `eval_samples` table
 - eval artifact
+
+2026-04-07 現在、CoreWeave SUNK 上で `comparison-family` の `validation` run を実行中である。
 
 ### 3.5 このフェーズが終わったらやること
 

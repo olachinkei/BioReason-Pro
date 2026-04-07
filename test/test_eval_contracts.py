@@ -250,6 +250,7 @@ def make_eval_args(**overrides):
         add_uniprot_summary=True,
         eval_split="validation",
         max_samples=-1,
+        max_model_len=32768,
         max_new_tokens=1024,
         temperature=0.1,
         top_p=0.9,
@@ -306,6 +307,32 @@ class EvalContractTests(unittest.TestCase):
         )
 
         self.assertEqual(args.eval_split, "validation")
+
+    def test_argument_parser_allows_missing_precomputed_embeddings_path(self):
+        parser = EVAL.setup_argument_parser()
+        args = parser.parse_args(
+            [
+                "--ckpt_dir",
+                "/tmp/mock-ckpt",
+                "--go_obo_path",
+                "/tmp/go-basic.obo",
+                "--evals_path",
+                "/tmp/evals",
+            ]
+        )
+
+        self.assertIsNone(args.precomputed_embeddings_path)
+
+    def test_initialize_model_treats_empty_precomputed_embeddings_path_as_none(self):
+        args = make_eval_args(precomputed_embeddings_path="")
+
+        with mock.patch.object(EVAL, "ProteinLLMModel") as mock_model_cls:
+            mock_model = object()
+            mock_model_cls.return_value = mock_model
+            result = EVAL.initialize_model(args)
+
+        self.assertIs(result, mock_model)
+        self.assertEqual(mock_model_cls.call_args.kwargs["precomputed_embeddings_path"], None)
 
     def test_select_eval_dataset_supports_validation_and_test(self):
         train_ds = FakeDataset([{"protein_id": "train"}])
@@ -532,10 +559,103 @@ class EvalContractTests(unittest.TestCase):
             self.assertEqual(calls["run_cafa_evaluation"]["n_cpu"], 4)
             self.assertEqual(calls["run_cafa_evaluation"]["th_step"], 0.95)
 
+    def test_maybe_compute_metrics_summary_runs_without_ia_file(self):
+        calls = {}
+
+        def process_json_data(base_dir, reasoning_mode=False, final_answer_only=False, go_dag=None):
+            return [("P12345", {"GO:0001111"})], [("P12345", {"GO:0001111"})]
+
+        def create_cafa_prediction_file(predictions, output_path):
+            Path(output_path).write_text("predictions", encoding="utf-8")
+
+        def create_cafa_ground_truth_file(ground_truth, output_path):
+            Path(output_path).write_text("ground_truth", encoding="utf-8")
+
+        def run_cafa_evaluation(ontology_path, predictions_dir, ground_truth_path, ia_file_path=None, n_cpu=0, th_step=0.99):
+            calls["run_cafa_evaluation"] = {
+                "ontology_path": ontology_path,
+                "predictions_dir": predictions_dir,
+                "ground_truth_path": ground_truth_path,
+                "ia_file_path": ia_file_path,
+                "n_cpu": n_cpu,
+                "th_step": th_step,
+            }
+            return types.SimpleNamespace(to_csv=lambda *args, **kwargs: None), {
+                "f": types.SimpleNamespace(to_csv=lambda *args, **kwargs: None),
+                "f_w": types.SimpleNamespace(to_csv=lambda *args, **kwargs: None),
+            }
+
+        def extract_metrics_summary(results):
+            return {"molecular_function_f1": 0.7}
+
+        def write_metrics_summary(metrics, output_dir):
+            output_path = Path(output_dir) / "metrics_summary.json"
+            output_path.write_text(json.dumps(metrics), encoding="utf-8")
+            return str(output_path)
+
+        fake_cafa_module = types.SimpleNamespace(
+            process_json_data=process_json_data,
+            create_cafa_prediction_file=create_cafa_prediction_file,
+            create_cafa_ground_truth_file=create_cafa_ground_truth_file,
+            run_cafa_evaluation=run_cafa_evaluation,
+            extract_metrics_summary=extract_metrics_summary,
+            write_metrics_summary=write_metrics_summary,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            go_obo_path = Path(tmpdir) / "go-basic.obo"
+            go_obo_path.write_text("obo", encoding="utf-8")
+
+            args = make_eval_args(
+                evals_path=tmpdir,
+                go_obo_path=str(go_obo_path),
+                ia_file_path=None,
+            )
+
+            with mock.patch.object(EVAL.importlib, "import_module", return_value=fake_cafa_module):
+                metrics_summary, metrics_summary_path = EVAL.maybe_compute_metrics_summary(args)
+
+        self.assertEqual(metrics_summary["fmax_mf"], 0.7)
+        self.assertIsNotNone(metrics_summary_path)
+        self.assertIsNone(calls["run_cafa_evaluation"]["ia_file_path"])
+
+    def test_maybe_compute_metrics_summary_tolerates_missing_metric_frames(self):
+        def process_json_data(base_dir, reasoning_mode=False, final_answer_only=False, go_dag=None):
+            return [("P12345", {"GO:0001111"})], [("P12345", {"GO:0001111"})]
+
+        fake_cafa_module = types.SimpleNamespace(
+            process_json_data=process_json_data,
+            create_cafa_prediction_file=lambda predictions, output_path: Path(output_path).write_text(
+                "predictions", encoding="utf-8"
+            ),
+            create_cafa_ground_truth_file=lambda ground_truth, output_path: Path(output_path).write_text(
+                "ground_truth", encoding="utf-8"
+            ),
+            run_cafa_evaluation=lambda *args, **kwargs: (None, {"f": None, "f_w": None}),
+            extract_metrics_summary=lambda results: {},
+            write_metrics_summary=lambda metrics, output_dir: str(Path(output_dir) / "metrics_summary.json"),
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            go_obo_path = Path(tmpdir) / "go-basic.obo"
+            go_obo_path.write_text("obo", encoding="utf-8")
+
+            args = make_eval_args(
+                evals_path=tmpdir,
+                go_obo_path=str(go_obo_path),
+                ia_file_path=None,
+            )
+
+            with mock.patch.object(EVAL.importlib, "import_module", return_value=fake_cafa_module):
+                metrics_summary, metrics_summary_path = EVAL.maybe_compute_metrics_summary(args)
+
+        self.assertEqual(metrics_summary, {})
+        self.assertTrue(metrics_summary_path.endswith("metrics_summary.json"))
+
     def test_maybe_compute_metrics_summary_skips_when_required_files_are_missing(self):
         args = make_eval_args(
             go_obo_path="/tmp/does-not-exist.obo",
-            ia_file_path="/tmp/does-not-exist.ia",
+            ia_file_path=None,
         )
 
         with mock.patch.object(EVAL.importlib, "import_module") as import_module:
