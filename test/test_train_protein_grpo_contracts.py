@@ -33,6 +33,8 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
     def test_wrapper_uses_sft_conversion_lora_settings(self):
         wrapper_text = WRAPPER_PATH.read_text()
 
+        self.assertIn("source_env_file_without_overrides()", wrapper_text)
+        self.assertIn('source_env_file_without_overrides "$REGISTRY_ENV_FILE"', wrapper_text)
         self.assertIn('BASE_WANDB_PROJECT=${BASE_WANDB_PROJECT:-"${WANDB_PROJECT:-bioreason-pro-custom}"}', wrapper_text)
         self.assertIn('SFT_CONVERSION_LORA_RANK=${SFT_CONVERSION_LORA_RANK:-128}', wrapper_text)
         self.assertIn('SFT_CONVERSION_LORA_ALPHA=${SFT_CONVERSION_LORA_ALPHA:-256}', wrapper_text)
@@ -144,6 +146,8 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
     def test_sft_wrapper_supports_search_hyperparameters(self):
         wrapper_text = SFT_WRAPPER_PATH.read_text()
 
+        self.assertIn("source_env_file_without_overrides()", wrapper_text)
+        self.assertIn('source_env_file_without_overrides "$REGISTRY_ENV_FILE"', wrapper_text)
         self.assertIn('TRAIN_EXCLUSIVE=${TRAIN_EXCLUSIVE:-"True"}', wrapper_text)
         self.assertIn('STAGE2_LEARNING_RATE=${STAGE2_LEARNING_RATE:-1e-4}', wrapper_text)
         self.assertIn('STAGE2_WARMUP_RATIO=${STAGE2_WARMUP_RATIO:-0.05}', wrapper_text)

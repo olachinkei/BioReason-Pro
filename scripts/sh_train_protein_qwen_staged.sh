@@ -19,11 +19,32 @@
 # Run from project root
 cd "$(dirname "$0")/.."
 
+source_env_file_without_overrides() {
+  local env_file="$1"
+  local raw_line line key existing_value
+  [ -f "$env_file" ] || return 0
+
+  while IFS= read -r raw_line || [ -n "$raw_line" ]; do
+    line="${raw_line#"${raw_line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [ -n "$line" ] || continue
+    [[ "$line" == \#* ]] && continue
+    [[ "$line" == export\ * ]] && line="${line#export }"
+    [[ "$line" == *=* ]] || continue
+    key="${line%%=*}"
+    key="${key%"${key##*[![:space:]]}"}"
+    existing_value="${!key:-}"
+    if [ -n "$existing_value" ]; then
+      continue
+    fi
+    eval "export $line"
+  done < "$env_file"
+}
+
 REGISTRY_ENV_FILE=${REGISTRY_ENV_FILE:-"configs/disease_benchmark/wandb_registry_paths.env"}
 
 if [ -f "$REGISTRY_ENV_FILE" ]; then
-  # shellcheck disable=SC1090
-  source "$REGISTRY_ENV_FILE"
+  source_env_file_without_overrides "$REGISTRY_ENV_FILE"
 fi
 
 # ===================================================================================================
