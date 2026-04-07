@@ -599,7 +599,8 @@ class ProteinLLMModel(nn.Module):
         attention_mask = attention_mask.to(input_ids.device)
 
         # Unsloth's patched generate path is brittle with prompt embeddings. For training-time
-        # sample traces we fall back to a small greedy decode loop driven by the regular forward pass.
+        # sample traces we fall back to a small greedy decode loop that reuses the prepared
+        # multimodal prefix embeddings and appends token embeddings directly.
         if prefer_original_generate and not do_sample:
             max_new_tokens = int(generation_kwargs.pop("max_new_tokens", 64))
             eos_token_id = generation_kwargs.pop("eos_token_id", getattr(self.text_model.config, "eos_token_id", None))
@@ -608,19 +609,22 @@ class ProteinLLMModel(nn.Module):
 
             generated_ids = input_ids.clone()
             generated_attention_mask = attention_mask.clone()
+            generated_inputs_embeds = text_inputs_embeds.clone()
+            token_embedding_layer = self.text_model.get_input_embeddings()
 
             for _ in range(max_new_tokens):
-                outputs = self.forward(
-                    input_ids=generated_ids,
+                outputs = self.text_model(
+                    inputs_embeds=generated_inputs_embeds,
                     attention_mask=generated_attention_mask,
-                    protein_sequences=protein_sequences,
-                    batch_idx_map=batch_idx_map,
-                    structure_coords=structure_coords,
-                    go_aspects=go_aspects,
                     use_cache=False,
                 )
                 next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                next_token_embeds = token_embedding_layer(next_token).to(
+                    dtype=generated_inputs_embeds.dtype,
+                    device=generated_inputs_embeds.device,
+                )
                 generated_ids = torch.cat([generated_ids, next_token], dim=1)
+                generated_inputs_embeds = torch.cat([generated_inputs_embeds, next_token_embeds], dim=1)
                 next_mask = torch.ones(
                     (generated_attention_mask.size(0), 1),
                     dtype=generated_attention_mask.dtype,

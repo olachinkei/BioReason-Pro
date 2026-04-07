@@ -35,8 +35,10 @@ class TrainProteinLLMTrackingContractsTest(unittest.TestCase):
     def test_prefer_original_generate_uses_manual_decode_for_sample_traces(self):
         source = MODEL_PATH.read_text()
         self.assertIn("if prefer_original_generate and not do_sample:", source)
-        self.assertIn("outputs = self.forward(", source)
+        self.assertIn("generated_inputs_embeds = text_inputs_embeds.clone()", source)
+        self.assertIn("outputs = self.text_model(", source)
         self.assertIn("generated_ids = torch.cat([generated_ids, next_token], dim=1)", source)
+        self.assertIn("generated_inputs_embeds = torch.cat([generated_inputs_embeds, next_token_embeds], dim=1)", source)
 
     def test_sft_wrapper_passes_weave_and_logs_more_frequently(self):
         wrapper = WRAPPER_PATH.read_text()

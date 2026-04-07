@@ -41,6 +41,10 @@ DEFAULT_STRUCTURE_DIR = str((ROOT / "data" / "structures").resolve())
 DEFAULT_EVAL_OUTPUT_ROOT = "data/artifacts/eval"
 DEFAULT_DATASET_CACHE_DIR = "data/artifacts/hf_cache"
 DEFAULT_REGISTRY_ENV_FILE = "configs/disease_benchmark/wandb_registry_paths.env"
+DEFAULT_MODEL_CACHE_DIR = "data/artifacts/cache/hf_models"
+DEFAULT_PAPER_MODEL_LOCAL_DIR = "data/artifacts/models/bioreason_pro_rl_paper"
+DEFAULT_TRAIN_SFT_HF_DIR = "data/artifacts/models/train_sft_output_hf"
+SFT_TO_HF_CONVERTER = str((ROOT / "bioreason2" / "utils" / "save_unsloth_ckpt.py").resolve())
 
 SAMPLE_TABLE_COLUMNS = [
     "protein_id",
@@ -290,6 +294,113 @@ def prepare_clean_eval_output_dir(path_value: Path) -> Path:
     return path_value
 
 
+def select_checkpoint_for_eval(model_dir: Path) -> Optional[Path]:
+    checkpoints = sorted(model_dir.rglob("*.ckpt"))
+    if not checkpoints:
+        return None
+    preferred = [path for path in checkpoints if "-best-" in path.name]
+    candidates = preferred or checkpoints
+    return max(candidates, key=lambda path: (path.stat().st_mtime, path.name))
+
+
+def resolve_hf_model_dir_for_eval(
+    target: Mapping[str, Any],
+    resolved_model: Mapping[str, Any],
+    runtime_paths: Mapping[str, str],
+) -> Dict[str, Any]:
+    model_dir = Path(resolved_model["local_path"])
+    if (model_dir / "config.json").is_file():
+        return dict(resolved_model)
+
+    ckpt_path = select_checkpoint_for_eval(model_dir)
+    if ckpt_path is None:
+        raise RegistryError(
+            f"Resolved model source for {target['target_name']} does not contain config.json or a .ckpt checkpoint: "
+            f"{model_dir}"
+        )
+
+    paper_model_ref = normalize_text(os.environ.get("BIOREASON_RL_PAPER_MODEL_REGISTRY_PATH")).strip()
+    if not paper_model_ref:
+        raise RegistryError(
+            "BIOREASON_RL_PAPER_MODEL_REGISTRY_PATH is required to convert raw SFT checkpoints into HF format "
+            "for evaluation."
+        )
+
+    paper_model_source = materialize_first_available_source(
+        [
+            {
+                "type": "wandb_artifact",
+                "wandb_registry_path": paper_model_ref,
+                "local_dir": str((ROOT / DEFAULT_PAPER_MODEL_LOCAL_DIR).resolve()),
+                "required_paths": ["config.json"],
+            }
+        ],
+        allow_missing=False,
+    )
+    paper_model_dir = Path(paper_model_source["local_path"])
+
+    hf_model_dir = (ROOT / DEFAULT_TRAIN_SFT_HF_DIR).resolve()
+    if hf_model_dir.exists():
+        shutil.rmtree(hf_model_dir)
+    hf_model_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    converter_command = [
+        sys.executable,
+        SFT_TO_HF_CONVERTER,
+        "--checkpoint_path",
+        str(ckpt_path),
+        "--save_dir",
+        str(hf_model_dir),
+        "--text_model_name",
+        str(paper_model_dir),
+        "--protein_model_name",
+        "esm3_sm_open_v1",
+        "--cache_dir",
+        str((ROOT / DEFAULT_MODEL_CACHE_DIR).resolve()),
+        "--max_length_text",
+        "4000",
+        "--max_length_protein",
+        "2000",
+        "--lora_rank",
+        "128",
+        "--lora_alpha",
+        "256",
+        "--lora_dropout",
+        "0.05",
+        "--protein_embedding_layer",
+        "-1",
+        "--go_obo_path",
+        normalize_text(runtime_paths.get("go_obo_path")),
+        "--go_hidden_dim",
+        "512",
+        "--go_num_gat_layers",
+        "3",
+        "--go_num_heads",
+        "8",
+        "--go_num_reduced_embeddings",
+        "200",
+        "--go_embedding_dim",
+        "2560",
+        "--unified_go_encoder",
+        "False",
+        "--protein_model_finetune",
+        "False",
+    ]
+    checkpoint_go_embeddings = paper_model_dir / "go_embedding.pt"
+    if checkpoint_go_embeddings.is_file():
+        converter_command.extend(["--precomputed_embeddings_path", str(checkpoint_go_embeddings)])
+
+    run_shell_command(converter_command, os.environ.copy())
+    if not (hf_model_dir / "config.json").is_file():
+        raise RegistryError(f"Converted HF model directory is missing config.json: {hf_model_dir}")
+
+    converted = dict(resolved_model)
+    converted["local_path"] = str(hf_model_dir)
+    converted["converted_from_checkpoint"] = str(ckpt_path)
+    converted["source_ref"] = normalize_text(resolved_model.get("source_ref"))
+    return converted
+
+
 def run_protein_llm_target(
     args: argparse.Namespace,
     bundle: Mapping[str, Any],
@@ -302,6 +413,7 @@ def run_protein_llm_target(
     )
     if not resolved_model:
         raise RegistryError(f"Could not resolve any model source for {target['target_name']}.")
+    resolved_model = resolve_hf_model_dir_for_eval(target, resolved_model, runtime_paths)
 
     output_dir = Path(runtime_paths["output_root"]) / target["target_name"] / args.split
     prepare_clean_eval_output_dir(output_dir)

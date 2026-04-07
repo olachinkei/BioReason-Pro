@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import types
@@ -131,34 +132,38 @@ class RunRegisteredEvalContractsTest(unittest.TestCase):
             chunk_id=0,
             keep_local_eval_outputs=False,
         )
-        runtime_paths = {
-            "output_root": tempfile.mkdtemp(),
-            "go_obo_path": "/tmp/go-basic.obo",
-            "ia_file_path": "/tmp/IA.txt",
-            "go_embeddings_path": "/tmp/go-embeddings",
-            "dataset_cache_dir": "/tmp/hf-cache",
-            "structure_dir": "/tmp/structures",
-        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_dir = Path(tmpdir) / "bioreason-base"
+            model_dir.mkdir(parents=True, exist_ok=True)
+            (model_dir / "config.json").write_text("{}", encoding="utf-8")
+            runtime_paths = {
+                "output_root": tempfile.mkdtemp(),
+                "go_obo_path": "/tmp/go-basic.obo",
+                "ia_file_path": "/tmp/IA.txt",
+                "go_embeddings_path": "/tmp/go-embeddings",
+                "dataset_cache_dir": "/tmp/hf-cache",
+                "structure_dir": "/tmp/structures",
+            }
 
-        captured = {}
+            captured = {}
 
-        def fake_run_shell_command(command, env):
-            captured["command"] = list(command)
-            captured["env"] = dict(env)
+            def fake_run_shell_command(command, env):
+                captured["command"] = list(command)
+                captured["env"] = dict(env)
 
-        with mock.patch.object(
-            REGISTERED_EVAL,
-            "materialize_first_available_source",
-            return_value={
-                "local_path": "/tmp/bioreason-base",
-                "source_ref": "demo/project/bioreason-pro-base:production",
-            },
-        ), mock.patch.object(REGISTERED_EVAL, "run_shell_command", side_effect=fake_run_shell_command):
-            status = REGISTERED_EVAL.run_protein_llm_target(args, bundle, target, runtime_paths)
+            with mock.patch.object(
+                REGISTERED_EVAL,
+                "materialize_first_available_source",
+                return_value={
+                    "local_path": str(model_dir),
+                    "source_ref": "demo/project/bioreason-pro-base:production",
+                },
+            ), mock.patch.object(REGISTERED_EVAL, "run_shell_command", side_effect=fake_run_shell_command):
+                status = REGISTERED_EVAL.run_protein_llm_target(args, bundle, target, runtime_paths)
 
         self.assertEqual(status["status"], "completed")
         self.assertEqual(captured["command"], ["bash", "scripts/sh_eval.sh"])
-        self.assertEqual(captured["env"]["MODEL_PATH"], "/tmp/bioreason-base")
+        self.assertEqual(captured["env"]["MODEL_PATH"], str(model_dir))
         self.assertEqual(captured["env"]["CAFA5_DATASET"], "wanglab/cafa5")
         self.assertEqual(captured["env"]["DATASET_NAME"], "disease_temporal_hc_reasoning_v1")
         self.assertEqual(captured["env"]["TEMPORAL_SPLIT_ARTIFACT"], "demo/project/disease-temporal-split:production")
@@ -220,17 +225,118 @@ class RunRegisteredEvalContractsTest(unittest.TestCase):
                 "structure_dir": "/tmp/structures",
             }
 
+            model_dir = output_root / "model"
+            model_dir.mkdir(parents=True, exist_ok=True)
+            (model_dir / "config.json").write_text("{}", encoding="utf-8")
+
             with mock.patch.object(
                 REGISTERED_EVAL,
                 "materialize_first_available_source",
                 return_value={
-                    "local_path": "/tmp/bioreason-base",
+                    "local_path": str(model_dir),
                     "source_ref": "demo/project/bioreason-pro-base:production",
                 },
             ), mock.patch.object(REGISTERED_EVAL, "run_shell_command", return_value=None):
                 REGISTERED_EVAL.run_protein_llm_target(args, bundle, target, runtime_paths)
 
             self.assertFalse(stale_file.exists())
+
+    def test_run_protein_llm_target_converts_raw_sft_checkpoint_before_eval(self):
+        bundle = {
+            "benchmark_version": "213 -> 221 -> 225 -> 228",
+            "benchmark_alias": "213.221.225.228",
+            "shortlist_mode": "high-confidence",
+            "shortlist_query": "demo query",
+            "train_start_release": 213,
+            "train_end_release": 221,
+            "dev_end_release": 225,
+            "test_end_release": 228,
+            "temporal_split_artifact": {"wandb_registry_path": "demo/project/disease-temporal-split:production"},
+            "reasoning_dataset": {
+                "wandb_registry_path": "demo/project/disease-temporal-reasoning:production",
+                "dataset_source": "wanglab/cafa5",
+                "dataset_name": "disease_temporal_hc_reasoning_v1",
+            },
+        }
+        target = {
+            "target_name": "train-sft-output",
+            "display_name": "train-sft-output",
+            "runner": "protein_llm",
+            "model_sources": [
+                {"type": "wandb_artifact", "wandb_registry_path": "demo/project/train-sft-output:latest"}
+            ],
+        }
+        args = types.SimpleNamespace(
+            split="test",
+            wandb_project="demo-project",
+            wandb_entity="demo-entity",
+            wandb_mode="online",
+            weave_project="demo-entity/demo-project",
+            metric_threads=4,
+            metric_threshold_step=0.95,
+            max_samples=3,
+            sample_strategy="shuffled_prefix",
+            num_chunks=1,
+            chunk_id=0,
+            keep_local_eval_outputs=False,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            raw_model_dir = tmp_path / "train_sft_output"
+            raw_model_dir.mkdir(parents=True, exist_ok=True)
+            ckpt_path = raw_model_dir / "demo-best.ckpt"
+            ckpt_path.write_text("checkpoint", encoding="utf-8")
+
+            paper_model_dir = tmp_path / "paper_model"
+            paper_model_dir.mkdir(parents=True, exist_ok=True)
+            (paper_model_dir / "config.json").write_text("{}", encoding="utf-8")
+            (paper_model_dir / "go_embedding.pt").write_text("stub", encoding="utf-8")
+
+            runtime_paths = {
+                "output_root": str(tmp_path / "eval"),
+                "go_obo_path": "/tmp/go-basic.obo",
+                "ia_file_path": "/tmp/IA.txt",
+                "go_embeddings_path": "/tmp/go-embeddings",
+                "dataset_cache_dir": "/tmp/hf-cache",
+                "structure_dir": "/tmp/structures",
+            }
+
+            commands = []
+
+            def fake_materialize(sources, allow_missing=False):
+                source = sources[0]
+                if source.get("wandb_registry_path") == "demo/project/train-sft-output:latest":
+                    return {
+                        "local_path": str(raw_model_dir),
+                        "source_ref": "demo/project/train-sft-output:latest",
+                    }
+                if source.get("wandb_registry_path") == "demo/project/bioreason-pro-rl:production":
+                    return {
+                        "local_path": str(paper_model_dir),
+                        "source_ref": "demo/project/bioreason-pro-rl:production",
+                    }
+                raise AssertionError(f"Unexpected source: {source}")
+
+            def fake_run_shell(command, env):
+                commands.append(list(command))
+                if command[1].endswith("save_unsloth_ckpt.py"):
+                    save_dir = Path(command[command.index("--save_dir") + 1])
+                    save_dir.mkdir(parents=True, exist_ok=True)
+                    (save_dir / "config.json").write_text("{}", encoding="utf-8")
+
+            with mock.patch.dict(os.environ, {"BIOREASON_RL_PAPER_MODEL_REGISTRY_PATH": "demo/project/bioreason-pro-rl:production"}, clear=False), mock.patch.object(
+                REGISTERED_EVAL,
+                "materialize_first_available_source",
+                side_effect=fake_materialize,
+            ), mock.patch.object(REGISTERED_EVAL, "run_shell_command", side_effect=fake_run_shell):
+                status = REGISTERED_EVAL.run_protein_llm_target(args, bundle, target, runtime_paths)
+
+            self.assertEqual(status["status"], "completed")
+            self.assertEqual(commands[0][0], sys.executable)
+            self.assertTrue(commands[0][1].endswith("save_unsloth_ckpt.py"))
+            self.assertIn(str(ckpt_path), commands[0])
+            self.assertEqual(commands[1], ["bash", "scripts/sh_eval.sh"])
 
     def test_resolve_effective_max_samples_defaults_validation_to_100(self):
         args = types.SimpleNamespace(split="validation", max_samples=None)
