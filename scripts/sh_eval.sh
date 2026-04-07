@@ -133,11 +133,25 @@ WANDB_ENTITY=${WANDB_ENTITY:-}
 WANDB_RUN_NAME=${WANDB_RUN_NAME:-}
 WANDB_ARTIFACT_NAME=${WANDB_ARTIFACT_NAME:-}
 WANDB_MODE=${WANDB_MODE:-}
+EXPECTED_WANDB_ENTITY=${EXPECTED_WANDB_ENTITY:-"wandb-healthcare"}
+EXPECTED_WANDB_PROJECT=${EXPECTED_WANDB_PROJECT:-"bioreason-pro-custom"}
+ALLOW_WANDB_PROJECT_MISMATCH=${ALLOW_WANDB_PROJECT_MISMATCH:-0}
 WEAVE_PROJECT=${WEAVE_PROJECT:-}
 WEAVE_EVAL_NAME=${WEAVE_EVAL_NAME:-}
 
 if [ -z "${WANDB_MODE// }" ]; then
     unset WANDB_MODE
+fi
+
+if [ "$ALLOW_WANDB_PROJECT_MISMATCH" != "1" ]; then
+    if [ -n "$WANDB_ENTITY" ] && [ "$WANDB_ENTITY" != "$EXPECTED_WANDB_ENTITY" ]; then
+        echo "Error: WANDB_ENTITY=$WANDB_ENTITY does not match expected $EXPECTED_WANDB_ENTITY"
+        exit 1
+    fi
+    if [ -n "$WANDB_PROJECT" ] && [ "$WANDB_PROJECT" != "$EXPECTED_WANDB_PROJECT" ]; then
+        echo "Error: WANDB_PROJECT=$WANDB_PROJECT does not match expected $EXPECTED_WANDB_PROJECT"
+        exit 1
+    fi
 fi
 
 # ===================================================================================================

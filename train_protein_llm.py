@@ -240,6 +240,7 @@ class ProteinLLMFineTuner(pl.LightningModule):
         self.use_unsloth = self.hparams.use_unsloth
         self.weave_trace_state: Optional[Dict[str, Any]] = None
         self._wandb_metric_schema_defined = False
+        self._sft_sample_table = None
 
         # Store dataset configuration
         self.dataset_type = self.hparams.dataset_type
@@ -560,6 +561,30 @@ class ProteinLLMFineTuner(pl.LightningModule):
         clean_payload["epoch"] = int(self.current_epoch)
         run.log(clean_payload)
 
+    def _log_sft_sample_row(self, sample_row: Mapping[str, Any]) -> None:
+        if not self.trainer.is_global_zero:
+            return
+
+        run = self._get_wandb_run()
+        if run is None:
+            return
+
+        if self._sft_sample_table is None:
+            self._sft_sample_table = wandb.Table(
+                columns=list(SFT_SAMPLE_TABLE_COLUMNS),
+                log_mode="MUTABLE",
+            )
+
+        row_values = [sample_row.get(column, "") for column in SFT_SAMPLE_TABLE_COLUMNS]
+        self._sft_sample_table.add_data(*row_values)
+        run.log(
+            {
+                "train_sft_samples": self._sft_sample_table,
+                "trainer/global_step": int(self.global_step),
+                "epoch": int(self.current_epoch),
+            }
+        )
+
     def _step(self, batch: Dict, batch_idx: int, prefix: str) -> torch.Tensor:
         """
         Performs a single step for training, validation, or testing.
@@ -720,6 +745,7 @@ class ProteinLLMFineTuner(pl.LightningModule):
             sample_row=sample_row,
             result=result,
         )
+        self._log_sft_sample_row(sample_row)
 
         if result["success"]:
             if self.verbose_sample_generation:
@@ -1204,23 +1230,32 @@ def main(args: ArgumentParser):
             print("✓ GO encoder weights saved.")
 
     if trainer.global_rank == 0:
-        checkpoint_artifact_status = maybe_log_directory_artifact(
-            run=logger.experiment,
-            wandb_module=wandb,
-            artifact_name=tracking_config["model_artifact"],
-            artifact_type="model",
-            directory=args.checkpoint_dir,
-            aliases=args.checkpoint_artifact_aliases,
-            metadata=build_checkpoint_artifact_metadata(args, run_name, tracking_config=tracking_config),
-        )
-        if checkpoint_artifact_status["logged"]:
-            sync_run_config(
-                logger.experiment,
-                {
-                    "model_artifact": checkpoint_artifact_status["artifact_name"],
-                    "model_artifact_aliases": checkpoint_artifact_status["aliases"],
-                },
+        try:
+            checkpoint_artifact_status = maybe_log_directory_artifact(
+                run=logger.experiment,
+                wandb_module=wandb,
+                artifact_name=tracking_config["model_artifact"],
+                artifact_type="model",
+                directory=args.checkpoint_dir,
+                aliases=args.checkpoint_artifact_aliases,
+                metadata=build_checkpoint_artifact_metadata(args, run_name, tracking_config=tracking_config),
             )
+            if checkpoint_artifact_status["logged"]:
+                sync_run_config(
+                    logger.experiment,
+                    {
+                        "model_artifact": checkpoint_artifact_status["artifact_name"],
+                        "model_artifact_aliases": checkpoint_artifact_status["aliases"],
+                    },
+                )
+        finally:
+            if weave_trace_state and weave_trace_state.get("client") is not None:
+                flush = getattr(weave_trace_state["client"], "flush", None)
+                if callable(flush):
+                    flush()
+            finish = getattr(logger.experiment, "finish", None)
+            if callable(finish):
+                finish()
 
     # trainer.test(model, ckpt_path=args.ckpt_path if args.ckpt_path else "best")
 

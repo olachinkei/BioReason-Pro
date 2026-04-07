@@ -36,6 +36,7 @@ fi
 
 export PYTHONUNBUFFERED=1
 export PYTHONDONTWRITEBYTECODE=1
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
 unset SLURM_TRES_PER_TASK
 # ===================================================================================================
@@ -54,10 +55,24 @@ as_bool() {
 # ===================================================================================================
 BASE_WANDB_PROJECT=${BASE_WANDB_PROJECT:-"${WANDB_PROJECT:-bioreason-pro-finetune}"}
 WANDB_ENTITY=${WANDB_ENTITY:-""}
+EXPECTED_WANDB_ENTITY=${EXPECTED_WANDB_ENTITY:-"wandb-healthcare"}
+EXPECTED_WANDB_PROJECT=${EXPECTED_WANDB_PROJECT:-"bioreason-pro-custom"}
+ALLOW_WANDB_PROJECT_MISMATCH=${ALLOW_WANDB_PROJECT_MISMATCH:-"False"}
 WEAVE_PROJECT=${WEAVE_PROJECT:-""}
 WEAVE_TRACE_BUDGET=${WEAVE_TRACE_BUDGET:-64}
 if [ -z "$WEAVE_PROJECT" ] && [ -n "$WANDB_ENTITY" ]; then
   WEAVE_PROJECT="${WANDB_ENTITY}/${BASE_WANDB_PROJECT}"
+fi
+
+if ! as_bool "$ALLOW_WANDB_PROJECT_MISMATCH"; then
+  if [ -n "$WANDB_ENTITY" ] && [ "$WANDB_ENTITY" != "$EXPECTED_WANDB_ENTITY" ]; then
+    echo "Error: WANDB_ENTITY=$WANDB_ENTITY does not match expected $EXPECTED_WANDB_ENTITY"
+    exit 1
+  fi
+  if [ -n "$BASE_WANDB_PROJECT" ] && [ "$BASE_WANDB_PROJECT" != "$EXPECTED_WANDB_PROJECT" ]; then
+    echo "Error: BASE_WANDB_PROJECT=$BASE_WANDB_PROJECT does not match expected $EXPECTED_WANDB_PROJECT"
+    exit 1
+  fi
 fi
 TEXT_MODEL_NAME="Qwen/Qwen3-4B-Thinking-2507"
 EXPERIMENT_NAME="reasoning-sft"
@@ -130,12 +145,13 @@ TEST_END_RELEASE=228
 JOB_TIME_LIMIT="12:00:00"
 
 # --- Model Configuration ---
-MAX_LENGTH_TEXT=10000
-MAX_LENGTH_PROTEIN=2000
+MAX_LENGTH_TEXT=${MAX_LENGTH_TEXT:-4096}
+MAX_LENGTH_PROTEIN=${MAX_LENGTH_PROTEIN:-2000}
 LORA_RANK=128
 LORA_ALPHA=256
 LORA_DROPOUT=0.05
 ESM_LAYER=37
+NUM_WORKERS=${NUM_WORKERS:-4}
 
 INTERPRO_IN_PROMPT=True
 PREDICT_INTERPRO=False
@@ -254,7 +270,7 @@ BASE_COMMAND+=(
     --go_embedding_dim 2560
     --unified_go_encoder True
     --return_answer_in_batch False
-    --num_workers 8
+    --num_workers "$NUM_WORKERS"
     --weight_decay 0.01
     --seed 23
     --save_top_k 1

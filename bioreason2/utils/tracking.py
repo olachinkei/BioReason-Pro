@@ -299,9 +299,13 @@ def maybe_log_directory_artifact(
         }
 
     try:
-        log_artifact(artifact, aliases=resolved_aliases or None)
+        logged_artifact = log_artifact(artifact, aliases=resolved_aliases or None)
     except TypeError:
-        log_artifact(artifact)
+        logged_artifact = log_artifact(artifact)
+
+    wait = getattr(logged_artifact, "wait", None)
+    if callable(wait):
+        wait()
 
     return {
         "logged": True,

@@ -6,6 +6,7 @@ ROOT = Path(__file__).resolve().parents[1]
 TRAIN_PATH = ROOT / "train_protein_llm.py"
 WRAPPER_PATH = ROOT / "scripts" / "sh_train_protein_qwen_staged.sh"
 MODEL_PATH = ROOT / "bioreason2" / "models" / "protein_llm.py"
+TRACKING_PATH = ROOT / "bioreason2" / "utils" / "tracking.py"
 
 
 class TrainProteinLLMTrackingContractsTest(unittest.TestCase):
@@ -16,7 +17,9 @@ class TrainProteinLLMTrackingContractsTest(unittest.TestCase):
         self.assertIn("prefer_original_generate=True", source)
         self.assertIn('"failure_reason"', source)
         self.assertIn('"assistant_marker_found"', source)
-        self.assertNotIn("wandb.Table(", source)
+        self.assertIn('wandb.Table(', source)
+        self.assertIn('log_mode="MUTABLE"', source)
+        self.assertIn('"train_sft_samples"', source)
         self.assertNotIn('step_id = f"gen_', source)
 
     def test_train_sft_logs_core_metrics_to_wandb(self):
@@ -52,6 +55,8 @@ class TrainProteinLLMTrackingContractsTest(unittest.TestCase):
         wrapper = WRAPPER_PATH.read_text()
         self.assertIn('WEAVE_PROJECT=${WEAVE_PROJECT:-""}', wrapper)
         self.assertIn("WEAVE_TRACE_BUDGET=${WEAVE_TRACE_BUDGET:-64}", wrapper)
+        self.assertIn('EXPECTED_WANDB_ENTITY=${EXPECTED_WANDB_ENTITY:-"wandb-healthcare"}', wrapper)
+        self.assertIn('EXPECTED_WANDB_PROJECT=${EXPECTED_WANDB_PROJECT:-"bioreason-pro-custom"}', wrapper)
         self.assertIn("USE_UNSLOTH=${USE_UNSLOTH:-False}", wrapper)
         self.assertIn("ATTN_IMPLEMENTATION=${ATTN_IMPLEMENTATION:-sdpa}", wrapper)
         self.assertIn('STAGE2_LOG_EVERY_N_STEPS=${STAGE2_LOG_EVERY_N_STEPS:-10}', wrapper)
@@ -64,6 +69,19 @@ class TrainProteinLLMTrackingContractsTest(unittest.TestCase):
         self.assertIn('--use_unsloth "$USE_UNSLOTH"', wrapper)
         self.assertIn('--attn_implementation "$ATTN_IMPLEMENTATION"', wrapper)
         self.assertIn('--every_n_train_steps "$STAGE2_SAMPLE_GENERATION_EVERY_N_STEPS"', wrapper)
+
+    def test_train_sft_finishes_wandb_and_flushes_weave(self):
+        source = TRAIN_PATH.read_text()
+        self.assertIn('flush = getattr(weave_trace_state["client"], "flush", None)', source)
+        self.assertIn('finish = getattr(logger.experiment, "finish", None)', source)
+        self.assertIn("if callable(finish):", source)
+        self.assertIn("finish()", source)
+
+    def test_directory_artifact_logging_waits_for_completion(self):
+        source = TRACKING_PATH.read_text()
+        self.assertIn('wait = getattr(logged_artifact, "wait", None)', source)
+        self.assertIn("if callable(wait):", source)
+        self.assertIn("wait()", source)
 
 
 if __name__ == "__main__":
