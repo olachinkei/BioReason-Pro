@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = ROOT / "train_protein_grpo.py"
 SFT_SCRIPT_PATH = ROOT / "train_protein_llm.py"
 WRAPPER_PATH = ROOT / "scripts" / "sh_train_protein_grpo.sh"
+SFT_WRAPPER_PATH = ROOT / "scripts" / "sh_train_protein_qwen_staged.sh"
 
 
 def load_grpo_module():
@@ -114,16 +115,17 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
 
         self.assertIn("maybe_use_artifact_refs(", source)
         self.assertIn("maybe_trace_generation(", source)
-        self.assertIn('"data/step_num_groups_submitted"', source)
-        self.assertIn('"data/step_num_groups_trainable"', source)
-        self.assertIn('"data/step_num_trajectories"', source)
-        self.assertIn('"data/step_num_datums"', source)
-        self.assertIn('"data/step_trainer_tokens"', source)
+        self.assertIn('"data_step_num_groups_submitted"', source)
+        self.assertIn('"data_step_num_groups_trainable"', source)
+        self.assertIn('"data_step_num_trajectories"', source)
+        self.assertIn('"data_step_num_datums"', source)
+        self.assertIn('"data_step_trainer_tokens"', source)
         self.assertIn('"reward_std_dev"', source)
-        self.assertIn('"loss/train"', source)
-        self.assertIn('"loss/kl_div"', source)
-        self.assertIn('"loss/learning_rate"', source)
-        self.assertIn('"loss/grad_norm"', source)
+        self.assertIn('"loss_train"', source)
+        self.assertIn('"loss_kl_div"', source)
+        self.assertIn('"loss_learning_rate"', source)
+        self.assertIn('"loss_grad_norm"', source)
+        self.assertIn('"eval_reward"', source)
         self.assertNotIn("train_rl_rollouts", source)
         self.assertNotIn("wandb.Table(", source)
         self.assertNotIn('"dataset/train_size"', source)
@@ -136,6 +138,19 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertIn('"temporal_split_artifact": args.temporal_split_artifact', source)
         self.assertIn('"dataset_artifact": args.dataset_artifact', source)
         self.assertIn('"base_checkpoint": args.base_checkpoint', source)
+
+    def test_sft_wrapper_supports_search_hyperparameters(self):
+        wrapper_text = SFT_WRAPPER_PATH.read_text()
+
+        self.assertIn('TRAIN_EXCLUSIVE=${TRAIN_EXCLUSIVE:-"True"}', wrapper_text)
+        self.assertIn('STAGE2_LEARNING_RATE=${STAGE2_LEARNING_RATE:-1e-4}', wrapper_text)
+        self.assertIn('STAGE2_WARMUP_RATIO=${STAGE2_WARMUP_RATIO:-0.05}', wrapper_text)
+        self.assertIn('STAGE2_BATCH_SIZE=${STAGE2_BATCH_SIZE:-4}', wrapper_text)
+        self.assertIn('STAGE2_GRADIENT_ACCUMULATION_STEPS=${STAGE2_GRADIENT_ACCUMULATION_STEPS:-1}', wrapper_text)
+        self.assertIn('STAGE2_EARLY_STOPPING_PATIENCE=${STAGE2_EARLY_STOPPING_PATIENCE:-2}', wrapper_text)
+        self.assertIn('STAGE2_RUN_LABEL=${STAGE2_RUN_LABEL:-""}', wrapper_text)
+        self.assertIn('--early_stopping_patience "$STAGE2_EARLY_STOPPING_PATIENCE"', wrapper_text)
+        self.assertIn('--learning_rate "$STAGE2_LEARNING_RATE"', wrapper_text)
 
 
 if __name__ == "__main__":

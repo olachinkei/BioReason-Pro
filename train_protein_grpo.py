@@ -927,16 +927,16 @@ def evaluate_policy(
     model.train()
     if sample_count == 0:
         return {
-            "eval/reward": 0.0,
-            "eval/completion_length": 0.0,
-            "eval/loss/kl_div": 0.0,
-            "eval/data/step_num_datums": 0.0,
+            "eval_reward": 0.0,
+            "eval_completion_length": 0.0,
+            "eval_loss_kl_div": 0.0,
+            "eval_data_step_num_datums": 0.0,
         }
     return {
-        "eval/reward": total_reward / sample_count,
-        "eval/completion_length": total_length / sample_count,
-        "eval/loss/kl_div": total_kl / sample_count if sample_count else 0.0,
-        "eval/data/step_num_datums": float(sample_count),
+        "eval_reward": total_reward / sample_count,
+        "eval_completion_length": total_length / sample_count,
+        "eval_loss_kl_div": total_kl / sample_count if sample_count else 0.0,
+        "eval_data_step_num_datums": float(sample_count),
     }
 
 
@@ -1153,17 +1153,17 @@ def train(args: argparse.Namespace) -> None:
             if not sample_losses:
                 global_step += 1
                 skipped_payload = {
-                    "loss/train": 0.0,
+                    "loss_train": 0.0,
                     "reward": sum(reward_totals) / max(len(reward_totals), 1) if reward_totals else 0.0,
                     "reward_std_dev": sum(reward_stds) / max(len(reward_stds), 1) if reward_stds else 0.0,
-                    "loss/kl_div": 0.0,
-                    "loss/learning_rate": optimizer.param_groups[0]["lr"],
-                    "loss/grad_norm": 0.0,
-                    "data/step_num_groups_submitted": float(batch_size),
-                    "data/step_num_groups_trainable": float(trainable_group_count),
-                    "data/step_num_trajectories": float(len(reward_totals)),
-                    "data/step_num_datums": float(batch_size),
-                    "data/step_trainer_tokens": float(sum(completion_lengths)),
+                    "loss_kl_div": 0.0,
+                    "loss_learning_rate": optimizer.param_groups[0]["lr"],
+                    "loss_grad_norm": 0.0,
+                    "data_step_num_groups_submitted": float(batch_size),
+                    "data_step_num_groups_trainable": float(trainable_group_count),
+                    "data_step_num_trajectories": float(len(reward_totals)),
+                    "data_step_num_datums": float(batch_size),
+                    "data_step_trainer_tokens": float(sum(completion_lengths)),
                 }
                 if wandb_run is not None:
                     print(f"Logging RL skipped-update metrics at global_step={global_step}.")
@@ -1188,8 +1188,8 @@ def train(args: argparse.Namespace) -> None:
                         wandb_run.log(val_metrics, step=global_step)
                         print(f"RL validation metrics logged at global_step={global_step}.")
                     last_eval_step = global_step
-                    if val_metrics["eval/reward"] > best_val_reward:
-                        best_val_reward = val_metrics["eval/reward"]
+                    if val_metrics["eval_reward"] > best_val_reward:
+                        best_val_reward = val_metrics["eval_reward"]
                         save_raw_checkpoint(model, raw_checkpoint_dir / "best", global_step, args)
 
                 if args.save_every_n_steps > 0 and global_step % args.save_every_n_steps == 0:
@@ -1216,17 +1216,17 @@ def train(args: argparse.Namespace) -> None:
             global_step += 1
 
             log_payload = {
-                "loss/train": float(loss.detach().item() * max(args.gradient_accumulation_steps, 1)),
+                "loss_train": float(loss.detach().item() * max(args.gradient_accumulation_steps, 1)),
                 "reward": sum(reward_totals) / max(len(reward_totals), 1),
                 "reward_std_dev": sum(reward_stds) / max(len(reward_stds), 1),
-                "loss/kl_div": sum(kl_values) / max(len(kl_values), 1) if kl_values else 0.0,
-                "loss/learning_rate": optimizer.param_groups[0]["lr"],
-                "loss/grad_norm": grad_norm_value,
-                "data/step_num_groups_submitted": float(batch_size),
-                "data/step_num_groups_trainable": float(trainable_group_count),
-                "data/step_num_trajectories": float(len(reward_totals)),
-                "data/step_num_datums": float(batch_size),
-                "data/step_trainer_tokens": float(sum(completion_lengths)),
+                "loss_kl_div": sum(kl_values) / max(len(kl_values), 1) if kl_values else 0.0,
+                "loss_learning_rate": optimizer.param_groups[0]["lr"],
+                "loss_grad_norm": grad_norm_value,
+                "data_step_num_groups_submitted": float(batch_size),
+                "data_step_num_groups_trainable": float(trainable_group_count),
+                "data_step_num_trajectories": float(len(reward_totals)),
+                "data_step_num_datums": float(batch_size),
+                "data_step_trainer_tokens": float(sum(completion_lengths)),
             }
             if wandb_run is not None:
                 print(f"Logging RL train metrics at global_step={global_step}.")
@@ -1251,8 +1251,8 @@ def train(args: argparse.Namespace) -> None:
                     wandb_run.log(val_metrics, step=global_step)
                     print(f"RL validation metrics logged at global_step={global_step}.")
                 last_eval_step = global_step
-                if val_metrics["eval/reward"] > best_val_reward:
-                    best_val_reward = val_metrics["eval/reward"]
+                if val_metrics["eval_reward"] > best_val_reward:
+                    best_val_reward = val_metrics["eval_reward"]
                     save_raw_checkpoint(model, raw_checkpoint_dir / "best", global_step, args)
 
             if args.save_every_n_steps > 0 and global_step % args.save_every_n_steps == 0:
