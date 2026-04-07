@@ -14,7 +14,8 @@ import os
 import time
 from argparse import ArgumentParser
 from functools import partial
-from typing import Optional, Dict
+from pathlib import Path
+from typing import Any, Dict, Mapping, Optional
 
 # Third-party imports
 import pytorch_lightning as pl
@@ -27,6 +28,7 @@ from pytorch_lightning.callbacks import (
     ModelCheckpoint,
     DeviceStatsMonitor,
     Callback,
+    EarlyStopping,
 )
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.profilers import AdvancedProfiler
@@ -35,6 +37,11 @@ from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from transformers import logging
 from datasets import Value, concatenate_datasets
+
+try:
+    import weave
+except ImportError:  # pragma: no cover - optional on local environments
+    weave = None
 
 # Local imports
 from bioreason2.dataset.cafa5.collate import qwen_protein_collate_fn
@@ -59,6 +66,101 @@ from bioreason2.utils import (
 # Set start method to 'spawn' for CUDA compatibility with multiprocessing
 torch.multiprocessing.set_sharing_strategy("file_system")
 logging.set_verbosity_error()
+
+
+def normalize_tracking_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def resolve_weave_project(args: Any) -> str:
+    explicit = normalize_tracking_text(getattr(args, "weave_project", None)).strip()
+    if explicit:
+        return explicit
+    entity = normalize_tracking_text(getattr(args, "wandb_entity", None)).strip()
+    project = normalize_tracking_text(getattr(args, "wandb_project", None)).strip()
+    if entity and project:
+        return f"{entity}/{project}"
+    return ""
+
+
+def ensure_weave_server_cache_dir(output_dir: Path) -> str:
+    cache_dir = os.environ.get("WEAVE_SERVER_CACHE_DIR")
+    if normalize_tracking_text(cache_dir).strip():
+        resolved = Path(cache_dir).expanduser()
+    else:
+        resolved = output_dir / "weave_server_cache"
+        os.environ["WEAVE_SERVER_CACHE_DIR"] = str(resolved)
+    resolved.mkdir(parents=True, exist_ok=True)
+    return str(resolved)
+
+
+def maybe_init_weave(args: Any, output_dir: Path) -> Optional[Dict[str, Any]]:
+    if weave is None:
+        print("⚠️  Weave is unavailable; SFT generation traces will be skipped.")
+        return None
+
+    weave_project = resolve_weave_project(args)
+    if not weave_project:
+        print("⚠️  Weave project is not set; SFT generation traces will be skipped.")
+        return None
+
+    cache_dir = ensure_weave_server_cache_dir(output_dir)
+    print(f"Initializing Weave for SFT tracing: project={weave_project}, cache_dir={cache_dir}")
+    client = weave.init(weave_project)
+    print("Weave initialization for SFT tracing completed.")
+
+    @weave.op(name="train_sft_generation_trace")
+    def trace_generation(payload: Dict[str, Any]) -> Dict[str, Any]:
+        return payload
+
+    return {
+        "client": client,
+        "trace_generation": trace_generation,
+        "remaining_budget": max(int(getattr(args, "weave_trace_budget", 0)), 0),
+        "project": weave_project,
+        "logged": 0,
+    }
+
+
+def maybe_trace_sft_generation(
+    trace_state: Optional[Dict[str, Any]],
+    *,
+    prefix: str,
+    global_step: int,
+    batch_idx: int,
+    sample_row: Mapping[str, Any],
+    result: Mapping[str, Any],
+) -> None:
+    if not trace_state or trace_state.get("remaining_budget", 0) <= 0:
+        return
+
+    trace_state["remaining_budget"] -= 1
+    payload = {
+        "split": sample_row.get("split") or prefix,
+        "prefix": prefix,
+        "global_step": int(global_step),
+        "batch_idx": int(batch_idx),
+        "success": bool(result.get("success", False)),
+        "assistant_marker_found": bool(result.get("assistant_marker_found", False)),
+        "failure_reason": normalize_tracking_text(result.get("failure_reason")),
+        "error": normalize_tracking_text(result.get("error")),
+        "protein_id": normalize_tracking_text(sample_row.get("protein_id")),
+        "input_summary": normalize_tracking_text(sample_row.get("input_summary"))[:1024],
+        "reasoning": normalize_tracking_text(sample_row.get("reasoning")),
+        "final_answer": normalize_tracking_text(sample_row.get("final_answer")),
+        "expected_go_bp": normalize_tracking_text(sample_row.get("expected_go_bp")),
+        "expected_go_mf": normalize_tracking_text(sample_row.get("expected_go_mf")),
+        "expected_go_cc": normalize_tracking_text(sample_row.get("expected_go_cc")),
+        "ground_truth": normalize_tracking_text(sample_row.get("ground_truth")),
+        "generation": normalize_tracking_text(sample_row.get("generation")),
+        "user_input": normalize_tracking_text(result.get("user_input"))[:1024],
+    }
+    trace_state["trace_generation"](payload)
+    trace_state["logged"] += 1
 
 
 class EpochCheckpointFromN(Callback):
@@ -133,6 +235,8 @@ class ProteinLLMFineTuner(pl.LightningModule):
         self.every_n_train_steps = self.hparams.every_n_train_steps
         self.unified_go_encoder = self.hparams.unified_go_encoder
         self.use_unsloth = self.hparams.use_unsloth
+        self.weave_trace_state: Optional[Dict[str, Any]] = None
+        self._wandb_metric_schema_defined = False
 
         # Store dataset configuration
         self.dataset_type = self.hparams.dataset_type
@@ -400,6 +504,54 @@ class ProteinLLMFineTuner(pl.LightningModule):
         else:
             raise ValueError(f"Invalid training stage: {self.training_stage}")
 
+    def attach_weave_trace_state(self, trace_state: Optional[Dict[str, Any]]) -> None:
+        self.weave_trace_state = trace_state
+
+    def _get_wandb_run(self):
+        logger = getattr(self, "logger", None)
+        return getattr(logger, "experiment", None) if logger is not None else None
+
+    def _define_wandb_metrics_if_needed(self) -> None:
+        if self._wandb_metric_schema_defined:
+            return
+
+        run = self._get_wandb_run()
+        define_metric = getattr(run, "define_metric", None) if run is not None else None
+        if define_metric is None:
+            self._wandb_metric_schema_defined = True
+            return
+
+        define_metric("trainer/global_step")
+        define_metric("epoch")
+        for metric_name in [
+            "train_loss",
+            "train_loss_epoch",
+            "val_loss",
+            "val_loss_epoch",
+            "lr_step",
+            "lr_epoch",
+        ]:
+            define_metric(metric_name, step_metric="trainer/global_step")
+        self._wandb_metric_schema_defined = True
+
+    def _manual_wandb_log(self, payload: Mapping[str, Any]) -> None:
+        if not self.trainer.is_global_zero:
+            return
+
+        run = self._get_wandb_run()
+        if run is None:
+            return
+
+        self._define_wandb_metrics_if_needed()
+        clean_payload = {
+            key: value
+            for key, value in payload.items()
+            if value is not None and not (isinstance(value, str) and value == "")
+        }
+        clean_payload["trainer/global_step"] = int(self.global_step)
+        clean_payload["epoch"] = int(self.current_epoch)
+        run.log(clean_payload)
+
     def _step(self, batch: Dict, batch_idx: int, prefix: str) -> torch.Tensor:
         """
         Performs a single step for training, validation, or testing.
@@ -448,6 +600,10 @@ class ProteinLLMFineTuner(pl.LightningModule):
 
         # Rank-0 live per-step loss for progress bar without cross-GPU sync
         if self.trainer.is_global_zero:
+            lr_scheduler = self.lr_schedulers()
+            current_lr = None
+            if lr_scheduler is not None:
+                current_lr = float(lr_scheduler.get_last_lr()[0])
             self.log(
                 f"{prefix}_loss",
                 loss.detach(),
@@ -459,13 +615,22 @@ class ProteinLLMFineTuner(pl.LightningModule):
             )
             self.log(
                 "lr",
-                self.lr_schedulers().get_last_lr()[0],
+                current_lr,
                 on_step=True,
                 on_epoch=True,
                 prog_bar=True,
                 logger=True,
                 sync_dist=False,
             )
+            if prefix == "train":
+                self._manual_wandb_log(
+                    {
+                        "train_loss": float(loss.detach().item()),
+                        "lr_step": current_lr,
+                    }
+                )
+            elif prefix == "val":
+                self._manual_wandb_log({"val_loss": float(loss.detach().item())})
             self.log(
                 "step",
                 self.global_step,
@@ -477,9 +642,15 @@ class ProteinLLMFineTuner(pl.LightningModule):
             )
 
         # Sample generation for debugging and monitoring
-        if self.enable_sample_generation and (
-            (prefix == "train" and (self.global_step % 5_000 == 0)) or (prefix == "val" and (batch_idx % 5_000 == 0))
-        ):
+        sample_generation_interval = self.every_n_train_steps or 5_000
+        should_log_generation = (
+            self.enable_sample_generation
+            and (
+                (prefix == "train" and (self.global_step % sample_generation_interval == 0))
+                or (prefix == "val" and batch_idx == 0)
+            )
+        )
+        if should_log_generation:
             self._log_sample_generation(
                 batch,
                 prefix,
@@ -516,23 +687,39 @@ class ProteinLLMFineTuner(pl.LightningModule):
                 f"\n=== Sample Generation {prefix} (step {self.global_step} / {self.trainer.estimated_stepping_batches}) ==="
             )
 
-        if self.use_unsloth:
-            # Unsloth does not support model.generate() during training
-            return
+        restore_unsloth_training = False
+        try:
+            if self.use_unsloth and hasattr(FastLanguageModel, "for_inference"):
+                FastLanguageModel.for_inference(self.model.text_model)
+                restore_unsloth_training = True
 
-        result = generate_single_response(
-            model=self.model,
-            tokenizer=self.tokenizer,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels,
-            protein_sequences=protein_sequences,
-            structure_coords=structure_coords,
-            batch_idx_map=batch_idx_map,
-            go_aspects=go_aspects,
-            example_idx=example_idx,
-            max_new_tokens=64,
-            do_sample=False,
+            result = generate_single_response(
+                model=self.model,
+                tokenizer=self.tokenizer,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                protein_sequences=protein_sequences,
+                structure_coords=structure_coords,
+                batch_idx_map=batch_idx_map,
+                go_aspects=go_aspects,
+                example_idx=example_idx,
+                max_new_tokens=64,
+                do_sample=False,
+                prefer_original_generate=True,
+            )
+        finally:
+            if restore_unsloth_training and hasattr(FastLanguageModel, "for_training"):
+                FastLanguageModel.for_training(self.model.text_model, use_gradient_checkpointing="unsloth")
+
+        sample_row = build_sft_sample_row(batch=batch, prefix=prefix, result=result, example_idx=example_idx)
+        maybe_trace_sft_generation(
+            self.weave_trace_state,
+            prefix=prefix,
+            global_step=self.global_step,
+            batch_idx=batch_idx,
+            sample_row=sample_row,
+            result=result,
         )
 
         if result["success"]:
@@ -548,7 +735,6 @@ class ProteinLLMFineTuner(pl.LightningModule):
             timestamp = time.time()
             step_id = f"gen_{self.global_step}-{timestamp}"
             wandb_logger = self.logger.experiment
-            sample_row = build_sft_sample_row(batch=batch, prefix=prefix, result=result, example_idx=example_idx)
             wandb_logger.log(
                 {
                     step_id: wandb.Table(
@@ -559,8 +745,15 @@ class ProteinLLMFineTuner(pl.LightningModule):
                     )
                 }
             )
-        elif self.verbose_sample_generation:
-            print(f"=====[Generation failed for this example {example_idx}]=====")
+        else:
+            failure_reason = normalize_tracking_text(result.get("failure_reason")) or "generation_failed"
+            if self.verbose_sample_generation:
+                print(f"=====[Generation failed for example {example_idx}: {failure_reason}]=====")
+            else:
+                print(
+                    f"Sample generation failed during {prefix} at global_step={self.global_step}, "
+                    f"batch_idx={batch_idx}: {failure_reason}"
+                )
 
     def training_step(self, batch: Dict, batch_idx: int) -> torch.Tensor:
         """Perform a single training step."""
@@ -569,6 +762,22 @@ class ProteinLLMFineTuner(pl.LightningModule):
     def validation_step(self, batch: Dict, batch_idx: int) -> torch.Tensor:
         """Perform a single validation step."""
         return self._step(batch, batch_idx, prefix="val")
+
+    def on_train_epoch_end(self) -> None:
+        train_loss_epoch = self.trainer.callback_metrics.get("train_loss_epoch")
+        lr_epoch = self.trainer.callback_metrics.get("lr_epoch")
+        payload: Dict[str, Any] = {}
+        if train_loss_epoch is not None:
+            payload["train_loss_epoch"] = float(train_loss_epoch.detach().item())
+        if lr_epoch is not None:
+            payload["lr_epoch"] = float(lr_epoch.detach().item())
+        if payload:
+            self._manual_wandb_log(payload)
+
+    def on_validation_epoch_end(self) -> None:
+        val_loss_epoch = self.trainer.callback_metrics.get("val_loss_epoch")
+        if val_loss_epoch is not None:
+            self._manual_wandb_log({"val_loss_epoch": float(val_loss_epoch.detach().item())})
 
     def configure_optimizers(self):
         """
@@ -915,9 +1124,21 @@ def main(args: ArgumentParser):
             start_epoch=args.checkpoint_start_epoch,
         )
         callbacks.extend([recent_ckpts, best_val_ckpt, epoch_ckpt])
+        if args.early_stopping_patience > 0:
+            callbacks.append(
+                EarlyStopping(
+                    monitor="val_loss_epoch",
+                    mode="min",
+                    patience=args.early_stopping_patience,
+                    min_delta=args.early_stopping_min_delta,
+                    verbose=True,
+                )
+            )
 
     # Setup logger
     is_resuming = args.ckpt_path is not None
+    if weave is not None and resolve_weave_project(args):
+        ensure_weave_server_cache_dir(Path(args.checkpoint_dir))
     logger = WandbLogger(
         project=args.wandb_project,
         entity=args.wandb_entity,
@@ -946,6 +1167,9 @@ def main(args: ArgumentParser):
     # Optionally add device stats monitor
     if args.enable_device_stats_monitor:
         callbacks.append(DeviceStatsMonitor(cpu_stats=args.device_stats_cpu))
+
+    weave_trace_state = maybe_init_weave(args, Path(args.checkpoint_dir))
+    model.attach_weave_trace_state(weave_trace_state)
 
     # Initialize the PyTorch Lightning Trainer
     trainer = pl.Trainer(
@@ -1227,6 +1451,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("--checkpoint_start_epoch", type=int, default=4, help="Epoch to start saving checkpoints from.")
     parser.add_argument("--every_n_train_steps", type=int, default=None)
+    parser.add_argument("--early_stopping_patience", type=int, default=0)
+    parser.add_argument("--early_stopping_min_delta", type=float, default=0.0)
     # Arguments for sample generation
     parser.add_argument(
         "--enable_sample_generation",
@@ -1240,6 +1466,8 @@ if __name__ == "__main__":
         default=False,
         help="Print generated samples to the console.",
     )
+    parser.add_argument("--weave_project", type=str, default=None)
+    parser.add_argument("--weave_trace_budget", type=int, default=64)
     parser.add_argument("--debug", type=str2bool, default=False)
     parser.add_argument("--run_name", type=str, default=None, help="Custom name for the WandB run.")
     parser.add_argument(

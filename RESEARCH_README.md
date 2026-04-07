@@ -397,7 +397,8 @@ W&B 上で最低限次を確認する。
 - `temporal_split_artifact`
 - `dataset_artifact`
 - `model_artifact`
-- train / validation loss
+- `train_loss`, `train_loss_epoch`, `val_loss`, `val_loss_epoch`, `lr_step`, `lr_epoch`
+- Weave generation trace
 - sample table
 - output checkpoint artifact
 

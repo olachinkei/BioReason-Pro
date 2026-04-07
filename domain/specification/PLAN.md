@@ -272,7 +272,8 @@ This wrapper internally calls `srun python train_protein_llm.py ...`.
 Complete when the following are present on W&B.
 
 - `job_type=train_sft`
-- train / validation loss
+- `train_loss`, `train_loss_epoch`, `val_loss`, `val_loss_epoch`, `lr_step`, `lr_epoch`
+- Weave generation trace
 - sample table
 - output checkpoint artifact
 

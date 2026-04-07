@@ -511,6 +511,8 @@ class ProteinLLMModel(nn.Module):
         Returns:
             Generated token IDs
         """
+        prefer_original_generate = bool(generation_kwargs.pop("prefer_original_generate", False))
+
         # Ensure required inputs are available
         if input_ids is None or attention_mask is None:
             raise ValueError("input_ids and attention_mask must be provided")
@@ -595,8 +597,17 @@ class ProteinLLMModel(nn.Module):
         text_inputs_embeds = text_inputs_embeds.to(input_ids.device)
         attention_mask = attention_mask.to(input_ids.device)
 
+        generate_fn = self.text_model.generate
+        if prefer_original_generate:
+            if hasattr(self.text_model, "_old_generate"):
+                generate_fn = self.text_model._old_generate
+            else:
+                base_model = getattr(self.text_model, "base_model", None)
+                if base_model is not None and hasattr(base_model, "_old_generate"):
+                    generate_fn = base_model._old_generate
+
         with torch.inference_mode():
-            outputs = self.text_model.generate(
+            outputs = generate_fn(
                 inputs_embeds=text_inputs_embeds,
                 attention_mask=attention_mask,
                 use_cache=True,

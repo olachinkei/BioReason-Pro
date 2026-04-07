@@ -149,6 +149,8 @@ if as_bool "$TRAIN_USE_SRUN"; then
     srun
     --job-name "${TRAIN_JOB_NAME}-prep"
     --partition "$TRAIN_PARTITION"
+    --nodes 1
+    --ntasks-per-node 1
     --gpus "$TRAIN_NUM_GPUS"
     --cpus-per-task "$TRAIN_CPUS_PER_TASK"
     --mem "$TRAIN_MEM"
@@ -158,6 +160,8 @@ if as_bool "$TRAIN_USE_SRUN"; then
     srun
     --job-name "$TRAIN_JOB_NAME"
     --partition "$TRAIN_PARTITION"
+    --nodes 1
+    --ntasks-per-node 1
     --gpus "$TRAIN_NUM_GPUS"
     --cpus-per-task "$TRAIN_CPUS_PER_TASK"
     --mem "$TRAIN_MEM"

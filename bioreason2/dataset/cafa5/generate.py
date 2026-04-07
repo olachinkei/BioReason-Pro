@@ -1,5 +1,6 @@
 import torch
 import gc
+import traceback
 from typing import Optional, List, Dict, Any
 
 
@@ -15,6 +16,7 @@ def generate_single_response(
     go_aspects: Optional[List[str]] = None,
     example_idx: int = 0,
     assistant_marker: str = "<|im_start|>assistant\n",
+    prefer_original_generate: bool = False,
     **generation_kwargs,
 ) -> Dict[str, Any]:
     """
@@ -32,6 +34,7 @@ def generate_single_response(
         go_aspects: List of GO aspects for each example in the batch
         example_idx: Which example from the batch to generate for
         assistant_marker: The marker that indicates start of assistant response
+        prefer_original_generate: Whether to bypass Unsloth fast-generate wrappers when possible
         **generation_kwargs: Additional arguments for model.generate()
 
     Returns:
@@ -41,9 +44,26 @@ def generate_single_response(
         - ground_truth: The target response (if labels provided)
         - success: Boolean indicating if generation succeeded
     """
-    result = {"user_input": "", "generation": "", "ground_truth": "", "success": False}
+    result = {
+        "user_input": "",
+        "generation": "",
+        "ground_truth": "",
+        "success": False,
+        "assistant_marker_found": False,
+        "failure_reason": "",
+        "error": "",
+    }
 
     try:
+        def _decode_non_padding_slice() -> str:
+            non_pad_positions = (input_ids[example_idx] != tokenizer.pad_token_id).nonzero(as_tuple=True)[0]
+            if len(non_pad_positions) == 0:
+                return ""
+            return tokenizer.decode(
+                input_ids[example_idx, non_pad_positions[0] : non_pad_positions[-1] + 1],
+                skip_special_tokens=False,
+            ).strip()
+
         # Encode assistant marker
         assistant_marker_tokens = tokenizer.encode(assistant_marker, add_special_tokens=False)
         marker_tensor = torch.tensor(assistant_marker_tokens, device=input_ids.device)
@@ -61,7 +81,11 @@ def generate_single_response(
                 break
 
         if assistant_pos is None:
+            result["user_input"] = _decode_non_padding_slice()
+            result["failure_reason"] = "assistant_marker_not_found"
             return result
+
+        result["assistant_marker_found"] = True
 
         # Prepare generation input (up to and including assistant marker)
         gen_input_ids = input_ids[example_idx : example_idx + 1, start_idx : assistant_pos + marker_len]
@@ -100,6 +124,7 @@ def generate_single_response(
                 structure_coords=example_structure_coords,
                 batch_idx_map=example_batch_map,
                 go_aspects=example_go_aspects,
+                prefer_original_generate=prefer_original_generate,
                 **generation_kwargs,
             )
 
@@ -135,4 +160,7 @@ def generate_single_response(
 
     except Exception as e:
         print(f"Error generating for example {example_idx}: {str(e)}")
+        traceback.print_exc()
+        result["error"] = str(e)
+        result["failure_reason"] = "generation_exception"
         return result

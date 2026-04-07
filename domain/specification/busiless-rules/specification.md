@@ -357,7 +357,11 @@ Fixed rules:
 - Stage 1 projector warm-up is treated only as a fallback for training instability or as an ablation
 - Validation subset strategy is fixed to `stratified_aspect_profile`
 - Checkpoint selection validation subset must show `selected=100` in logs
-- Train / validation metrics are saved via `wandb.log()`
+- Hyperparameter search is allowed only within the same `stage 2 only` setting, same comparison model input, and same 100-sample validation subset rule
+- SFT search may run multiple trials in parallel, but all trials must keep the same benchmark version and artifact lineage
+- The selected SFT setting is the compliant trial with the lowest `val_loss_epoch`
+- Train / validation metrics (`train_loss`, `train_loss_epoch`, `val_loss`, `val_loss_epoch`, `lr_step`, `lr_epoch`) are saved via `wandb.log()`
+- Training-time sample generation is traced with Weave
 - Sample table is saved as a W&B Table
 - Output checkpoint is registered as a W&B Artifact
 

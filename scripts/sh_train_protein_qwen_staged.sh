@@ -54,6 +54,11 @@ as_bool() {
 # ===================================================================================================
 BASE_WANDB_PROJECT=${BASE_WANDB_PROJECT:-"${WANDB_PROJECT:-bioreason-pro-finetune}"}
 WANDB_ENTITY=${WANDB_ENTITY:-""}
+WEAVE_PROJECT=${WEAVE_PROJECT:-""}
+WEAVE_TRACE_BUDGET=${WEAVE_TRACE_BUDGET:-64}
+if [ -z "$WEAVE_PROJECT" ] && [ -n "$WANDB_ENTITY" ]; then
+  WEAVE_PROJECT="${WANDB_ENTITY}/${BASE_WANDB_PROJECT}"
+fi
 TEXT_MODEL_NAME="Qwen/Qwen3-4B-Thinking-2507"
 EXPERIMENT_NAME="reasoning-sft"
 MODEL_SOURCE_RESOLVER=${MODEL_SOURCE_RESOLVER:-"scripts/materialize_model_source.py"}
@@ -68,6 +73,7 @@ TRAIN_MEM=${TRAIN_MEM:-"128G"}
 TRAIN_TIME_LIMIT=${TRAIN_TIME_LIMIT:-"12:00:00"}
 TRAIN_JOB_NAME=${TRAIN_JOB_NAME:-"bioreason-sft-stage2"}
 TRAIN_USE_SRUN=${TRAIN_USE_SRUN:-"True"}
+TRAIN_EXCLUSIVE=${TRAIN_EXCLUSIVE:-"True"}
 
 # --- Paths: Set these to your local directories ---
 BASE_CHECKPOINT_DIR=${BASE_CHECKPOINT_DIR:-"data/artifacts/models/bioreason_pro_rl_paper"}
@@ -76,6 +82,9 @@ CACHE_DIR=${CACHE_DIR:-"data/artifacts/cache"}
 STRUCTURE_DIR=${STRUCTURE_DIR:-"data/structures"}
 GO_EMBEDDINGS_PATH=${GO_EMBEDDINGS_PATH:-"${BIOREASON_GO_EMBEDDINGS_PATH:-}"}
 GO_OBO_PATH=${GO_OBO_PATH:-"bioreason2/dataset/go-basic.obo"}
+WEAVE_SERVER_CACHE_DIR=${WEAVE_SERVER_CACHE_DIR:-"${CACHE_DIR}/weave_server_cache"}
+mkdir -p "$WEAVE_SERVER_CACHE_DIR"
+export WEAVE_SERVER_CACHE_DIR
 
 # --- Dataset Configuration ---
 CAFA5_DATASET=${CAFA5_DATASET:-""}
@@ -89,6 +98,19 @@ ADD_UNIPROT_SUMMARY=True
 IS_SWISSPROT=False
 VALIDATION_SUBSET_SIZE=${VALIDATION_SUBSET_SIZE:-100}
 VALIDATION_SUBSET_STRATEGY=${VALIDATION_SUBSET_STRATEGY:-"stratified_aspect_profile"}
+STAGE2_BATCH_SIZE=${STAGE2_BATCH_SIZE:-4}
+STAGE2_GRADIENT_ACCUMULATION_STEPS=${STAGE2_GRADIENT_ACCUMULATION_STEPS:-1}
+STAGE2_MAX_EPOCHS=${STAGE2_MAX_EPOCHS:-10}
+STAGE2_LEARNING_RATE=${STAGE2_LEARNING_RATE:-1e-4}
+STAGE2_WARMUP_RATIO=${STAGE2_WARMUP_RATIO:-0.05}
+STAGE2_VAL_CHECK_INTERVAL=${STAGE2_VAL_CHECK_INTERVAL:-0.2}
+STAGE2_EARLY_STOPPING_PATIENCE=${STAGE2_EARLY_STOPPING_PATIENCE:-2}
+STAGE2_EARLY_STOPPING_MIN_DELTA=${STAGE2_EARLY_STOPPING_MIN_DELTA:-0.0}
+STAGE2_LIMIT_TRAIN_BATCHES=${STAGE2_LIMIT_TRAIN_BATCHES:-1.0}
+STAGE2_LIMIT_VAL_BATCHES=${STAGE2_LIMIT_VAL_BATCHES:-1.0}
+STAGE2_LOG_EVERY_N_STEPS=${STAGE2_LOG_EVERY_N_STEPS:-10}
+STAGE2_SAMPLE_GENERATION_EVERY_N_STEPS=${STAGE2_SAMPLE_GENERATION_EVERY_N_STEPS:-500}
+STAGE2_RUN_LABEL=${STAGE2_RUN_LABEL:-""}
 
 # --- Benchmark / Tracking Configuration ---
 BENCHMARK_VERSION="213 -> 221 -> 225 -> 228"
@@ -160,11 +182,16 @@ if as_bool "$TRAIN_USE_SRUN"; then
     srun
     --job-name "$TRAIN_JOB_NAME"
     --partition "$TRAIN_PARTITION"
+    --nodes "$TRAIN_NUM_NODES"
+    --ntasks-per-node 1
     --gpus "$TRAIN_NUM_GPUS"
     --cpus-per-task "$TRAIN_CPUS_PER_TASK"
     --mem "$TRAIN_MEM"
     --time "$TRAIN_TIME_LIMIT"
   )
+  if as_bool "$TRAIN_EXCLUSIVE"; then
+    BASE_COMMAND+=(--exclusive)
+  fi
 fi
 
 BASE_COMMAND+=(
@@ -240,9 +267,11 @@ BASE_COMMAND+=(
     --min_go_bp_freq 1
     --min_go_cc_freq 1
     --apply_go_filtering_to_val_test False
-    --log_every_n_steps 200
+    --log_every_n_steps "$STAGE2_LOG_EVERY_N_STEPS"
     --enable_sample_generation True
     --verbose_sample_generation False
+    --weave_project "$WEAVE_PROJECT"
+    --weave_trace_budget "$WEAVE_TRACE_BUDGET"
     --val_check_interval 0.2
     --debug False
 )
@@ -313,9 +342,15 @@ fi
 # ===================================================================================================
 echo "--- Starting Stage 2: Full Model Fine-tuning"
 
-RUN_NAME_S2_DIR="${BASE_WANDB_PROJECT}-$(basename ${TEXT_MODEL_NAME})-${EXPERIMENT_NAME}-stage2"
-STAGE2_CHECKPOINT_DIR="${BASE_CHECKPOINT_DIR}/${RUN_NAME_S2_DIR}"
-WANDB_RUN_NAME_S2="stage2-$(basename ${TEXT_MODEL_NAME})-${EXPERIMENT_NAME}"
+RUN_NAME_S2_DIR_DEFAULT="${BASE_WANDB_PROJECT}-$(basename ${TEXT_MODEL_NAME})-${EXPERIMENT_NAME}-stage2"
+WANDB_RUN_NAME_S2_DEFAULT="stage2-$(basename ${TEXT_MODEL_NAME})-${EXPERIMENT_NAME}"
+if [ -n "$STAGE2_RUN_LABEL" ]; then
+  RUN_NAME_S2_DIR_DEFAULT="${RUN_NAME_S2_DIR_DEFAULT}-${STAGE2_RUN_LABEL}"
+  WANDB_RUN_NAME_S2_DEFAULT="${WANDB_RUN_NAME_S2_DEFAULT}-${STAGE2_RUN_LABEL}"
+fi
+RUN_NAME_S2_DIR="${RUN_NAME_S2_DIR:-$RUN_NAME_S2_DIR_DEFAULT}"
+STAGE2_CHECKPOINT_DIR="${STAGE2_CHECKPOINT_DIR:-${BASE_CHECKPOINT_DIR}/${RUN_NAME_S2_DIR}}"
+WANDB_RUN_NAME_S2="${WANDB_RUN_NAME_S2:-$WANDB_RUN_NAME_S2_DEFAULT}"
 mkdir -p $STAGE2_CHECKPOINT_DIR
 
 CKPT_ARG=""
@@ -334,15 +369,22 @@ stdbuf -oL -eL "${BASE_COMMAND[@]}" \
     --checkpoint_artifact_name "${WANDB_RUN_NAME_S2}-checkpoints" \
     --cafa5_dataset_name $STAGE2_DATASET_NAME \
     --training_stage 2 \
-    --max_epochs 10 \
-    --learning_rate 1e-4 \
-    --warmup_ratio 0.05 \
+    --max_epochs "$STAGE2_MAX_EPOCHS" \
+    --learning_rate "$STAGE2_LEARNING_RATE" \
+    --warmup_ratio "$STAGE2_WARMUP_RATIO" \
     --text_model_finetune True \
     --projector_checkpoint_path $PROJECTOR_WEIGHTS_PATH \
     --go_projection_checkpoint_path $GO_PROJECTOR_WEIGHTS_PATH \
     --go_encoder_checkpoint_path $GO_ENCODER_WEIGHTS_PATH \
     --checkpoint_dir $STAGE2_CHECKPOINT_DIR \
-    --every_n_train_steps 10000000000 \
+    --every_n_train_steps "$STAGE2_SAMPLE_GENERATION_EVERY_N_STEPS" \
+    --batch_size "$STAGE2_BATCH_SIZE" \
+    --gradient_accumulation_steps "$STAGE2_GRADIENT_ACCUMULATION_STEPS" \
+    --val_check_interval "$STAGE2_VAL_CHECK_INTERVAL" \
+    --early_stopping_patience "$STAGE2_EARLY_STOPPING_PATIENCE" \
+    --early_stopping_min_delta "$STAGE2_EARLY_STOPPING_MIN_DELTA" \
+    --limit_train_batches "$STAGE2_LIMIT_TRAIN_BATCHES" \
+    --limit_val_batches "$STAGE2_LIMIT_VAL_BATCHES" \
     --wandb_project "${BASE_WANDB_PROJECT}" \
     $CKPT_ARG
 # ===================================================================================================
