@@ -67,6 +67,12 @@ SAMPLE_TABLE_COLUMNS = [
 ]
 
 
+def parse_bool_env(value: Optional[str]) -> bool:
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run disease benchmark evaluation from W&B Registry path manifests.")
     parser.add_argument("--target", type=str, default=None, help="Single evaluation target to run.")
@@ -167,6 +173,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--num-chunks", type=int, default=1)
     parser.add_argument("--chunk-id", type=int, default=0)
+    parser.add_argument(
+        "--use-srun",
+        action="store_true",
+        default=parse_bool_env(os.getenv("BIOREASON_EVAL_USE_SRUN") or os.getenv("EVAL_USE_SRUN")),
+        help="Submit the low-level eval wrapper through srun when invoked from a login node.",
+    )
+    parser.add_argument("--srun-partition", type=str, default=os.getenv("BIOREASON_EVAL_PARTITION") or "h100")
+    parser.add_argument("--srun-gpus", type=int, default=int(os.getenv("BIOREASON_EVAL_GPUS") or "1"))
+    parser.add_argument("--srun-cpus-per-task", type=int, default=int(os.getenv("BIOREASON_EVAL_CPUS_PER_TASK") or "8"))
+    parser.add_argument("--srun-mem", type=str, default=os.getenv("BIOREASON_EVAL_MEM") or "128G")
+    parser.add_argument("--srun-time-limit", type=str, default=os.getenv("BIOREASON_EVAL_TIME_LIMIT") or "02:00:00")
+    parser.add_argument("--srun-account", type=str, default=os.getenv("BIOREASON_EVAL_ACCOUNT") or "")
     parser.add_argument(
         "--continue-on-error",
         action="store_true",
@@ -285,6 +303,43 @@ def remove_empty_parent(path_value: Path) -> None:
 
 def run_shell_command(command: Sequence[str], env: Mapping[str, str]) -> None:
     subprocess.run(list(command), cwd=str(ROOT), env=dict(env), check=True)
+
+
+def should_wrap_eval_with_srun(args: argparse.Namespace) -> bool:
+    if not getattr(args, "use_srun", False):
+        return False
+    return not bool(os.getenv("SLURM_JOB_ID"))
+
+
+def build_srun_command(
+    args: argparse.Namespace,
+    base_command: Sequence[str],
+    *,
+    job_name: str,
+) -> List[str]:
+    command = [
+        "srun",
+        "--job-name",
+        job_name,
+        "--partition",
+        normalize_text(args.srun_partition),
+        "--nodes",
+        "1",
+        "--ntasks-per-node",
+        "1",
+        "--gpus",
+        str(args.srun_gpus),
+        "--cpus-per-task",
+        str(args.srun_cpus_per_task),
+        "--mem",
+        normalize_text(args.srun_mem),
+        "--time",
+        normalize_text(args.srun_time_limit),
+    ]
+    if normalize_text(args.srun_account):
+        command.extend(["--account", normalize_text(args.srun_account)])
+    command.extend(list(base_command))
+    return command
 
 
 def prepare_clean_eval_output_dir(path_value: Path) -> Path:
@@ -461,7 +516,11 @@ def run_protein_llm_target(
             "KEEP_LOCAL_EVAL_OUTPUTS": "1" if args.keep_local_eval_outputs else "0",
         }
     )
-    run_shell_command(["bash", "scripts/sh_eval.sh"], env)
+    command: List[str] = ["bash", "scripts/sh_eval.sh"]
+    if should_wrap_eval_with_srun(args):
+        job_name = f"eval-{normalize_text(target['target_name'])[:32]}-{args.split}"
+        command = build_srun_command(args, command, job_name=job_name)
+    run_shell_command(command, env)
     if should_cleanup_local_eval_outputs(args):
         remove_empty_parent(output_dir)
 

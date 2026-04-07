@@ -1,6 +1,7 @@
 import json
 import os
 import shlex
+import shutil
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
@@ -232,6 +233,9 @@ def download_wandb_artifact(wandb_registry_path: str, local_dir: str) -> str:
         raise RegistryError("wandb is required to download registry artifacts.") from exc
 
     api = wandb.Api()
+    local_path = Path(local_dir)
+    if local_path.exists():
+        shutil.rmtree(local_path)
     ensure_directory(local_dir)
     artifact = api.artifact(wandb_registry_path)
     artifact.download(root=local_dir)

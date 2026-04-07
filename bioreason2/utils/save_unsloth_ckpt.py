@@ -1,4 +1,5 @@
 import os
+import shutil
 import torch
 from bioreason2.models.protein_llm import ProteinLLMModel, _get_target_modules
 from pathlib import Path
@@ -83,6 +84,14 @@ def save_lightning_ckpt(args):
         + ("Unsloth..." if use_unsloth_runtime else "standard PEFT fallback...")
     )
 
+    checkpoint_go_cache_path = None
+    precomputed_embeddings_source = args.precomputed_embeddings_path
+    if precomputed_embeddings_source:
+        candidate = Path(precomputed_embeddings_source)
+        if candidate.is_file():
+            checkpoint_go_cache_path = candidate
+            precomputed_embeddings_source = None
+
     model = ProteinLLMModel(
         text_model_name=args.text_model_name,
         protein_model_name=args.protein_model_name,
@@ -95,7 +104,7 @@ def save_lightning_ckpt(args):
         go_model_finetune=True,
         attn_implementation="flash_attention_2" if use_unsloth_runtime else "sdpa",
         go_obo_path=args.go_obo_path,
-        precomputed_embeddings_path=args.precomputed_embeddings_path,
+        precomputed_embeddings_path=precomputed_embeddings_source,
         go_hidden_dim=args.go_hidden_dim,
         go_num_gat_layers=args.go_num_gat_layers,
         go_num_heads=args.go_num_heads,
@@ -231,6 +240,10 @@ def save_lightning_ckpt(args):
     _save_component_state_dict(model.protein_projection, f"{args.save_dir}/protein_projection.pt", "protein projection")
     _save_component_state_dict(model.go_projection, f"{args.save_dir}/go_projection.pt", "GO projection")
     _save_component_state_dict(getattr(model, "go_encoder", None), f"{args.save_dir}/go_encoder.pt", "GO encoder")
+    if checkpoint_go_cache_path is not None:
+        target_cache_path = Path(args.save_dir) / "go_embedding.pt"
+        shutil.copy2(checkpoint_go_cache_path, target_cache_path)
+        print(f"💾 Saved GO embedding cache to {target_cache_path}")
     
     protein_model_dir = f"{args.save_dir}/protein_model"
     os.makedirs(protein_model_dir, exist_ok=True)
