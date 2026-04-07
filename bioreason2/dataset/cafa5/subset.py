@@ -11,6 +11,15 @@ ASPECT_COLUMNS: Sequence[Tuple[str, str]] = (
     ("CC", "go_cc"),
 )
 
+EXPLICIT_ASPECT_TO_CODE = {
+    "biological_process": "BP",
+    "molecular_function": "MF",
+    "cellular_component": "CC",
+    "bp": "BP",
+    "mf": "MF",
+    "cc": "CC",
+}
+
 
 def _count_terms(value: Any) -> int:
     if value is None:
@@ -31,7 +40,9 @@ def _count_terms(value: Any) -> int:
 def build_aspect_profile(example: Mapping[str, Any]) -> str:
     explicit_aspect = str(example.get("go_aspect") or "").strip()
     if explicit_aspect:
-        return f"aspect:{explicit_aspect}"
+        normalized_aspect = explicit_aspect.lower()
+        if normalized_aspect not in {"all", "mixed", "multi", "any"}:
+            return f"aspect:{explicit_aspect}"
 
     present_aspects = [aspect for aspect, column in ASPECT_COLUMNS if _count_terms(example.get(column)) > 0]
     if not present_aspects:
@@ -48,6 +59,17 @@ def build_aspect_profile(example: Mapping[str, Any]) -> str:
         size_bucket = "labels:11+"
 
     return f"profile:{'+'.join(present_aspects)}|{size_bucket}"
+
+
+def _present_aspects(example: Mapping[str, Any]) -> Tuple[str, ...]:
+    explicit_aspect = str(example.get("go_aspect") or "").strip().lower()
+    if explicit_aspect:
+        mapped = EXPLICIT_ASPECT_TO_CODE.get(explicit_aspect)
+        if mapped:
+            return (mapped,)
+
+    present = [aspect for aspect, column in ASPECT_COLUMNS if _count_terms(example.get(column)) > 0]
+    return tuple(present)
 
 
 def _allocate_group_counts(group_sizes: Mapping[str, int], target_size: int) -> Dict[str, int]:
@@ -141,25 +163,61 @@ def select_dataset_subset(
         raise ValueError(f"Unsupported sample strategy: {strategy}")
 
     grouped_indices: MutableMapping[str, List[int]] = defaultdict(list)
+    profile_by_index: Dict[int, str] = {}
+    aspect_candidates: MutableMapping[str, List[int]] = defaultdict(list)
+    examples_by_index: Dict[int, Mapping[str, Any]] = {}
     for idx, example in enumerate(dataset):
-        grouped_indices[build_aspect_profile(example)].append(idx)
+        profile = build_aspect_profile(example)
+        grouped_indices[profile].append(idx)
+        profile_by_index[idx] = profile
+        examples_by_index[idx] = example
+        for aspect in _present_aspects(example):
+            aspect_candidates[aspect].append(idx)
+
+    rng = random.Random(seed)
+    selected_indices_set = set()
+    selected_group_counts: Dict[str, int] = {}
+    aspect_coverage: Dict[str, int] = {}
+
+    # Reserve one example per GO aspect when the budget allows it so
+    # smoke evals keep BP/MF/CC coverage and do not silently drop one metric.
+    available_aspects = [aspect for aspect in ("BP", "MF", "CC") if aspect_candidates.get(aspect)]
+    if max_samples >= len(available_aspects):
+        for aspect in available_aspects:
+            candidates = [idx for idx in aspect_candidates[aspect] if idx not in selected_indices_set]
+            if not candidates:
+                continue
+            rng.shuffle(candidates)
+            chosen_idx = candidates[0]
+            selected_indices_set.add(chosen_idx)
+            profile = profile_by_index[chosen_idx]
+            selected_group_counts[profile] = selected_group_counts.get(profile, 0) + 1
+            aspect_coverage[aspect] = aspect_coverage.get(aspect, 0) + 1
+
+    remaining_grouped_indices: Dict[str, List[int]] = {}
+    for key, indices in grouped_indices.items():
+        remaining = [idx for idx in indices if idx not in selected_indices_set]
+        if remaining:
+            remaining_grouped_indices[key] = remaining
 
     allocations = _allocate_group_counts(
-        {key: len(indices) for key, indices in grouped_indices.items()},
-        target_size=max_samples,
+        {key: len(indices) for key, indices in remaining_grouped_indices.items()},
+        target_size=max(max_samples - len(selected_indices_set), 0),
     )
-    rng = random.Random(seed)
-    selected_indices: List[int] = []
-    selected_group_counts: Dict[str, int] = {}
-    for key in sorted(grouped_indices.keys()):
-        indices = list(grouped_indices[key])
+
+    selected_indices: List[int] = sorted(selected_indices_set)
+    for key in sorted(remaining_grouped_indices.keys()):
+        indices = list(remaining_grouped_indices[key])
         rng.shuffle(indices)
         take = allocations.get(key, 0)
         if take <= 0:
             continue
         chosen = sorted(indices[:take])
         selected_indices.extend(chosen)
-        selected_group_counts[key] = len(chosen)
+        selected_group_counts[key] = selected_group_counts.get(key, 0) + len(chosen)
+        for idx in chosen:
+            for aspect in _present_aspects(examples_by_index[idx]):
+                aspect_coverage[aspect] = aspect_coverage.get(aspect, 0) + 1
 
     selected_indices = sorted(selected_indices)
     subset = dataset.select(selected_indices)
@@ -168,4 +226,5 @@ def select_dataset_subset(
         "requested_samples": max_samples,
         "selected_samples": len(subset),
         "group_counts": selected_group_counts,
+        "aspect_coverage": aspect_coverage,
     }

@@ -106,6 +106,30 @@ class ResearchRegistryContractsTest(unittest.TestCase):
         self.assertEqual(result["source_ref"], "hf://wanglab/bioreason-pro-sft")
         self.assertTrue(result["downloaded"])
 
+    def test_materialize_source_redownloads_when_only_partial_required_paths_exist(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_dir = Path(tmpdir) / "model"
+            local_dir.mkdir(parents=True, exist_ok=True)
+            (local_dir / "config.json").write_text("{}", encoding="utf-8")
+
+            with mock.patch.object(REGISTRY, "download_wandb_artifact") as artifact_mock:
+                result = REGISTRY.materialize_source(
+                    {
+                        "type": "wandb_artifact",
+                        "wandb_registry_path": "demo/project/train-sft-output:v2",
+                        "local_dir": str(local_dir),
+                        "required_paths": [
+                            "config.json",
+                            "go_embedding.pt",
+                            "protein_model/pytorch_model.bin",
+                        ],
+                    }
+                )
+
+        artifact_mock.assert_called_once_with("demo/project/train-sft-output:v2", str(local_dir))
+        self.assertEqual(result["source_ref"], "demo/project/train-sft-output:v2")
+        self.assertTrue(result["downloaded"])
+
     def test_materialize_source_local_dir_requires_content(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             local_dir = Path(tmpdir) / "predictions"

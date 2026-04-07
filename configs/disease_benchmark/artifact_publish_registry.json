@@ -23,7 +23,11 @@
           "type": "local_dir",
           "local_dir": "${BIOREASON_RL_PAPER_MODEL_SOURCE_DIR}",
           "required_paths": [
-            "config.json"
+            "config.json",
+            "go_embedding.pt",
+            "go_projection.pt",
+            "protein_projection.pt",
+            "protein_model/pytorch_model.bin"
           ]
         },
         {
@@ -31,7 +35,11 @@
           "repo_id_env": "BIOREASON_PRO_RL_HF_REPO",
           "local_dir": "data/artifacts/models/bioreason_pro_rl_paper",
           "required_paths": [
-            "config.json"
+            "config.json",
+            "go_embedding.pt",
+            "go_projection.pt",
+            "protein_projection.pt",
+            "protein_model/pytorch_model.bin"
           ]
         }
       ]

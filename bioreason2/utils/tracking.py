@@ -340,8 +340,8 @@ def _select_checkpoint_file(source_dir: Path) -> Optional[Path]:
         return None
 
     preferred_patterns = (
-        lambda path: path.name == "last.ckpt",
         lambda path: "-best-" in path.name or "best" in path.name,
+        lambda path: path.name == "last.ckpt",
         lambda path: "-recent-" in path.name or "recent" in path.name,
     )
     for predicate in preferred_patterns:
@@ -349,6 +349,40 @@ def _select_checkpoint_file(source_dir: Path) -> Optional[Path]:
         if matches:
             return max(matches, key=lambda path: (path.stat().st_mtime, path.name))
     return max(checkpoints, key=lambda path: (path.stat().st_mtime, path.name))
+
+
+def _export_checkpoint_payload(src: Path, dst: Path) -> Dict[str, Any]:
+    """Write a compact checkpoint payload when possible.
+
+    We keep only the fields needed for downstream conversion/evaluation so the
+    model artifact stays aligned with the selected validation-best checkpoint
+    without uploading optimizer state.
+    """
+    try:
+        import torch  # type: ignore
+    except ImportError:
+        _link_or_copy_file(src, dst)
+        return {"slimmed": False, "reason": "torch_unavailable"}
+
+    try:
+        checkpoint = torch.load(src, map_location="cpu", weights_only=False)
+    except Exception:
+        _link_or_copy_file(src, dst)
+        return {"slimmed": False, "reason": "checkpoint_load_failed"}
+
+    if not isinstance(checkpoint, dict) or "state_dict" not in checkpoint:
+        _link_or_copy_file(src, dst)
+        return {"slimmed": False, "reason": "unexpected_checkpoint_layout"}
+
+    compact_checkpoint = {
+        "state_dict": checkpoint["state_dict"],
+        "hyper_parameters": checkpoint.get("hyper_parameters"),
+        "epoch": checkpoint.get("epoch"),
+        "global_step": checkpoint.get("global_step"),
+        "pytorch-lightning_version": checkpoint.get("pytorch-lightning_version"),
+    }
+    torch.save(compact_checkpoint, dst)
+    return {"slimmed": True, "reason": ""}
 
 
 def prepare_model_artifact_directory(
@@ -411,7 +445,7 @@ def prepare_model_artifact_directory(
             }
 
         artifact_checkpoint = export_path / checkpoint_path.name
-        _link_or_copy_file(checkpoint_path, artifact_checkpoint)
+        checkpoint_export = _export_checkpoint_payload(checkpoint_path, artifact_checkpoint)
 
         copied_entries = [checkpoint_path.name]
         for sidecar_name in [
@@ -434,6 +468,8 @@ def prepare_model_artifact_directory(
                 "mode": "raw_checkpoint",
                 "copied_entries": copied_entries,
                 "selected_checkpoint": checkpoint_path.name,
+                "checkpoint_slimmed": checkpoint_export["slimmed"],
+                "checkpoint_slim_reason": checkpoint_export["reason"],
             }
         )
 

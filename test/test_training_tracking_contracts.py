@@ -233,12 +233,42 @@ class TrainingTrackingContractsTest(unittest.TestCase):
 
             self.assertTrue(manifest["prepared"])
             self.assertEqual(manifest["mode"], "raw_checkpoint")
-            self.assertEqual(manifest["selected_checkpoint"], "last.ckpt")
+            self.assertEqual(manifest["selected_checkpoint"], "demo-best.ckpt")
             exported = Path(export)
-            self.assertTrue((exported / "last.ckpt").is_file())
-            self.assertFalse((exported / "demo-best.ckpt").exists())
+            self.assertTrue((exported / "demo-best.ckpt").is_file())
+            self.assertFalse((exported / "last.ckpt").exists())
             self.assertTrue((exported / "training_metadata.json").is_file())
             self.assertTrue((exported / "artifact_manifest.json").is_file())
+
+    def test_prepare_model_artifact_directory_slims_torch_checkpoints(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch unavailable")
+
+        with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as export:
+            source_path = Path(source)
+            checkpoint_path = source_path / "demo-best.ckpt"
+            torch.save(
+                {
+                    "state_dict": {"weight": torch.ones(2)},
+                    "optimizer_states": [{"big": torch.zeros(128)}],
+                    "hyper_parameters": {"foo": "bar"},
+                    "epoch": 3,
+                    "global_step": 9,
+                },
+                checkpoint_path,
+            )
+
+            manifest = TRACKING.prepare_model_artifact_directory(source, export)
+
+            self.assertTrue(manifest["prepared"])
+            self.assertTrue(manifest["checkpoint_slimmed"])
+            exported_checkpoint = Path(export) / "demo-best.ckpt"
+            slim = torch.load(exported_checkpoint, map_location="cpu", weights_only=False)
+            self.assertIn("state_dict", slim)
+            self.assertNotIn("optimizer_states", slim)
+            self.assertEqual(slim["epoch"], 3)
 
     def test_prepare_model_artifact_directory_excludes_raw_checkpoints_for_hf_exports(self):
         with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as export:

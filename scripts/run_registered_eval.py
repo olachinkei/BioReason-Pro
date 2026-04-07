@@ -267,8 +267,29 @@ def resolve_dataset_loader_source(asset: Mapping[str, Any]) -> str:
     return normalize_text(asset.get("dataset_source") or "wanglab/cafa5")
 
 
-def build_run_names(target_name: str, split: str, benchmark_alias: str) -> Dict[str, str]:
-    suffix = f"{target_name}-{split}-{benchmark_alias}"
+def _derive_eval_target_label(target_name: str, model_source_ref: str = "") -> str:
+    """Return a stable, human-readable label for eval run names."""
+    if target_name not in {"train-sft-output", "train-rl-output"}:
+        return target_name
+
+    source_ref = normalize_text(model_source_ref).strip()
+    if not source_ref:
+        return target_name
+
+    artifact_ref = source_ref.split("/")[-1]
+    artifact_name = artifact_ref.split(":", 1)[0].strip()
+    return artifact_name or target_name
+
+
+def build_run_names(
+    target_name: str,
+    split: str,
+    benchmark_alias: str,
+    *,
+    model_source_ref: str = "",
+) -> Dict[str, str]:
+    target_label = _derive_eval_target_label(target_name, model_source_ref=model_source_ref)
+    suffix = f"{target_label}-{split}-{benchmark_alias}"
     return {
         "run_name": f"eval-{suffix}",
         "artifact_name": f"eval-{suffix}",
@@ -306,9 +327,14 @@ def run_shell_command(command: Sequence[str], env: Mapping[str, str]) -> None:
 
 
 def should_wrap_eval_with_srun(args: argparse.Namespace) -> bool:
-    if not getattr(args, "use_srun", False):
-        return False
-    return not bool(os.getenv("SLURM_JOB_ID"))
+    in_slurm_job = bool(os.getenv("SLURM_JOB_ID"))
+    if getattr(args, "use_srun", False):
+        return not in_slurm_job
+
+    # When invoked from a cluster login node, default to submitting eval through
+    # srun so vLLM resolves a CUDA device on the allocated worker instead of the
+    # login shell.
+    return (not in_slurm_job) and shutil.which("srun") is not None
 
 
 def build_srun_command(
@@ -473,7 +499,12 @@ def run_protein_llm_target(
     output_dir = Path(runtime_paths["output_root"]) / target["target_name"] / args.split
     prepare_clean_eval_output_dir(output_dir)
 
-    names = build_run_names(target["target_name"], args.split, bundle["benchmark_alias"])
+    names = build_run_names(
+        target["target_name"],
+        args.split,
+        bundle["benchmark_alias"],
+        model_source_ref=normalize_text(resolved_model.get("source_ref")),
+    )
     env = os.environ.copy()
     env.update(
         {

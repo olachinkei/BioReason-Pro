@@ -23,7 +23,11 @@
           "wandb_registry_path": "${BIOREASON_RL_PAPER_MODEL_REGISTRY_PATH}",
           "local_dir": "data/artifacts/models/bioreason_pro_rl_paper",
           "required_paths": [
-            "config.json"
+            "config.json",
+            "go_embedding.pt",
+            "go_projection.pt",
+            "protein_projection.pt",
+            "protein_model/pytorch_model.bin"
           ]
         }
       ]
@@ -38,7 +42,11 @@
           "wandb_registry_path": "${BIOREASON_TRAIN_SFT_MODEL_REGISTRY_PATH}",
           "local_dir": "data/artifacts/models/train_sft_output",
           "required_paths": [
-            "config.json"
+            "config.json",
+            "go_embedding.pt",
+            "go_projection.pt",
+            "protein_projection.pt",
+            "protein_model/pytorch_model.bin"
           ]
         }
       ]
@@ -53,7 +61,11 @@
           "wandb_registry_path": "${BIOREASON_TRAIN_RL_MODEL_REGISTRY_PATH}",
           "local_dir": "data/artifacts/models/train_rl_output",
           "required_paths": [
-            "config.json"
+            "config.json",
+            "go_embedding.pt",
+            "go_projection.pt",
+            "protein_projection.pt",
+            "protein_model/pytorch_model.bin"
           ]
         }
       ]

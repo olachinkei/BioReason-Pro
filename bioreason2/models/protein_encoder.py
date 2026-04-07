@@ -45,7 +45,8 @@ def _prepare_local_esm3_runtime(model_dir: Path) -> str:
             else:
                 weight_target.unlink()
         except FileNotFoundError:
-            pass
+            if weight_target.is_symlink():
+                weight_target.unlink()
         except OSError:
             if weight_target.is_file():
                 weight_target.unlink()

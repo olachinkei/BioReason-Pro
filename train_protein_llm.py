@@ -18,6 +18,7 @@ import os
 from argparse import ArgumentParser
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Mapping, Optional
 
 # Third-party imports
@@ -66,6 +67,7 @@ from bioreason2.utils import (
     str2bool,
     sync_run_config,
 )
+from bioreason2.utils.save_unsloth_ckpt import save_lightning_ckpt
 
 # Set start method to 'spawn' for CUDA compatibility with multiprocessing
 torch.multiprocessing.set_sharing_strategy("file_system")
@@ -167,6 +169,80 @@ def maybe_trace_sft_generation(
     trace_state["logged"] += 1
 
 
+def select_model_artifact_checkpoint(checkpoint_dir: str, preferred_path: str = "") -> Optional[Path]:
+    preferred = Path(preferred_path).expanduser() if preferred_path else None
+    if preferred and preferred.is_file():
+        return preferred.resolve()
+
+    checkpoint_root = Path(checkpoint_dir).expanduser().resolve()
+    checkpoints = sorted(checkpoint_root.rglob("*.ckpt"))
+    if not checkpoints:
+        return None
+
+    preferred_patterns = (
+        lambda path: "-best-" in path.name or "best" in path.name,
+        lambda path: path.name == "last.ckpt",
+        lambda path: "-recent-" in path.name or "recent" in path.name,
+    )
+    for predicate in preferred_patterns:
+        matches = [path for path in checkpoints if predicate(path)]
+        if matches:
+            return max(matches, key=lambda path: (path.stat().st_mtime, path.name))
+    return max(checkpoints, key=lambda path: (path.stat().st_mtime, path.name))
+
+
+def export_sft_model_artifact(args: Any, checkpoint_path: Path, export_dir: Path) -> Path:
+    if export_dir.exists():
+        import shutil
+
+        shutil.rmtree(export_dir)
+    export_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    text_model_dir = Path(args.text_model_name).expanduser()
+    go_cache_path = text_model_dir / "go_embedding.pt"
+    precomputed_embeddings_path = str(go_cache_path) if go_cache_path.is_file() else None
+
+    save_lightning_ckpt(
+        SimpleNamespace(
+            checkpoint_path=str(checkpoint_path),
+            save_dir=str(export_dir),
+            text_model_name=str(text_model_dir),
+            protein_model_name=args.protein_model_name,
+            cache_dir=args.cache_dir,
+            max_length_text=args.max_length_text,
+            max_length_protein=args.max_length_protein,
+            lora_rank=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            protein_embedding_layer=args.protein_embedding_layer,
+            go_obo_path=args.go_obo_path,
+            precomputed_embeddings_path=precomputed_embeddings_path,
+            go_hidden_dim=args.go_hidden_dim,
+            go_num_gat_layers=args.go_num_gat_layers,
+            go_num_heads=args.go_num_heads,
+            go_num_reduced_embeddings=args.go_num_reduced_embeddings,
+            go_embedding_dim=args.go_embedding_dim,
+            unified_go_encoder=args.unified_go_encoder,
+            protein_model_finetune=args.protein_model_finetune,
+        )
+    )
+    return export_dir
+
+
+def resolve_go_embedding_sources(
+    precomputed_embeddings_path: Optional[str],
+) -> tuple[Optional[str], Optional[str]]:
+    if not precomputed_embeddings_path:
+        return None, None
+
+    candidate = Path(precomputed_embeddings_path).expanduser()
+    if candidate.is_dir():
+        return str(candidate), None
+    if candidate.is_file():
+        return None, str(candidate)
+    return str(candidate), None
+
+
 class EpochCheckpointFromN(Callback):
     """Custom callback to save checkpoints every epoch starting from a specific epoch."""
     
@@ -219,6 +295,10 @@ class ProteinLLMFineTuner(pl.LightningModule):
         self.attn_implementation = self.hparams.attn_implementation
         self.go_obo_path = self.hparams.go_obo_path
         self.precomputed_embeddings_path = self.hparams.precomputed_embeddings_path
+        (
+            self.precomputed_embeddings_path,
+            self.precomputed_go_embedding_cache_path,
+        ) = resolve_go_embedding_sources(self.precomputed_embeddings_path)
         self.go_hidden_dim = self.hparams.go_hidden_dim
         self.go_num_gat_layers = self.hparams.go_num_gat_layers
         self.go_num_heads = self.hparams.go_num_heads
@@ -237,11 +317,11 @@ class ProteinLLMFineTuner(pl.LightningModule):
         self.enable_sample_generation = self.hparams.enable_sample_generation
         self.verbose_sample_generation = self.hparams.verbose_sample_generation
         self.every_n_train_steps = self.hparams.every_n_train_steps
+        self.sample_generation_every_n_steps = self.hparams.sample_generation_every_n_steps
         self.unified_go_encoder = self.hparams.unified_go_encoder
         self.use_unsloth = self.hparams.use_unsloth
         self.weave_trace_state: Optional[Dict[str, Any]] = None
         self._wandb_metric_schema_defined = False
-        self._sft_sample_table = None
 
         # Store dataset configuration
         self.dataset_type = self.hparams.dataset_type
@@ -286,6 +366,15 @@ class ProteinLLMFineTuner(pl.LightningModule):
             unified_go_encoder=self.unified_go_encoder,
             use_unsloth=self.use_unsloth,
         )
+
+        if self.precomputed_go_embedding_cache_path:
+            try:
+                self.model.load_precomputed_go_embedding_cache(
+                    self.precomputed_go_embedding_cache_path,
+                    aspect="all",
+                )
+            except Exception as exc:
+                print(f"⚠️  Failed to load direct GO embedding cache: {exc}")
 
         # Initialize projector / GO modules from a prior checkpoint when provided.
         # This applies to both stage 1 warm-starts and stage 2 continuation, unless
@@ -563,28 +652,11 @@ class ProteinLLMFineTuner(pl.LightningModule):
         run.log(clean_payload)
 
     def _log_sft_sample_row(self, sample_row: Mapping[str, Any]) -> None:
-        if not self.trainer.is_global_zero:
-            return
-
-        run = self._get_wandb_run()
-        if run is None:
-            return
-
-        if self._sft_sample_table is None:
-            self._sft_sample_table = wandb.Table(
-                columns=list(SFT_SAMPLE_TABLE_COLUMNS),
-                log_mode="MUTABLE",
-            )
-
-        row_values = [sample_row.get(column, "") for column in SFT_SAMPLE_TABLE_COLUMNS]
-        self._sft_sample_table.add_data(*row_values)
-        run.log(
-            {
-                "train_sft_samples": self._sft_sample_table,
-                "trainer/global_step": int(self.global_step),
-                "epoch": int(self.current_epoch),
-            }
-        )
+        # Training-time generations are retained in Weave traces only.
+        # W&B tracks scalar metrics and artifact lineage, but should not
+        # emit a mutable sample table artifact for each generation step.
+        del sample_row
+        return
 
     def _step(self, batch: Dict, batch_idx: int, prefix: str) -> torch.Tensor:
         """
@@ -676,7 +748,7 @@ class ProteinLLMFineTuner(pl.LightningModule):
             )
 
         # Sample generation for debugging and monitoring
-        sample_generation_interval = self.every_n_train_steps or 5_000
+        sample_generation_interval = self.sample_generation_every_n_steps or 5_000
         should_log_generation = (
             self.enable_sample_generation
             and (
@@ -789,6 +861,21 @@ class ProteinLLMFineTuner(pl.LightningModule):
         val_loss_epoch = self.trainer.callback_metrics.get("val_loss_epoch")
         if val_loss_epoch is not None:
             self._manual_wandb_log({"val_loss_epoch": float(val_loss_epoch.detach().item())})
+
+    def on_fit_end(self) -> None:
+        if not self.trainer.is_global_zero:
+            return
+
+        run = self._get_wandb_run()
+        summary = getattr(run, "summary", None) if run is not None else None
+        if summary is None:
+            return
+
+        summary["trainer/global_step"] = int(self.global_step)
+        summary["epoch"] = int(self.current_epoch)
+        val_loss_epoch = self.trainer.callback_metrics.get("val_loss_epoch")
+        if val_loss_epoch is not None:
+            summary["val_loss_epoch"] = float(val_loss_epoch.detach().item())
 
     def configure_optimizers(self):
         """
@@ -1080,6 +1167,8 @@ def main(args: ArgumentParser):
             )
             if subset_summary.get("group_counts"):
                 print(f"Validation subset group counts: {subset_summary['group_counts']}")
+            if subset_summary.get("aspect_coverage"):
+                print(f"Validation subset aspect coverage: {subset_summary['aspect_coverage']}")
 
     # Setup directories
     os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -1232,39 +1321,78 @@ def main(args: ArgumentParser):
 
     if trainer.global_rank == 0:
         try:
-            artifact_export_dir = os.path.join(args.checkpoint_dir, "_artifact_export")
-            artifact_manifest = prepare_model_artifact_directory(
-                source_dir=args.checkpoint_dir,
-                export_dir=artifact_export_dir,
+            best_checkpoint_path = ""
+            best_callback = locals().get("best_val_ckpt")
+            if best_callback is not None:
+                best_checkpoint_path = normalize_tracking_text(getattr(best_callback, "best_model_path", ""))
+            selected_checkpoint = select_model_artifact_checkpoint(
+                args.checkpoint_dir,
+                preferred_path=best_checkpoint_path,
             )
-            artifact_directory = (
-                artifact_manifest["export_dir"]
-                if artifact_manifest.get("prepared")
-                else args.checkpoint_dir
-            )
-            checkpoint_artifact_status = maybe_log_directory_artifact(
-                run=logger.experiment,
-                wandb_module=wandb,
-                artifact_name=tracking_config["model_artifact"],
-                artifact_type="model",
-                directory=artifact_directory,
-                aliases=args.checkpoint_artifact_aliases,
-                metadata=build_checkpoint_artifact_metadata(
-                    args,
-                    run_name,
-                    tracking_config={
-                        **tracking_config,
-                        "artifact_export_mode": artifact_manifest.get("mode"),
-                        "artifact_selected_checkpoint": artifact_manifest.get("selected_checkpoint"),
-                    },
-                ),
-            )
-            if checkpoint_artifact_status["logged"]:
+
+            checkpoint_artifact_name = normalize_tracking_text(args.checkpoint_artifact_name).strip()
+            if checkpoint_artifact_name:
+                checkpoint_export_dir = os.path.join(args.checkpoint_dir, "_checkpoint_artifact_export")
+                checkpoint_manifest = prepare_model_artifact_directory(
+                    source_dir=args.checkpoint_dir,
+                    export_dir=checkpoint_export_dir,
+                )
+                checkpoint_artifact_status = maybe_log_directory_artifact(
+                    run=logger.experiment,
+                    wandb_module=wandb,
+                    artifact_name=checkpoint_artifact_name,
+                    artifact_type="model",
+                    directory=checkpoint_manifest["export_dir"] if checkpoint_manifest.get("prepared") else args.checkpoint_dir,
+                    aliases=args.checkpoint_artifact_aliases,
+                    metadata=build_checkpoint_artifact_metadata(
+                        args,
+                        run_name,
+                        tracking_config={
+                            **tracking_config,
+                            "artifact_export_mode": checkpoint_manifest.get("mode"),
+                            "artifact_selected_checkpoint": checkpoint_manifest.get("selected_checkpoint"),
+                        },
+                    ),
+                )
+                if checkpoint_artifact_status["logged"]:
+                    sync_run_config(
+                        logger.experiment,
+                        {
+                            "checkpoint_artifact": checkpoint_artifact_status["artifact_name"],
+                            "checkpoint_artifact_aliases": checkpoint_artifact_status["aliases"],
+                        },
+                    )
+
+            model_artifact_name = normalize_tracking_text(args.model_artifact).strip()
+            if model_artifact_name and selected_checkpoint is not None:
+                model_export_dir = Path(args.checkpoint_dir) / "_model_artifact_export"
+                export_sft_model_artifact(args, selected_checkpoint, model_export_dir)
+                model_artifact_status = maybe_log_directory_artifact(
+                    run=logger.experiment,
+                    wandb_module=wandb,
+                    artifact_name=model_artifact_name,
+                    artifact_type="model",
+                    directory=str(model_export_dir),
+                    aliases=args.checkpoint_artifact_aliases,
+                    metadata=build_checkpoint_artifact_metadata(
+                        args,
+                        run_name,
+                        tracking_config={
+                            **tracking_config,
+                            "artifact_export_mode": "hf_export",
+                            "artifact_selected_checkpoint": str(selected_checkpoint),
+                        },
+                    ),
+                )
+            else:
+                model_artifact_status = {"logged": False}
+
+            if model_artifact_status["logged"]:
                 sync_run_config(
                     logger.experiment,
                     {
-                        "model_artifact": checkpoint_artifact_status["artifact_name"],
-                        "model_artifact_aliases": checkpoint_artifact_status["aliases"],
+                        "model_artifact": model_artifact_status["artifact_name"],
+                        "model_artifact_aliases": model_artifact_status["aliases"],
                     },
                 )
         finally:
@@ -1493,6 +1621,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--checkpoint_start_epoch", type=int, default=4, help="Epoch to start saving checkpoints from.")
     parser.add_argument("--every_n_train_steps", type=int, default=None)
+    parser.add_argument("--sample_generation_every_n_steps", type=int, default=None)
     parser.add_argument("--early_stopping_patience", type=int, default=0)
     parser.add_argument("--early_stopping_min_delta", type=float, default=0.0)
     # Arguments for sample generation
@@ -1593,7 +1722,7 @@ if __name__ == "__main__":
         help="If > 0, overrides to run a fixed number of steps",
     )
     parser.add_argument("--log_every_n_steps", type=int, default=50)
-    parser.add_argument("--num_sanity_val_steps", type=int, default=2)
+    parser.add_argument("--num_sanity_val_steps", type=int, default=0)
     # Device stats monitor controls
     parser.add_argument("--enable_device_stats_monitor", type=str2bool, default=False)
     parser.add_argument("--device_stats_cpu", type=str2bool, default=False)

@@ -4,6 +4,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+try:
+    import torch
+except ImportError:  # pragma: no cover - contract tests run without torch
+    torch = None
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = ROOT / "train_protein_grpo.py"
@@ -42,10 +47,13 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertIn('CAFA5_DATASET=${CAFA5_DATASET:-""}', wrapper_text)
         self.assertIn('WEAVE_TRACE_BUDGET=${WEAVE_TRACE_BUDGET:-64}', wrapper_text)
         self.assertIn('MIN_NEW_TOKENS=${MIN_NEW_TOKENS:-1}', wrapper_text)
+        self.assertIn('if [ "${CHECKPOINT_ARTIFACT_NAME+x}" = "x" ]; then', wrapper_text)
         self.assertIn('RL_RUN_FAMILY="rl-sft"', wrapper_text)
         self.assertIn('RL_RUN_FAMILY="rl-paper"', wrapper_text)
         self.assertIn('WANDB_RUN_NAME=${WANDB_RUN_NAME:-"${RL_RUN_FAMILY}-${TIMESTAMP}"}', wrapper_text)
         self.assertIn('--asset-key reasoning_dataset', wrapper_text)
+        self.assertIn('find "$RESOLVED_TRAIN_SFT_DIR" -maxdepth 2 -type f -name "*best*.ckpt"', wrapper_text)
+        self.assertIn('SFT_CKPT_PATH="$RESOLVED_TRAIN_SFT_DIR/last.ckpt"', wrapper_text)
         self.assertIn('--lora_rank "$SFT_CONVERSION_LORA_RANK"', wrapper_text)
         self.assertIn('--lora_alpha "$SFT_CONVERSION_LORA_ALPHA"', wrapper_text)
         self.assertIn('--lora_dropout "$SFT_CONVERSION_LORA_DROPOUT"', wrapper_text)
@@ -112,11 +120,36 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertEqual(args.weave_trace_budget, 64)
         self.assertFalse(args.ablation_from_paper_rl)
 
+    def test_extract_completion_ids_handles_prompt_inclusive_output(self):
+        if torch is None:
+            self.skipTest("torch is not available in the contract test environment")
+
+        prompt_ids = torch.tensor([[11, 12, 13]])
+        generated_ids = torch.tensor([[11, 12, 13, 21, 22]])
+
+        completion_ids = GRPO.extract_completion_ids(generated_ids, prompt_ids)
+
+        self.assertTrue(torch.equal(completion_ids, torch.tensor([21, 22])))
+
+    def test_extract_completion_ids_handles_completion_only_output(self):
+        if torch is None:
+            self.skipTest("torch is not available in the contract test environment")
+
+        prompt_ids = torch.tensor([[11, 12, 13, 14]])
+        generated_ids = torch.tensor([[21, 22]])
+
+        completion_ids = GRPO.extract_completion_ids(generated_ids, prompt_ids)
+
+        self.assertTrue(torch.equal(completion_ids, torch.tensor([21, 22])))
+
     def test_rl_script_uses_canonical_metrics_and_input_artifact_lineage(self):
         source = SCRIPT_PATH.read_text()
 
         self.assertIn("maybe_use_artifact_refs(", source)
         self.assertIn("maybe_trace_generation(", source)
+        self.assertIn("candidate.is_file()", source)
+        self.assertIn("precomputed_go_embedding_cache_path", source)
+        self.assertIn("model.load_precomputed_go_embedding_cache(", source)
         self.assertIn("prepare_model_artifact_directory(", source)
         self.assertIn('"artifact_export_mode"', source)
         self.assertIn('"data_step_num_groups_submitted"', source)
@@ -130,6 +163,9 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertIn('"loss_learning_rate"', source)
         self.assertIn('"loss_grad_norm"', source)
         self.assertIn('"eval_reward"', source)
+        self.assertIn('"train_skipped_update"', source)
+        self.assertNotIn('"loss_train": 0.0', source)
+        self.assertNotIn('"loss_kl_div": 0.0', source)
         self.assertNotIn("train_rl_rollouts", source)
         self.assertNotIn("wandb.Table(", source)
         self.assertNotIn('"dataset/train_size"', source)

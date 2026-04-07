@@ -173,7 +173,11 @@ KL_BETA=${KL_BETA:-0.02}
 REWARD_FUNCS=${REWARD_FUNCS:-"strict_format,reasoning_presence,go_overlap,answer_nonempty"}
 REWARD_WEIGHTS=${REWARD_WEIGHTS:-""}
 
-CHECKPOINT_ARTIFACT_NAME=${CHECKPOINT_ARTIFACT_NAME:-"train-rl-output"}
+if [ "${CHECKPOINT_ARTIFACT_NAME+x}" = "x" ]; then
+  CHECKPOINT_ARTIFACT_NAME="${CHECKPOINT_ARTIFACT_NAME}"
+else
+  CHECKPOINT_ARTIFACT_NAME="train-rl-output"
+fi
 CHECKPOINT_ARTIFACT_ALIASES=${CHECKPOINT_ARTIFACT_ALIASES:-"latest,213.221.225.228"}
 
 PREP_COMMAND=()
@@ -240,9 +244,12 @@ if [ -n "$PRIMARY_BASE_CHECKPOINT" ]; then
     BASE_CHECKPOINT_REF="$PRIMARY_BASE_CHECKPOINT"
     echo "--- Using HF-ready train-sft-output artifact at $RESOLVED_BASE_MODEL_DIR"
   else
-    SFT_CKPT_PATH="$RESOLVED_TRAIN_SFT_DIR/last.ckpt"
+    SFT_CKPT_PATH=$(find "$RESOLVED_TRAIN_SFT_DIR" -maxdepth 2 -type f -name "*best*.ckpt" | sort | tail -n 1)
+    if [ -z "${SFT_CKPT_PATH:-}" ] || [ ! -f "$SFT_CKPT_PATH" ]; then
+      SFT_CKPT_PATH="$RESOLVED_TRAIN_SFT_DIR/last.ckpt"
+    fi
     if [ ! -f "$SFT_CKPT_PATH" ]; then
-      SFT_CKPT_PATH=$(find "$RESOLVED_TRAIN_SFT_DIR" -maxdepth 2 -type f -name "*.ckpt" | sort | head -n 1)
+      SFT_CKPT_PATH=$(find "$RESOLVED_TRAIN_SFT_DIR" -maxdepth 2 -type f -name "*.ckpt" | sort | tail -n 1)
     fi
 
     if [ -z "${SFT_CKPT_PATH:-}" ] || [ ! -f "$SFT_CKPT_PATH" ]; then

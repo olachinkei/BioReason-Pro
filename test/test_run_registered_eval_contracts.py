@@ -12,6 +12,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = ROOT / "scripts" / "run_registered_eval.py"
 REGISTRY_PATH = ROOT / "bioreason2" / "utils" / "research_registry.py"
+EVAL_TARGET_REGISTRY_JSON = ROOT / "configs" / "disease_benchmark" / "eval_target_registry.json"
 
 
 def load_research_registry_module():
@@ -68,6 +69,21 @@ REGISTERED_EVAL = load_registered_eval_module()
 
 
 class RunRegisteredEvalContractsTest(unittest.TestCase):
+    def test_protein_llm_targets_require_bundled_protein_assets(self):
+        registry = json.loads(EVAL_TARGET_REGISTRY_JSON.read_text(encoding="utf-8"))
+        required_paths = {
+            "config.json",
+            "go_embedding.pt",
+            "go_projection.pt",
+            "protein_projection.pt",
+            "protein_model/pytorch_model.bin",
+        }
+
+        for target_name in ("bioreason-pro-rl-paper", "train-sft-output", "train-rl-output"):
+            target = registry["targets"][target_name]
+            source = target["model_sources"][0]
+            self.assertEqual(set(source["required_paths"]), required_paths)
+
     def test_with_bundle_context_formats_target_sources(self):
         bundle = {
             "benchmark_alias": "213.221.225.228",
@@ -158,7 +174,11 @@ class RunRegisteredEvalContractsTest(unittest.TestCase):
                     "local_path": str(model_dir),
                     "source_ref": "demo/project/bioreason-pro-base:production",
                 },
-            ), mock.patch.object(REGISTERED_EVAL, "run_shell_command", side_effect=fake_run_shell_command):
+            ), mock.patch.object(REGISTERED_EVAL, "run_shell_command", side_effect=fake_run_shell_command), mock.patch.object(
+                REGISTERED_EVAL.shutil,
+                "which",
+                return_value=None,
+            ):
                 status = REGISTERED_EVAL.run_protein_llm_target(args, bundle, target, runtime_paths)
 
         self.assertEqual(status["status"], "completed")
@@ -243,7 +263,11 @@ class RunRegisteredEvalContractsTest(unittest.TestCase):
                     "local_path": str(model_dir),
                     "source_ref": "demo/project/train-sft-output:latest",
                 },
-            ), mock.patch.object(REGISTERED_EVAL, "run_shell_command", side_effect=fake_run_shell_command):
+            ), mock.patch.object(REGISTERED_EVAL, "run_shell_command", side_effect=fake_run_shell_command), mock.patch.object(
+                REGISTERED_EVAL.shutil,
+                "which",
+                return_value="/usr/bin/srun",
+            ):
                 REGISTERED_EVAL.run_protein_llm_target(args, bundle, target, runtime_paths)
 
         self.assertEqual(
@@ -267,6 +291,100 @@ class RunRegisteredEvalContractsTest(unittest.TestCase):
         )
         self.assertEqual(captured["command"][-2:], ["bash", "scripts/sh_eval.sh"])
         self.assertEqual(captured["env"]["MODEL_ARTIFACT"], "demo/project/train-sft-output:latest")
+        self.assertEqual(captured["env"]["WANDB_RUN_NAME"], "eval-train-sft-output-test-213.221.225.228")
+
+    def test_run_protein_llm_target_auto_wraps_eval_in_srun_on_login_node(self):
+        bundle = {
+            "benchmark_version": "213 -> 221 -> 225 -> 228",
+            "benchmark_alias": "213.221.225.228",
+            "shortlist_mode": "high-confidence",
+            "shortlist_query": "demo query",
+            "train_start_release": 213,
+            "train_end_release": 221,
+            "dev_end_release": 225,
+            "test_end_release": 228,
+            "temporal_split_artifact": {"wandb_registry_path": "demo/project/disease-temporal-split:production"},
+            "reasoning_dataset": {
+                "wandb_registry_path": "demo/project/disease-temporal-reasoning:production",
+                "dataset_source": "wanglab/cafa5",
+                "dataset_name": "disease_temporal_hc_reasoning_v1",
+            },
+        }
+        target = {
+            "target_name": "train-sft-output",
+            "display_name": "train-sft-output",
+            "runner": "protein_llm",
+            "model_sources": [{"type": "wandb_artifact", "wandb_registry_path": "demo/project/train-sft-output:latest"}],
+        }
+        args = types.SimpleNamespace(
+            split="test",
+            wandb_project="demo-project",
+            wandb_entity="demo-entity",
+            wandb_mode="online",
+            weave_project="demo-entity/demo-project",
+            metric_threads=4,
+            metric_threshold_step=0.95,
+            max_samples=8,
+            sample_strategy="stratified_aspect_profile",
+            num_chunks=1,
+            chunk_id=0,
+            keep_local_eval_outputs=False,
+            use_srun=False,
+            srun_partition="h100",
+            srun_gpus=1,
+            srun_cpus_per_task=8,
+            srun_mem="128G",
+            srun_time_limit="02:00:00",
+            srun_account="",
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_dir = Path(tmpdir) / "train-sft-output"
+            model_dir.mkdir(parents=True, exist_ok=True)
+            (model_dir / "config.json").write_text("{}", encoding="utf-8")
+            runtime_paths = {
+                "output_root": tempfile.mkdtemp(),
+                "go_obo_path": "/tmp/go-basic.obo",
+                "ia_file_path": "/tmp/IA.txt",
+                "go_embeddings_path": "/tmp/go-embeddings",
+                "dataset_cache_dir": "/tmp/hf-cache",
+                "structure_dir": "/tmp/structures",
+            }
+
+            captured = {}
+
+            def fake_run_shell_command(command, env):
+                captured["command"] = list(command)
+                captured["env"] = dict(env)
+
+            with mock.patch.object(
+                REGISTERED_EVAL,
+                "materialize_first_available_source",
+                return_value={
+                    "local_path": str(model_dir),
+                    "source_ref": "demo/project/train-sft-output:latest",
+                },
+            ), mock.patch.object(REGISTERED_EVAL, "run_shell_command", side_effect=fake_run_shell_command), mock.patch.object(
+                REGISTERED_EVAL.shutil,
+                "which",
+                return_value="/usr/bin/srun",
+            ), mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("SLURM_JOB_ID", None)
+                REGISTERED_EVAL.run_protein_llm_target(args, bundle, target, runtime_paths)
+
+        self.assertEqual(captured["command"][:2], ["srun", "--job-name"])
+        self.assertEqual(captured["command"][-2:], ["bash", "scripts/sh_eval.sh"])
+
+    def test_build_run_names_uses_specific_artifact_name_for_tuned_targets(self):
+        names = REGISTERED_EVAL.build_run_names(
+            "train-sft-output",
+            "test",
+            "213.221.225.228",
+            model_source_ref="wandb-healthcare/bioreason-pro-custom/train-sft-output-verify40:v0",
+        )
+
+        self.assertEqual(names["run_name"], "eval-train-sft-output-verify40-test-213.221.225.228")
+        self.assertEqual(names["artifact_name"], "eval-train-sft-output-verify40-test-213.221.225.228")
+        self.assertEqual(names["weave_eval_name"], "eval-train-sft-output-verify40-test-213.221.225.228")
 
     def test_run_protein_llm_target_cleans_stale_scratch_before_execution(self):
         bundle = {

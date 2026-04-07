@@ -459,6 +459,13 @@ def instantiate_model(args: argparse.Namespace, trainable: bool) -> Any:
 
     quantization_config = build_quantization_config(args) if trainable else None
     attn_implementation = resolve_attn_implementation("flash_attention_2")
+    precomputed_embeddings_source = args.precomputed_embeddings_path
+    precomputed_go_embedding_cache_path = None
+    if precomputed_embeddings_source:
+        candidate = Path(precomputed_embeddings_source).expanduser()
+        if candidate.is_file():
+            precomputed_go_embedding_cache_path = str(candidate)
+            precomputed_embeddings_source = None
     model = ProteinLLMModel(
         text_model_name=args.text_model_name,
         protein_model_name=args.protein_model_name,
@@ -471,7 +478,7 @@ def instantiate_model(args: argparse.Namespace, trainable: bool) -> Any:
         go_model_finetune=args.train_go_modules,
         attn_implementation=attn_implementation,
         go_obo_path=args.go_obo_path,
-        precomputed_embeddings_path=args.precomputed_embeddings_path,
+        precomputed_embeddings_path=precomputed_embeddings_source,
         go_hidden_dim=args.go_hidden_dim,
         go_num_gat_layers=args.go_num_gat_layers,
         go_num_heads=args.go_num_heads,
@@ -482,6 +489,8 @@ def instantiate_model(args: argparse.Namespace, trainable: bool) -> Any:
         unified_go_encoder=args.unified_go_encoder,
         use_unsloth=False,
     )
+    if precomputed_go_embedding_cache_path:
+        model.load_precomputed_go_embedding_cache(precomputed_go_embedding_cache_path, aspect="all")
     load_auxiliary_checkpoint_components(model, args.text_model_name)
     if trainable:
         configure_trainable_modules(model, args)
@@ -540,6 +549,8 @@ def load_rl_datasets(args: argparse.Namespace) -> Tuple[Any, Any]:
     )
     if subset_summary.get("group_counts"):
         print(f"RL validation subset group counts: {subset_summary['group_counts']}")
+    if subset_summary.get("aspect_coverage"):
+        print(f"RL validation subset aspect coverage: {subset_summary['aspect_coverage']}")
     return train_dataset, val_dataset
 
 
@@ -613,6 +624,33 @@ def decode_completion(tokenizer: Any, completion_ids: Any) -> str:
         if marker in text:
             text = text.split(marker, 1)[0].strip()
     return text
+
+
+def extract_completion_ids(generated_ids: Any, prompt_input_ids: Any) -> Any:
+    """Handle both prompt-inclusive and completion-only outputs from generate()."""
+    import torch
+
+    if generated_ids.dim() != 2:
+        raise ValueError(f"Expected rank-2 generated ids, got shape {tuple(generated_ids.shape)}")
+    if generated_ids.shape[0] != 1:
+        raise ValueError(f"Expected batch size 1 during RL rollout extraction, got {generated_ids.shape[0]}")
+
+    if prompt_input_ids.dim() == 2:
+        if prompt_input_ids.shape[0] != 1:
+            raise ValueError(
+                f"Expected batch size 1 for prompt ids during RL rollout extraction, got {prompt_input_ids.shape[0]}"
+            )
+        prompt_tokens = prompt_input_ids[0]
+    else:
+        prompt_tokens = prompt_input_ids
+
+    prompt_tokens = prompt_tokens.detach().to(device=generated_ids.device, dtype=generated_ids.dtype)
+    generated_tokens = generated_ids[0]
+    prompt_len = int(prompt_tokens.shape[0])
+
+    if generated_tokens.shape[0] >= prompt_len and torch.equal(generated_tokens[:prompt_len], prompt_tokens):
+        return generated_tokens[prompt_len:].detach()
+    return generated_tokens.detach()
 
 
 def build_combined_inputs(prompt_input_ids: Any, prompt_attention_mask: Any, completion_ids: Any) -> Tuple[Any, Any, int]:
@@ -723,11 +761,6 @@ def export_hf_model(model: Any, save_dir: Path) -> None:
         torch.save(model.go_projection.state_dict(), export_dir / "go_projection.pt")
     if getattr(model, "go_encoder", None) is not None:
         torch.save(model.go_encoder.state_dict(), export_dir / "go_encoder.pt")
-    if getattr(model, "protein_model", None) is not None:
-        protein_model_dir = export_dir / "protein_model"
-        protein_model_dir.mkdir(parents=True, exist_ok=True)
-        torch.save(model.protein_model.state_dict(), protein_model_dir / "pytorch_model.bin")
-
     for item in export_dir.iterdir():
         target_path = save_dir / item.name
         if target_path.exists():
@@ -880,7 +913,7 @@ def evaluate_policy(
                     pad_token_id=tokenizer.pad_token_id,
                     eos_token_id=tokenizer.eos_token_id,
                 )
-                completion_ids = generated_ids[0, prompt_len:]
+                completion_ids = extract_completion_ids(generated_ids, prompt_input_ids)
                 completion_text = decode_completion(tokenizer, completion_ids)
                 rewards, _ = compute_group_rewards([completion_text], example["sample_meta"], reward_names, reward_weights)
                 total_reward += rewards[0]
@@ -1071,7 +1104,7 @@ def train(args: argparse.Namespace) -> None:
                         pad_token_id=tokenizer.pad_token_id,
                         eos_token_id=tokenizer.eos_token_id,
                     )
-                    completion_ids = generated_ids[0, prompt_len:].detach()
+                    completion_ids = extract_completion_ids(generated_ids, prompt_input_ids)
                     print(
                         "Completed RL rollout generation: "
                         f"global_step={global_step}, completion_tokens={completion_ids.numel()}"
@@ -1154,17 +1187,13 @@ def train(args: argparse.Namespace) -> None:
             if not sample_losses:
                 global_step += 1
                 skipped_payload = {
-                    "loss_train": 0.0,
-                    "reward": sum(reward_totals) / max(len(reward_totals), 1) if reward_totals else 0.0,
-                    "reward_std_dev": sum(reward_stds) / max(len(reward_stds), 1) if reward_stds else 0.0,
-                    "loss_kl_div": 0.0,
                     "loss_learning_rate": optimizer.param_groups[0]["lr"],
-                    "loss_grad_norm": 0.0,
                     "data_step_num_groups_submitted": float(batch_size),
                     "data_step_num_groups_trainable": float(trainable_group_count),
                     "data_step_num_trajectories": float(len(reward_totals)),
                     "data_step_num_datums": float(batch_size),
                     "data_step_trainer_tokens": float(sum(completion_lengths)),
+                    "train_skipped_update": 1.0,
                 }
                 if wandb_run is not None:
                     print(f"Logging RL skipped-update metrics at global_step={global_step}.")
@@ -1228,6 +1257,7 @@ def train(args: argparse.Namespace) -> None:
                 "data_step_num_trajectories": float(len(reward_totals)),
                 "data_step_num_datums": float(batch_size),
                 "data_step_trainer_tokens": float(sum(completion_lengths)),
+                "train_skipped_update": 0.0,
             }
             if wandb_run is not None:
                 print(f"Logging RL train metrics at global_step={global_step}.")

@@ -17,9 +17,8 @@ class TrainProteinLLMTrackingContractsTest(unittest.TestCase):
         self.assertIn("prefer_original_generate=True", source)
         self.assertIn('"failure_reason"', source)
         self.assertIn('"assistant_marker_found"', source)
-        self.assertIn('wandb.Table(', source)
-        self.assertIn('log_mode="MUTABLE"', source)
-        self.assertIn('"train_sft_samples"', source)
+        self.assertIn("Training-time generations are retained in Weave traces only.", source)
+        self.assertNotIn('"train_sft_samples"', source)
         self.assertNotIn('step_id = f"gen_', source)
 
     def test_train_sft_logs_core_metrics_to_wandb(self):
@@ -58,7 +57,11 @@ class TrainProteinLLMTrackingContractsTest(unittest.TestCase):
         self.assertIn('EXPECTED_WANDB_ENTITY=${EXPECTED_WANDB_ENTITY:-"wandb-healthcare"}', wrapper)
         self.assertIn('EXPECTED_WANDB_PROJECT=${EXPECTED_WANDB_PROJECT:-"bioreason-pro-custom"}', wrapper)
         self.assertIn('WANDB_RUN_NAME_S2="${WANDB_RUN_NAME_S2:-${WANDB_RUN_NAME:-$WANDB_RUN_NAME_S2_DEFAULT}}"', wrapper)
-        self.assertIn('STAGE2_CHECKPOINT_ARTIFACT_NAME="${STAGE2_CHECKPOINT_ARTIFACT_NAME:-${CHECKPOINT_ARTIFACT_NAME:-${WANDB_RUN_NAME_S2}-checkpoints}}"', wrapper)
+        self.assertIn('RUN_NAME_S2_DIR="${WANDB_RUN_NAME_S2}"', wrapper)
+        self.assertIn('STAGE2_MODEL_ARTIFACT_NAME="${STAGE2_MODEL_ARTIFACT_NAME:-train-sft-output}"', wrapper)
+        self.assertIn('if [ "${STAGE2_CHECKPOINT_ARTIFACT_NAME+x}" = "x" ]; then', wrapper)
+        self.assertIn('STAGE2_CHECKPOINT_ARTIFACT_NAME="${CHECKPOINT_ARTIFACT_NAME}"', wrapper)
+        self.assertIn('STAGE2_CHECKPOINT_ARTIFACT_NAME="${WANDB_RUN_NAME_S2}-checkpoints"', wrapper)
         self.assertIn("USE_UNSLOTH=${USE_UNSLOTH:-False}", wrapper)
         self.assertIn("ATTN_IMPLEMENTATION=${ATTN_IMPLEMENTATION:-sdpa}", wrapper)
         self.assertIn('STAGE2_LOG_EVERY_N_STEPS=${STAGE2_LOG_EVERY_N_STEPS:-10}', wrapper)
@@ -66,19 +69,40 @@ class TrainProteinLLMTrackingContractsTest(unittest.TestCase):
             'STAGE2_SAMPLE_GENERATION_EVERY_N_STEPS=${STAGE2_SAMPLE_GENERATION_EVERY_N_STEPS:-500}',
             wrapper,
         )
+        self.assertIn(
+            'STAGE2_CHECKPOINT_EVERY_N_TRAIN_STEPS=${STAGE2_CHECKPOINT_EVERY_N_TRAIN_STEPS:-500}',
+            wrapper,
+        )
         self.assertIn('--weave_project "$WEAVE_PROJECT"', wrapper)
         self.assertIn('--weave_trace_budget "$WEAVE_TRACE_BUDGET"', wrapper)
+        self.assertIn('--model_artifact "${STAGE2_MODEL_ARTIFACT_NAME}"', wrapper)
         self.assertIn('--use_unsloth "$USE_UNSLOTH"', wrapper)
         self.assertIn('--attn_implementation "$ATTN_IMPLEMENTATION"', wrapper)
-        self.assertIn('--every_n_train_steps "$STAGE2_SAMPLE_GENERATION_EVERY_N_STEPS"', wrapper)
+        self.assertIn('NUM_SANITY_VAL_STEPS=${NUM_SANITY_VAL_STEPS:-0}', wrapper)
+        self.assertIn('--num_sanity_val_steps "$NUM_SANITY_VAL_STEPS"', wrapper)
+        self.assertIn('--every_n_train_steps "$STAGE2_CHECKPOINT_EVERY_N_TRAIN_STEPS"', wrapper)
+        self.assertIn('--sample_generation_every_n_steps "$STAGE2_SAMPLE_GENERATION_EVERY_N_STEPS"', wrapper)
+
+    def test_train_sft_disables_sanity_validation_by_default(self):
+        source = TRAIN_PATH.read_text()
+        self.assertIn('parser.add_argument("--num_sanity_val_steps", type=int, default=0)', source)
 
     def test_train_sft_finishes_wandb_and_flushes_weave(self):
         source = TRAIN_PATH.read_text()
         self.assertIn('flush = getattr(weave_trace_state["client"], "flush", None)', source)
         self.assertIn('finalize = getattr(logger, "finalize", None)', source)
         self.assertIn('finalize("success")', source)
+        self.assertIn("def resolve_go_embedding_sources(", source)
+        self.assertIn("self.precomputed_go_embedding_cache_path", source)
+        self.assertIn('self.model.load_precomputed_go_embedding_cache(', source)
         self.assertIn("prepare_model_artifact_directory(", source)
+        self.assertIn("save_lightning_ckpt(", source)
+        self.assertIn('"checkpoint_artifact"', source)
         self.assertIn('"artifact_selected_checkpoint"', source)
+        self.assertIn("def on_fit_end(self) -> None:", source)
+        self.assertIn('summary["trainer/global_step"] = int(self.global_step)', source)
+        self.assertNotIn("shutil.rmtree(protein_model_dir)", source)
+        self.assertNotIn("go_embedding_cache.unlink()", source)
 
     def test_directory_artifact_logging_does_not_block_before_finish(self):
         source = TRACKING_PATH.read_text()
