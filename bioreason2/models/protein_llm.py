@@ -432,6 +432,8 @@ class ProteinLLMModel(nn.Module):
                     f"features {n_protein_features}, tokens: {n_protein_tokens}"
                 )
 
+            protein_embeds_flat = protein_embeds_flat.to(dtype=text_inputs_embeds.dtype)
+
             # Replace protein tokens with actual protein embeddings (out-of-place to preserve autograd graph)
             if n_protein_tokens > 0:
                 orig_shape = text_inputs_embeds.shape  # (B, L, H)

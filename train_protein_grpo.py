@@ -10,6 +10,7 @@ GO encoder, and reasoning dataset format intact.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import math
 import os
@@ -19,25 +20,15 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
+try:
+    import weave
+except ImportError:  # pragma: no cover - optional dependency at runtime
+    weave = None
+
 
 GO_ID_PATTERN = re.compile(r"GO:\d{7}")
 THINK_TAG_PATTERN = re.compile(r"<think>\s*(.*?)\s*</think>", re.DOTALL)
 ANSWER_TAG_PATTERN = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.DOTALL)
-RL_SAMPLE_TABLE_COLUMNS = [
-    "global_step",
-    "protein_id",
-    "split",
-    "prompt_preview",
-    "completion",
-    "reasoning",
-    "final_answer",
-    "predicted_go_ids",
-    "target_go_ids",
-    "reward_total",
-    "advantage",
-]
-
-
 def normalize_text(value: Any) -> str:
     if value is None:
         return ""
@@ -46,6 +37,16 @@ def normalize_text(value: Any) -> str:
     if isinstance(value, (list, tuple, set)):
         return ", ".join(str(item) for item in value if item not in (None, ""))
     return str(value)
+
+
+def resolve_attn_implementation(preferred: str) -> str:
+    normalized = normalize_text(preferred).strip() or "sdpa"
+    if normalized != "flash_attention_2":
+        return normalized
+    if importlib.util.find_spec("flash_attn") is not None:
+        return normalized
+    print("flash_attn is unavailable; falling back to attn_implementation=sdpa for RL")
+    return "sdpa"
 
 
 def maybe_parse_list(value: Any) -> List[str]:
@@ -212,11 +213,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--seed", type=int, default=23)
-    parser.add_argument("--wandb_project", type=str, default="bioreason-pro-rl")
+    parser.add_argument("--wandb_project", type=str, default=os.environ.get("WANDB_PROJECT", "bioreason-pro-custom"))
     parser.add_argument("--wandb_entity", type=str, default=None)
     parser.add_argument("--wandb_mode", type=str, default=None)
     parser.add_argument("--wandb_job_type", type=str, default="train_rl", choices=["train_rl"])
     parser.add_argument("--weave_project", type=str, default=None)
+    parser.add_argument("--weave_trace_budget", type=int, default=64)
 
     parser.add_argument("--benchmark_version", type=str, default="213 -> 221 -> 225 -> 228")
     parser.add_argument("--temporal_split_artifact", type=str, default=None)
@@ -300,6 +302,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
 
     parser.add_argument("--num_generations", type=int, default=4)
+    parser.add_argument("--min_new_tokens", type=int, default=1)
     parser.add_argument("--max_new_tokens", type=int, default=768)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top_p", type=float, default=0.95)
@@ -344,6 +347,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "train_projector",
         "train_go_modules",
         "use_qlora",
+        "bnb_4bit_use_double_quant",
         "do_sample",
         "ablation_from_paper_rl",
     ]
@@ -454,6 +458,7 @@ def instantiate_model(args: argparse.Namespace, trainable: bool) -> Any:
     from bioreason2.models.protein_llm import ProteinLLMModel
 
     quantization_config = build_quantization_config(args) if trainable else None
+    attn_implementation = resolve_attn_implementation("flash_attention_2")
     model = ProteinLLMModel(
         text_model_name=args.text_model_name,
         protein_model_name=args.protein_model_name,
@@ -464,7 +469,7 @@ def instantiate_model(args: argparse.Namespace, trainable: bool) -> Any:
         protein_model_finetune=args.protein_model_finetune,
         protein_embedding_layer=args.protein_embedding_layer,
         go_model_finetune=args.train_go_modules,
-        attn_implementation="flash_attention_2",
+        attn_implementation=attn_implementation,
         go_obo_path=args.go_obo_path,
         precomputed_embeddings_path=args.precomputed_embeddings_path,
         go_hidden_dim=args.go_hidden_dim,
@@ -734,23 +739,6 @@ def export_hf_model(model: Any, save_dir: Path) -> None:
     export_dir.rmdir()
 
 
-def build_rollout_row(global_step: int, sample_meta: Mapping[str, Any], completion: str, total_reward: float, advantage: float) -> List[Any]:
-    sections = extract_reasoning_and_answer(completion)
-    return [
-        global_step,
-        normalize_text(sample_meta.get("protein_id")),
-        normalize_text(sample_meta.get("split")),
-        normalize_text(sample_meta.get("prompt_preview"))[:512],
-        completion,
-        sections["reasoning"],
-        sections["final_answer"],
-        ", ".join(extract_go_ids(completion)),
-        ", ".join(build_target_go_ids(sample_meta)),
-        float(total_reward),
-        float(advantage),
-    ]
-
-
 def maybe_init_wandb(args: argparse.Namespace, tracking_config: Mapping[str, Any]) -> Any:
     import wandb
 
@@ -766,6 +754,89 @@ def maybe_init_wandb(args: argparse.Namespace, tracking_config: Mapping[str, Any
     return wandb.init(**init_kwargs)
 
 
+def resolve_weave_project(args: argparse.Namespace) -> str:
+    explicit = normalize_text(getattr(args, "weave_project", None)).strip()
+    if explicit:
+        return explicit
+    entity = normalize_text(getattr(args, "wandb_entity", None)).strip()
+    project = normalize_text(getattr(args, "wandb_project", None)).strip()
+    if entity and project:
+        return f"{entity}/{project}"
+    return ""
+
+
+def ensure_weave_server_cache_dir(output_dir: Path) -> str:
+    cache_dir = os.environ.get("WEAVE_SERVER_CACHE_DIR")
+    if normalize_text(cache_dir).strip():
+        resolved = Path(cache_dir).expanduser()
+    else:
+        resolved = output_dir / "weave_server_cache"
+        os.environ["WEAVE_SERVER_CACHE_DIR"] = str(resolved)
+    resolved.mkdir(parents=True, exist_ok=True)
+    return str(resolved)
+
+
+def maybe_init_weave(args: argparse.Namespace, output_dir: Path) -> Optional[Dict[str, Any]]:
+    if weave is None:
+        print("⚠️  Weave is unavailable; RL generation traces will be skipped.")
+        return None
+
+    weave_project = resolve_weave_project(args)
+    if not weave_project:
+        print("⚠️  Weave project is not set; RL generation traces will be skipped.")
+        return None
+
+    cache_dir = ensure_weave_server_cache_dir(output_dir)
+    print(f"Initializing Weave for RL tracing: project={weave_project}, cache_dir={cache_dir}")
+    client = weave.init(weave_project)
+    print("Weave initialization for RL tracing completed.")
+
+    @weave.op(name="train_rl_generation_trace")
+    def trace_generation(payload: Dict[str, Any]) -> Dict[str, Any]:
+        return payload
+
+    return {
+        "client": client,
+        "trace_generation": trace_generation,
+        "remaining_budget": max(int(getattr(args, "weave_trace_budget", 0)), 0),
+        "project": weave_project,
+        "logged": 0,
+    }
+
+
+def maybe_trace_generation(
+    trace_state: Optional[Dict[str, Any]],
+    *,
+    split: str,
+    global_step: int,
+    sample_meta: Mapping[str, Any],
+    completion: str,
+    total_reward: float,
+    advantage: Optional[float] = None,
+) -> None:
+    if not trace_state or trace_state.get("remaining_budget", 0) <= 0:
+        return
+
+    trace_state["remaining_budget"] -= 1
+    sections = extract_reasoning_and_answer(completion)
+    payload = {
+        "split": split,
+        "global_step": int(global_step),
+        "protein_id": normalize_text(sample_meta.get("protein_id")),
+        "go_aspect": normalize_text(sample_meta.get("go_aspect")),
+        "prompt_preview": normalize_text(sample_meta.get("prompt_preview"))[:512],
+        "completion": completion,
+        "reasoning": sections["reasoning"],
+        "final_answer": sections["final_answer"],
+        "predicted_go_ids": extract_go_ids(completion),
+        "target_go_ids": build_target_go_ids(sample_meta),
+        "reward_total": float(total_reward),
+        "advantage": None if advantage is None else float(advantage),
+    }
+    trace_state["trace_generation"](payload)
+    trace_state["logged"] += 1
+
+
 def evaluate_policy(
     model: Any,
     ref_model: Any,
@@ -775,6 +846,8 @@ def evaluate_policy(
     reward_names: Sequence[str],
     reward_weights: Sequence[float],
     device: Any,
+    trace_state: Optional[Dict[str, Any]] = None,
+    global_step: int = 0,
 ) -> Dict[str, float]:
     import torch
 
@@ -802,6 +875,7 @@ def evaluate_policy(
                     do_sample=args.do_sample,
                     temperature=args.temperature,
                     top_p=args.top_p,
+                    min_new_tokens=args.min_new_tokens,
                     max_new_tokens=args.max_new_tokens,
                     pad_token_id=tokenizer.pad_token_id,
                     eos_token_id=tokenizer.eos_token_id,
@@ -811,6 +885,15 @@ def evaluate_policy(
                 rewards, _ = compute_group_rewards([completion_text], example["sample_meta"], reward_names, reward_weights)
                 total_reward += rewards[0]
                 total_length += float(completion_ids.numel())
+                maybe_trace_generation(
+                    trace_state,
+                    split="validation",
+                    global_step=global_step,
+                    sample_meta=example["sample_meta"],
+                    completion=completion_text,
+                    total_reward=rewards[0],
+                    advantage=None,
+                )
                 if ref_model is not None and completion_ids.numel() > 0:
                     combined_ids, combined_mask, prompt_token_len = build_combined_inputs(
                         example["input_ids"],
@@ -843,11 +926,17 @@ def evaluate_policy(
 
     model.train()
     if sample_count == 0:
-        return {"val_reward": 0.0, "val_completion_length": 0.0, "val_kl": 0.0}
+        return {
+            "eval/reward": 0.0,
+            "eval/completion_length": 0.0,
+            "eval/loss/kl_div": 0.0,
+            "eval/data/step_num_datums": 0.0,
+        }
     return {
-        "val_reward": total_reward / sample_count,
-        "val_completion_length": total_length / sample_count,
-        "val_kl": total_kl / sample_count if sample_count else 0.0,
+        "eval/reward": total_reward / sample_count,
+        "eval/completion_length": total_length / sample_count,
+        "eval/loss/kl_div": total_kl / sample_count if sample_count else 0.0,
+        "eval/data/step_num_datums": float(sample_count),
     }
 
 
@@ -860,6 +949,7 @@ def train(args: argparse.Namespace) -> None:
         build_checkpoint_artifact_metadata,
         build_training_tracking_config,
         maybe_log_directory_artifact,
+        maybe_use_artifact_refs,
         parse_artifact_aliases,
         sync_run_config,
     )
@@ -902,20 +992,39 @@ def train(args: argparse.Namespace) -> None:
         weight_decay=args.weight_decay,
     )
 
+    ensure_weave_server_cache_dir(output_dir)
     wandb_run = maybe_init_wandb(args, tracking_config)
-    sample_table = None
-    try:
-        import wandb
-
-        sample_table = wandb.Table(columns=RL_SAMPLE_TABLE_COLUMNS)
-    except Exception:
-        sample_table = None
 
     if wandb_run is not None:
         sync_run_config(wandb_run, tracking_config)
+        sync_run_config(
+            wandb_run,
+            {
+                "dataset_train_size": len(train_dataset),
+                "dataset_validation_size": len(val_dataset),
+            },
+        )
+        maybe_use_artifact_refs(
+            wandb_run,
+            {
+                "temporal_split_artifact": args.temporal_split_artifact,
+                "dataset_artifact": args.dataset_artifact,
+                "base_checkpoint": args.base_checkpoint,
+            },
+        )
+    weave_trace_state = maybe_init_weave(args, output_dir)
+    if wandb_run is not None:
+        sync_run_config(
+            wandb_run,
+            {
+                "weave_trace_enabled": bool(weave_trace_state is not None),
+                "weave_trace_budget": int(getattr(args, "weave_trace_budget", 0)),
+            },
+        )
 
     best_val_reward = float("-inf")
     global_step = 0
+    last_eval_step: Optional[int] = None
     optimizer.zero_grad(set_to_none=True)
 
     for epoch_idx in range(args.max_epochs):
@@ -924,13 +1033,14 @@ def train(args: argparse.Namespace) -> None:
 
         for batch in train_loader:
             model.train()
+            print(f"Starting RL train batch at global_step={global_step}, epoch={epoch_idx}.")
             batch_size = batch["input_ids"].shape[0]
             sample_losses: List[Any] = []
             reward_totals: List[float] = []
             reward_stds: List[float] = []
             completion_lengths: List[int] = []
             kl_values: List[float] = []
-            reward_component_means: Dict[str, List[float]] = {name: [] for name in reward_names}
+            trainable_group_count = 0
 
             for example_idx in range(batch_size):
                 example = extract_example_from_batch(batch, example_idx, device)
@@ -940,6 +1050,11 @@ def train(args: argparse.Namespace) -> None:
                 completions: List[str] = []
                 completion_ids_list: List[Any] = []
                 for _ in range(args.num_generations):
+                    print(
+                        "Generating RL rollout: "
+                        f"global_step={global_step}, epoch={epoch_idx}, prompt_len={prompt_len}, "
+                        f"max_new_tokens={args.max_new_tokens}"
+                    )
                     generated_ids = model.generate(
                         input_ids=example["input_ids"],
                         attention_mask=example["attention_mask"],
@@ -950,17 +1065,22 @@ def train(args: argparse.Namespace) -> None:
                         do_sample=args.do_sample,
                         temperature=args.temperature,
                         top_p=args.top_p,
+                        min_new_tokens=args.min_new_tokens,
                         max_new_tokens=args.max_new_tokens,
                         pad_token_id=tokenizer.pad_token_id,
                         eos_token_id=tokenizer.eos_token_id,
                     )
                     completion_ids = generated_ids[0, prompt_len:].detach()
+                    print(
+                        "Completed RL rollout generation: "
+                        f"global_step={global_step}, completion_tokens={completion_ids.numel()}"
+                    )
                     completion_ids_list.append(completion_ids)
                     completions.append(decode_completion(tokenizer, completion_ids))
                     completion_lengths.append(int(completion_ids.numel()))
                 model.train()
 
-                total_rewards, component_scores = compute_group_rewards(
+                total_rewards, _ = compute_group_rewards(
                     completions,
                     example["sample_meta"],
                     reward_names,
@@ -972,16 +1092,25 @@ def train(args: argparse.Namespace) -> None:
                     reward_stds.append(float(torch.tensor(total_rewards, dtype=torch.float32).std(unbiased=False).item()))
                 else:
                     reward_stds.append(0.0)
-                for reward_name in reward_names:
-                    reward_component_means[reward_name].append(
-                        sum(component_scores[reward_name]) / max(len(component_scores[reward_name]), 1)
-                    )
 
                 for generation_idx, (completion_ids, completion_text, total_reward, advantage) in enumerate(
                     zip(completion_ids_list, completions, total_rewards, advantages)
                 ):
+                    if generation_idx == 0:
+                        maybe_trace_generation(
+                            weave_trace_state,
+                            split="train",
+                            global_step=global_step,
+                            sample_meta=example["sample_meta"],
+                            completion=completion_text,
+                            total_reward=total_reward,
+                            advantage=advantage,
+                        )
                     if completion_ids.numel() == 0:
                         continue
+
+                    if generation_idx == 0:
+                        trainable_group_count += 1
 
                     combined_ids, combined_mask, prompt_token_len = build_combined_inputs(
                         example["input_ids"],
@@ -1021,48 +1150,91 @@ def train(args: argparse.Namespace) -> None:
                     sample_losses.append(sample_loss)
                     kl_values.append(float(kl_term.mean().detach().item()))
 
-                    if sample_table is not None and generation_idx == 0:
-                        sample_table.add_data(
-                            *build_rollout_row(
-                                global_step=global_step,
-                                sample_meta=example["sample_meta"],
-                                completion=completion_text,
-                                total_reward=total_reward,
-                                advantage=advantage,
-                            )
-                        )
-
             if not sample_losses:
+                global_step += 1
+                skipped_payload = {
+                    "loss/train": 0.0,
+                    "reward": sum(reward_totals) / max(len(reward_totals), 1) if reward_totals else 0.0,
+                    "reward_std_dev": sum(reward_stds) / max(len(reward_stds), 1) if reward_stds else 0.0,
+                    "loss/kl_div": 0.0,
+                    "loss/learning_rate": optimizer.param_groups[0]["lr"],
+                    "loss/grad_norm": 0.0,
+                    "data/step_num_groups_submitted": float(batch_size),
+                    "data/step_num_groups_trainable": float(trainable_group_count),
+                    "data/step_num_trajectories": float(len(reward_totals)),
+                    "data/step_num_datums": float(batch_size),
+                    "data/step_trainer_tokens": float(sum(completion_lengths)),
+                }
+                if wandb_run is not None:
+                    print(f"Logging RL skipped-update metrics at global_step={global_step}.")
+                    wandb_run.log(skipped_payload, step=global_step)
+                    print(f"RL skipped-update metrics logged at global_step={global_step}.")
+
+                if args.eval_every_n_steps > 0 and global_step % args.eval_every_n_steps == 0:
+                    print(f"Starting RL validation eval at global_step={global_step} after skipped update.")
+                    val_metrics = evaluate_policy(
+                        model=model,
+                        ref_model=ref_model,
+                        dataloader=val_loader,
+                        tokenizer=tokenizer,
+                        args=args,
+                        reward_names=reward_names,
+                        reward_weights=reward_weights,
+                        device=device,
+                        trace_state=weave_trace_state,
+                        global_step=global_step,
+                    )
+                    if wandb_run is not None:
+                        wandb_run.log(val_metrics, step=global_step)
+                        print(f"RL validation metrics logged at global_step={global_step}.")
+                    last_eval_step = global_step
+                    if val_metrics["eval/reward"] > best_val_reward:
+                        best_val_reward = val_metrics["eval/reward"]
+                        save_raw_checkpoint(model, raw_checkpoint_dir / "best", global_step, args)
+
+                if args.save_every_n_steps > 0 and global_step % args.save_every_n_steps == 0:
+                    save_raw_checkpoint(model, raw_checkpoint_dir, global_step, args)
+
+                if global_step >= args.max_steps:
+                    break
                 continue
 
             loss = torch.stack(sample_losses).mean() / max(args.gradient_accumulation_steps, 1)
             loss.backward()
 
             should_step = ((global_step + 1) % max(args.gradient_accumulation_steps, 1)) == 0
+            grad_norm_value = 0.0
             if should_step:
-                clip_grad_norm_([parameter for parameter in model.parameters() if parameter.requires_grad], args.max_grad_norm)
+                grad_norm = clip_grad_norm_(
+                    [parameter for parameter in model.parameters() if parameter.requires_grad],
+                    args.max_grad_norm,
+                )
+                grad_norm_value = float(grad_norm.item()) if hasattr(grad_norm, "item") else float(grad_norm)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
             global_step += 1
 
             log_payload = {
-                "train/loss": float(loss.detach().item() * max(args.gradient_accumulation_steps, 1)),
+                "loss/train": float(loss.detach().item() * max(args.gradient_accumulation_steps, 1)),
                 "reward": sum(reward_totals) / max(len(reward_totals), 1),
-                "reward_std": sum(reward_stds) / max(len(reward_stds), 1),
-                "completion_length": sum(completion_lengths) / max(len(completion_lengths), 1),
-                "kl": sum(kl_values) / max(len(kl_values), 1) if kl_values else 0.0,
-                "lr": optimizer.param_groups[0]["lr"],
-                "global_step": global_step,
-                "epoch": epoch_idx,
+                "reward_std_dev": sum(reward_stds) / max(len(reward_stds), 1),
+                "loss/kl_div": sum(kl_values) / max(len(kl_values), 1) if kl_values else 0.0,
+                "loss/learning_rate": optimizer.param_groups[0]["lr"],
+                "loss/grad_norm": grad_norm_value,
+                "data/step_num_groups_submitted": float(batch_size),
+                "data/step_num_groups_trainable": float(trainable_group_count),
+                "data/step_num_trajectories": float(len(reward_totals)),
+                "data/step_num_datums": float(batch_size),
+                "data/step_trainer_tokens": float(sum(completion_lengths)),
             }
-            for reward_name in reward_names:
-                values = reward_component_means[reward_name]
-                log_payload[f"reward/{reward_name}"] = sum(values) / max(len(values), 1)
             if wandb_run is not None:
+                print(f"Logging RL train metrics at global_step={global_step}.")
                 wandb_run.log(log_payload, step=global_step)
+                print(f"RL train metrics logged at global_step={global_step}.")
 
             if args.eval_every_n_steps > 0 and global_step % args.eval_every_n_steps == 0:
+                print(f"Starting RL validation eval at global_step={global_step}.")
                 val_metrics = evaluate_policy(
                     model=model,
                     ref_model=ref_model,
@@ -1072,11 +1244,15 @@ def train(args: argparse.Namespace) -> None:
                     reward_names=reward_names,
                     reward_weights=reward_weights,
                     device=device,
+                    trace_state=weave_trace_state,
+                    global_step=global_step,
                 )
                 if wandb_run is not None:
                     wandb_run.log(val_metrics, step=global_step)
-                if val_metrics["val_reward"] > best_val_reward:
-                    best_val_reward = val_metrics["val_reward"]
+                    print(f"RL validation metrics logged at global_step={global_step}.")
+                last_eval_step = global_step
+                if val_metrics["eval/reward"] > best_val_reward:
+                    best_val_reward = val_metrics["eval/reward"]
                     save_raw_checkpoint(model, raw_checkpoint_dir / "best", global_step, args)
 
             if args.save_every_n_steps > 0 and global_step % args.save_every_n_steps == 0:
@@ -1085,12 +1261,29 @@ def train(args: argparse.Namespace) -> None:
             if global_step >= args.max_steps:
                 break
 
+    if global_step > 0 and last_eval_step != global_step:
+        print(f"Starting RL final validation eval at global_step={global_step}.")
+        final_val_metrics = evaluate_policy(
+            model=model,
+            ref_model=ref_model,
+            dataloader=val_loader,
+            tokenizer=tokenizer,
+            args=args,
+            reward_names=reward_names,
+            reward_weights=reward_weights,
+            device=device,
+            trace_state=weave_trace_state,
+            global_step=global_step,
+        )
+        final_val_metrics = {f"final/{key}": value for key, value in final_val_metrics.items()}
+        if wandb_run is not None:
+            wandb_run.log(final_val_metrics, step=global_step)
+            print(f"RL final validation metrics logged at global_step={global_step}.")
+
     final_checkpoint_dir = save_raw_checkpoint(model, raw_checkpoint_dir, global_step, args)
     export_hf_model(model, output_dir)
 
     if wandb_run is not None:
-        if sample_table is not None:
-            wandb_run.log({"train_rl_rollouts": sample_table}, step=global_step)
         try:
             import wandb
 
@@ -1110,9 +1303,15 @@ def train(args: argparse.Namespace) -> None:
                         "model_artifact": checkpoint_status["artifact_name"],
                         "model_artifact_aliases": checkpoint_status["aliases"],
                         "last_raw_checkpoint": str(final_checkpoint_dir),
+                        "weave_trace_project": weave_trace_state["project"] if weave_trace_state else None,
+                        "weave_trace_count": weave_trace_state["logged"] if weave_trace_state else 0,
                     },
                 )
         finally:
+            if weave_trace_state and weave_trace_state.get("client") is not None:
+                flush = getattr(weave_trace_state["client"], "flush", None)
+                if callable(flush):
+                    flush()
             wandb_run.finish()
 
 

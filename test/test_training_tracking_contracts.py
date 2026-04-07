@@ -33,10 +33,14 @@ class FakeRun:
     def __init__(self):
         self.config = FakeConfig()
         self.artifacts = []
+        self.used_artifacts = []
 
     def log_artifact(self, artifact, aliases=None):
         artifact.logged_aliases = aliases
         self.artifacts.append(artifact)
+
+    def use_artifact(self, artifact_ref, type=None):
+        self.used_artifacts.append((artifact_ref, type))
 
 
 class FakeArtifact:
@@ -104,6 +108,8 @@ class TrainingTrackingContractsTest(unittest.TestCase):
         self.assertEqual(config["num_train_epochs"], 10)
         self.assertEqual(config["validation_subset_size"], 100)
         self.assertEqual(config["validation_subset_strategy"], "stratified_aspect_profile")
+        self.assertEqual(config["weave_project"], "")
+        self.assertIsNone(config["weave_trace_budget"])
 
     def test_build_training_tracking_config_uses_output_dir_when_checkpoint_dir_missing(self):
         args = types.SimpleNamespace(
@@ -218,6 +224,30 @@ class TrainingTrackingContractsTest(unittest.TestCase):
     def test_parse_artifact_aliases_deduplicates(self):
         aliases = TRACKING.parse_artifact_aliases("latest, best,latest")
         self.assertEqual(aliases, ["latest", "best"])
+
+    def test_maybe_use_artifact_refs_registers_input_lineage(self):
+        run = FakeRun()
+
+        statuses = TRACKING.maybe_use_artifact_refs(
+            run,
+            {
+                "temporal_split_artifact": "wandb-healthcare/bioreason-pro-custom/disease-temporal-split:production",
+                "dataset_artifact": "wandb-healthcare/bioreason-pro-custom/disease-temporal-reasoning:production",
+                "base_checkpoint": "/tmp/local-checkpoint",
+            },
+        )
+
+        self.assertTrue(statuses["temporal_split_artifact"]["used"])
+        self.assertTrue(statuses["dataset_artifact"]["used"])
+        self.assertFalse(statuses["base_checkpoint"]["used"])
+        self.assertEqual(statuses["base_checkpoint"]["reason"], "not_wandb_artifact_ref")
+        self.assertEqual(
+            run.used_artifacts,
+            [
+                ("wandb-healthcare/bioreason-pro-custom/disease-temporal-split:production", None),
+                ("wandb-healthcare/bioreason-pro-custom/disease-temporal-reasoning:production", None),
+            ],
+        )
 
 
 if __name__ == "__main__":

@@ -1,56 +1,56 @@
 # PLAN
 
-この PLAN は、[specification.md](/Users/keisuke/Project/learning/drug_discovery/BioReason-Pro/domain/specification/busiless-rules/specification.md) と [RESEARCH_README.md](/Users/keisuke/Project/learning/drug_discovery/BioReason-Pro/RESEARCH_README.md) をそのまま実行計画に落としたものである。  
-目的は、**何が終わっていて、次に何をやるかを曖昧にしないこと**である。
+This PLAN is a direct translation of [specification.md](/Users/keisuke/Project/learning/drug_discovery/BioReason-Pro/domain/specification/busiless-rules/specification.md) and [RESEARCH_README.md](/Users/keisuke/Project/learning/drug_discovery/BioReason-Pro/RESEARCH_README.md) into an execution plan.  
+The purpose is to **eliminate ambiguity about what is done and what to do next**.
 
-## 0. 現在地
+## 0. Current Status
 
-### 0.1 採用前提
+### 0.1 Adopted Assumptions
 
-固定前提は次である。
+The fixed assumptions are as follows.
 
 - benchmark version: `213 -> 221 -> 225 -> 228`
 - benchmark alias: `213.221.225.228`
 - primary dataset: `disease_temporal_hc_reasoning_v1`
 - comparison model: `bioreason-pro-rl-paper`
-- 正本: W&B Artifact ref
+- source of truth: W&B Artifact ref
 - local filesystem: scratch
 
-### 0.2 進捗サマリ
+### 0.2 Progress Summary
 
-| 項目 | 状態 | 現状 |
+| Item | Status | Current State |
 |---|---|---|
-| 仕様の整理 | 完了 | final 仕様は [specification.md](/Users/keisuke/Project/learning/drug_discovery/BioReason-Pro/domain/specification/busiless-rules/specification.md) に統一済み |
-| 実行手順の整理 | 完了 | 現行 runbook は [RESEARCH_README.md](/Users/keisuke/Project/learning/drug_discovery/BioReason-Pro/RESEARCH_README.md) |
-| temporal split artifact 作成 | 完了 | `wandb-healthcare/bioreason-pro-custom/disease-temporal-split:production` |
-| reasoning dataset 作成 | 完了 | `wandb-healthcare/bioreason-pro-custom/disease-temporal-reasoning:production` |
-| comparison model artifact 確定 | 完了 | `wandb-healthcare/bioreason-pro-custom/bioreason-pro-rl:production` |
-| CoreWeave 実行フロー整理 | 完了 | `srun` ベースの実行、remote env、artifact 解決、1-sample smoke まで確認済み |
-| comparison model の validation 評価 | 要再実行 | Weave 未導入と Fmax 抽出失敗を直したあとで再実行する |
-| SFT | 要再実行 | 旧 run は full validation を使っていたため、100-sample subset でやり直す |
-| RL | 準備済み | `train_protein_grpo.py` と `scripts/sh_train_protein_grpo.sh` は実装済み、run は未実施 |
+| Specification cleanup | Complete | Final spec unified in [specification.md](/Users/keisuke/Project/learning/drug_discovery/BioReason-Pro/domain/specification/busiless-rules/specification.md) |
+| Execution procedure cleanup | Complete | Current runbook is [RESEARCH_README.md](/Users/keisuke/Project/learning/drug_discovery/BioReason-Pro/RESEARCH_README.md) |
+| Temporal split artifact creation | Complete | `wandb-healthcare/bioreason-pro-custom/disease-temporal-split:production` |
+| Reasoning dataset creation | Complete | `wandb-healthcare/bioreason-pro-custom/disease-temporal-reasoning:production` |
+| Comparison model artifact finalized | Complete | `wandb-healthcare/bioreason-pro-custom/bioreason-pro-rl:production` |
+| CoreWeave execution flow cleanup | Complete | `srun`-based execution, remote env, artifact resolution, 1-sample smoke verified |
+| Comparison model validation eval | Needs re-run | Re-run after fixing Weave non-integration and Fmax extraction failure |
+| SFT | Needs re-run | Previous run used full validation; redo with 100-sample subset |
+| RL | Ready | `train_protein_grpo.py` and `scripts/sh_train_protein_grpo.sh` implemented; run not yet executed |
 
-### 0.3 いま次にやること
+### 0.3 Immediate Next Steps
 
-次の実行対象は **`comparison-family` validation を 100-sample stratified で確認し、並行して `stage 2 only` SFT の進捗を確認すること** である。  
-その後、validation metric を確認して RL に進み、最終報告値は別 run の `test` eval で出す。
+The next execution target is to **verify `comparison-family` validation with 100-sample stratified, and in parallel check `stage 2 only` SFT progress**.  
+After that, review validation metrics and proceed to RL; final reported values will come from a separate `test` eval run.
 
-## 1. データの準備
+## 1. Data Preparation
 
-状態: **完了**
+Status: **Complete**
 
-### 1.1 やること
+### 1.1 Tasks
 
-ローカル Mac で次を行う。
+Perform the following on local Mac.
 
-1. temporal split artifact を build する
-2. split sanity check を通す
-3. reasoning dataset を build する
-4. W&B Artifact に upload する
+1. Build temporal split artifact
+2. Pass split sanity check
+3. Build reasoning dataset
+4. Upload to W&B Artifact
 
-高位 entry point は [run_temporal_split_artifact_pipeline.py](/Users/keisuke/Project/learning/drug_discovery/BioReason-Pro/scripts/run_temporal_split_artifact_pipeline.py) に固定する。
+The high-level entry point is fixed to [run_temporal_split_artifact_pipeline.py](/Users/keisuke/Project/learning/drug_discovery/BioReason-Pro/scripts/run_temporal_split_artifact_pipeline.py).
 
-### 1.2 実行コマンド
+### 1.2 Execution Commands
 
 ```bash
 cd /Users/keisuke/Project/learning/drug_discovery/BioReason-Pro
@@ -73,39 +73,39 @@ uv run --active python scripts/run_temporal_split_artifact_pipeline.py \
   --wandb-project "$WANDB_PROJECT"
 ```
 
-### 1.3 完了条件
+### 1.3 Completion Criteria
 
-次が揃っていれば完了とする。
+Considered complete when the following are satisfied.
 
 - `split_validation.time_order_valid == true`
 - `split_validation.protein_disjoint_valid == true`
-- temporal split artifact が W&B に upload されている
-- reasoning dataset artifact が W&B に upload されている
+- temporal split artifact uploaded to W&B
+- reasoning dataset artifact uploaded to W&B
 
-### 1.4 現在の成果物
+### 1.4 Current Artifacts
 
 - temporal split artifact
   - `wandb-healthcare/bioreason-pro-custom/disease-temporal-split:production`
 - reasoning dataset artifact
   - `wandb-healthcare/bioreason-pro-custom/disease-temporal-reasoning:production`
 
-## 2. GPU へのアクセス
+## 2. GPU Access
 
-状態: **完了**
+Status: **Complete**
 
-### 2.1 やること
+### 2.1 Tasks
 
-CoreWeave SUNK の login node から `srun` で job を送る。  
-GPU node に手で入る前提にはしない。
+Submit jobs via `srun` from the CoreWeave SUNK login node.  
+Do not assume manual access to GPU nodes.
 
-### 2.2 実行手順
+### 2.2 Execution Procedure
 
-1. login node に SSH する
-2. ローカルからコードだけ `rsync` する
-3. CoreWeave 側で `uv` 環境を作る
-4. `wandb_registry_paths.env` と `wandb_asset_sources.env` を用意する
+1. SSH into login node
+2. `rsync` code only from local
+3. Create `uv` environment on CoreWeave side
+4. Prepare `wandb_registry_paths.env` and `wandb_asset_sources.env`
 
-### 2.3 実行コマンド
+### 2.3 Execution Commands
 
 SSH:
 
@@ -125,7 +125,7 @@ rsync -av --delete \
   kkamata+cwb607@sunk.cwb607-training.coreweave.app:~/BioReason-Pro/
 ```
 
-CoreWeave 上の環境構築:
+CoreWeave environment setup:
 
 ```bash
 cd ~/BioReason-Pro
@@ -140,7 +140,7 @@ uv pip install unsloth
 uv run --active wandb login
 ```
 
-env 準備:
+env preparation:
 
 ```bash
 cd ~/BioReason-Pro
@@ -156,37 +156,37 @@ cp configs/disease_benchmark/wandb_asset_sources.env.example \
   configs/disease_benchmark/wandb_asset_sources.env
 ```
 
-### 2.4 完了条件
+### 2.4 Completion Criteria
 
-次が揃っていればこのフェーズは完了とする。
+This phase is complete when the following are satisfied.
 
-- login node に入れる
-- `~/BioReason-Pro` に最新コードがある
-- `.venv-gpu` が作成済み
-- `wandb_registry_paths.env` に次が入っている
+- Can access login node
+- Latest code is in `~/BioReason-Pro`
+- `.venv-gpu` is created
+- `wandb_registry_paths.env` contains:
   - `BIOREASON_MAIN_TEMPORAL_SPLIT_REGISTRY_PATH`
   - `BIOREASON_MAIN_REASONING_DATASET_REGISTRY_PATH`
   - `BIOREASON_RL_PAPER_MODEL_REGISTRY_PATH`
 
-## 3. 比較モデルの評価
+## 3. Comparison Model Evaluation
 
-状態: **修正後に再実行**
+Status: **Re-run after fixes**
 
-### 3.1 目的
+### 3.1 Purpose
 
-独自 tuning 前の比較モデル `bioreason-pro-rl-paper` を、現在採用している benchmark 上で `validation` split で評価する。  
-このフェーズでは **metrics のみ** を W&B に残し、table や eval artifact は要求しない。  
-`validation` は full split ではなく、`go_aspect` と label-profile を保つ deterministic な **100-sample stratified subset** で回す。
+Evaluate the pre-tuning comparison model `bioreason-pro-rl-paper` on the currently adopted benchmark using the `validation` split.  
+This phase saves **metrics only** to W&B; tables and eval artifacts are not required.  
+`validation` uses a deterministic **100-sample stratified subset** preserving `go_aspect` and label-profile, not the full split.
 
-### 3.2 評価対象
+### 3.2 Evaluation Targets
 
 - `comparison-family`: `bioreason-pro-rl-paper`
 - `tuned-family`: `train-sft-output`, `train-rl-output`
-- `spec-comparison`: 上記すべて
+- `spec-comparison`: all of the above
 
-この段階で実際に回しているのは `comparison-family` のみである。
+At this stage, only `comparison-family` is actually being run.
 
-### 3.3 実行コマンド
+### 3.3 Execution Commands
 
 ```bash
 srun \
@@ -208,9 +208,9 @@ srun \
   '
 ```
 
-### 3.4 完了条件
+### 3.4 Completion Criteria
 
-W&B 上に次が見えていれば完了とする。
+Complete when the following are visible on W&B.
 
 - `job_type=eval`
 - `fmax_mf`
@@ -218,25 +218,25 @@ W&B 上に次が見えていれば完了とする。
 - `fmax_cc`
 - `overall_mean_fmax`
 
-validation run では metrics が保存されていれば十分であり、`eval_summary` table、`eval_samples` table、eval artifact は要求しない。
-sample 数は既定で `100`、subset 戦略は `stratified_aspect_profile` に固定する。
-`fmax_mf`, `fmax_bp`, `fmax_cc` のいずれかが欠けた run は完了扱いにしない。
+For validation runs, having metrics saved is sufficient; `eval_summary` table, `eval_samples` table, and eval artifacts are not required.
+Sample count defaults to `100`; subset strategy is fixed to `stratified_aspect_profile`.
+Runs missing any of `fmax_mf`, `fmax_bp`, `fmax_cc` are not treated as complete.
 
-### 3.5 このフェーズが終わったらやること
+### 3.5 After This Phase
 
-結果を確認し、SFT に進む。  
-この時点では `test` はまだ使わない。
+Review results and proceed to SFT.  
+`test` is not used at this point.
 
 ## 4. SFT
 
-状態: **実行中**
+Status: **In progress**
 
-### 4.1 目的
+### 4.1 Purpose
 
-`bioreason-pro-rl-paper` を初期値として、reasoning dataset の `train` split を使って SFT を行う。
-canonical run は **stage 2 only** とし、comparison model に含まれる projector / GO module 重みをそのまま warm-start として使う。
+Perform SFT using `bioreason-pro-rl-paper` as the initial checkpoint, with the `train` split of the reasoning dataset.
+The canonical run is **stage 2 only**, using projector / GO module weights from the comparison model as-is for warm-start.
 
-### 4.2 入力
+### 4.2 Input
 
 - temporal split artifact
   - `BIOREASON_MAIN_TEMPORAL_SPLIT_REGISTRY_PATH`
@@ -245,7 +245,7 @@ canonical run は **stage 2 only** とし、comparison model に含まれる pro
 - comparison model artifact
   - `BIOREASON_RL_PAPER_MODEL_REGISTRY_PATH`
 
-### 4.3 実行コマンド
+### 4.3 Execution Commands
 
 ```bash
 cd ~/BioReason-Pro
@@ -254,29 +254,29 @@ source .venv-gpu/bin/activate
 bash scripts/sh_train_protein_qwen_staged.sh
 ```
 
-この wrapper は内部で `srun python train_protein_llm.py ...` を呼ぶ。
+This wrapper internally calls `srun python train_protein_llm.py ...`.
 
-### 4.4 固定ルール
+### 4.4 Fixed Rules
 
-- 学習には `train` split を使う
-- checkpoint selection には `validation` から deterministic に切り出した **100-sample stratified subset** を使う
-- `test` split は使わない
+- Training uses the `train` split
+- Checkpoint selection uses a **100-sample stratified subset** deterministically drawn from `validation`
+- The `test` split is not used
 - `job_type=train_sft`
-- wall time は `12:00:00`
-- canonical は `stage 2 only`
-- `RUN_STAGE1=true` は fallback / ablation のときだけ使う
-- validation subset は `VALIDATION_SUBSET_SIZE=100`, `VALIDATION_SUBSET_STRATEGY=stratified_aspect_profile` に固定する
+- Wall time is `12:00:00`
+- Canonical is `stage 2 only`
+- `RUN_STAGE1=true` is used only for fallback / ablation
+- Validation subset is fixed to `VALIDATION_SUBSET_SIZE=100`, `VALIDATION_SUBSET_STRATEGY=stratified_aspect_profile`
 
-### 4.5 完了条件
+### 4.5 Completion Criteria
 
-W&B 上に次が揃っていれば完了とする。
+Complete when the following are present on W&B.
 
 - `job_type=train_sft`
 - train / validation loss
 - sample table
 - output checkpoint artifact
 
-完了後は `wandb_registry_paths.env` に次を追記する。
+After completion, add the following to `wandb_registry_paths.env`.
 
 ```bash
 export BIOREASON_TRAIN_SFT_MODEL_REGISTRY_PATH="entity/project/train-sft-output:alias"
@@ -284,23 +284,23 @@ export BIOREASON_TRAIN_SFT_MODEL_REGISTRY_PATH="entity/project/train-sft-output:
 
 ## 5. RL
 
-状態: **準備済み、run は未実施**
+Status: **Ready, run not yet executed**
 
-### 5.1 目的
+### 5.1 Purpose
 
-`train-sft-output` を canonical input として RL を行う。
+Perform RL using `train-sft-output` as the canonical input.
 
-### 5.2 固定ルール
+### 5.2 Fixed Rules
 
-- rollout / reward 最適化には `train` split を使う
-- checkpoint selection と offline sanity-check には `validation` から deterministic に切り出した **100-sample stratified subset** を使う
-- `test` split は使わない
+- Rollout / reward optimization uses the `train` split
+- Checkpoint selection and offline sanity-check use a **100-sample stratified subset** deterministically drawn from `validation`
+- The `test` split is not used
 - `job_type=train_rl`
-- wall time は `12:00:00`
-- `bioreason-pro-rl-paper` から直接 RL を始める経路は ablation のみ
-- validation subset は `MAX_EVAL_SAMPLES=100`, `EVAL_SAMPLE_STRATEGY=stratified_aspect_profile` に固定する
+- Wall time is `12:00:00`
+- Starting RL directly from `bioreason-pro-rl-paper` is for ablation only
+- Validation subset is fixed to `MAX_EVAL_SAMPLES=100`, `EVAL_SAMPLE_STRATEGY=stratified_aspect_profile`
 
-### 5.3 実行コマンド
+### 5.3 Execution Commands
 
 ```bash
 cd ~/BioReason-Pro
@@ -309,34 +309,34 @@ source .venv-gpu/bin/activate
 bash scripts/sh_train_protein_grpo.sh
 ```
 
-この wrapper は内部で `srun python train_protein_grpo.py ...` を呼ぶ。  
-canonical には `BIOREASON_TRAIN_SFT_MODEL_REGISTRY_PATH` を使い、raw SFT checkpoint artifact しか無い場合は HF model へ変換してから RL を始める。
+This wrapper internally calls `srun python train_protein_grpo.py ...`.  
+Canonical uses `BIOREASON_TRAIN_SFT_MODEL_REGISTRY_PATH`; if only raw SFT checkpoint artifacts are available, convert to HF model before starting RL.
 
-### 5.4 完了条件
+### 5.4 Completion Criteria
 
-次が揃っていれば完了とする。
+Complete when the following are present.
 
 - `job_type=train_rl`
-- reward 系 metric
-- KL 系 metric
-- rollout trace
+- reward metrics
+- KL metrics
+- rollout traces
 - output checkpoint artifact
 
-完了後は `wandb_registry_paths.env` に次を追記する。
+After completion, add the following to `wandb_registry_paths.env`.
 
 ```bash
 export BIOREASON_TRAIN_RL_MODEL_REGISTRY_PATH="entity/project/train-rl-output:alias"
 ```
 
-## 6. 最終評価
+## 6. Final Evaluation
 
-状態: **未着手**
+Status: **Not started**
 
-### 6.1 目的
+### 6.1 Purpose
 
-`spec-comparison` を `test` split で separate run として評価し、最終比較を出す。
+Evaluate `spec-comparison` on the `test` split as a separate run and produce the final comparison.
 
-### 6.2 実行コマンド
+### 6.2 Execution Commands
 
 ```bash
 srun \
@@ -358,11 +358,11 @@ srun \
   '
 ```
 
-### 6.3 完了条件
+### 6.3 Completion Criteria
 
-W&B 上に次が揃っていれば完了とする。
+Complete when the following are present on W&B.
 
-- comparison model と tuned model の `test` 指標
+- `test` metrics for both comparison model and tuned model
 - `fmax_mf`
 - `fmax_bp`
 - `fmax_cc`
@@ -370,9 +370,9 @@ W&B 上に次が揃っていれば完了とする。
 - `eval_samples` table
 - Weave Evaluation
 
-## 7. 次アクション
+## 7. Next Actions
 
-いま一番近い next action は次の 2 つである。
+The nearest next actions are the following two.
 
-1. CoreWeave 側で `.venv-gpu` と `wandb_registry_paths.env` を揃える
-2. `comparison-family` を `validation` split で評価する
+1. Set up `.venv-gpu` and `wandb_registry_paths.env` on CoreWeave side
+2. Evaluate `comparison-family` on `validation` split

@@ -36,12 +36,22 @@ as_bool() {
 }
 
 MODEL_SOURCE_RESOLVER=${MODEL_SOURCE_RESOLVER:-"scripts/materialize_model_source.py"}
+DATA_BUNDLE_RESOLVER=${DATA_BUNDLE_RESOLVER:-"scripts/materialize_data_bundle.py"}
+DATA_MANIFEST_PATH=${DATA_MANIFEST_PATH:-"configs/disease_benchmark/data_registry.json"}
+DATA_BUNDLE=${DATA_BUNDLE:-"main_production"}
 SFT_TO_HF_CONVERTER=${SFT_TO_HF_CONVERTER:-"bioreason2/utils/save_unsloth_ckpt.py"}
 
-BASE_WANDB_PROJECT=${BASE_WANDB_PROJECT:-"bioreason-pro-rl"}
+BASE_WANDB_PROJECT=${BASE_WANDB_PROJECT:-"${WANDB_PROJECT:-bioreason-pro-custom}"}
 WANDB_ENTITY=${WANDB_ENTITY:-""}
 WANDB_MODE=${WANDB_MODE:-""}
 WEAVE_PROJECT=${WEAVE_PROJECT:-""}
+TRAIN_PARTITION=${TRAIN_PARTITION:-"h100"}
+TRAIN_NUM_GPUS=${TRAIN_NUM_GPUS:-1}
+TRAIN_CPUS_PER_TASK=${TRAIN_CPUS_PER_TASK:-16}
+TRAIN_MEM=${TRAIN_MEM:-"128G"}
+TRAIN_TIME_LIMIT=${TRAIN_TIME_LIMIT:-"12:00:00"}
+TRAIN_JOB_NAME=${TRAIN_JOB_NAME:-"bioreason-rl"}
+TRAIN_USE_SRUN=${TRAIN_USE_SRUN:-"True"}
 
 MODEL_CACHE_ROOT=${MODEL_CACHE_ROOT:-"data/artifacts/models"}
 TRAIN_SFT_SOURCE_DIR=${TRAIN_SFT_SOURCE_DIR:-"${MODEL_CACHE_ROOT}/train_sft_output_source"}
@@ -54,7 +64,7 @@ STRUCTURE_DIR=${STRUCTURE_DIR:-"${BIOREASON_STRUCTURE_DIR:-data/structures}"}
 GO_EMBEDDINGS_PATH=${GO_EMBEDDINGS_PATH:-"${BIOREASON_GO_EMBEDDINGS_PATH:-}"}
 GO_OBO_PATH=${GO_OBO_PATH:-"${BIOREASON_GO_OBO_PATH:-bioreason2/dataset/go-basic.obo}"}
 
-CAFA5_DATASET=${CAFA5_DATASET:-"wanglab/cafa5"}
+CAFA5_DATASET=${CAFA5_DATASET:-""}
 REASONING_DATASET_NAME=${REASONING_DATASET_NAME:-"disease_temporal_hc_reasoning_v1"}
 INTERPRO_DATASET_NAME=${INTERPRO_DATASET_NAME:-"interpro_metadata"}
 
@@ -97,6 +107,9 @@ BNB_4BIT_USE_DOUBLE_QUANT=${BNB_4BIT_USE_DOUBLE_QUANT:-"True"}
 LORA_RANK=${LORA_RANK:-32}
 LORA_ALPHA=${LORA_ALPHA:-64}
 LORA_DROPOUT=${LORA_DROPOUT:-0.05}
+SFT_CONVERSION_LORA_RANK=${SFT_CONVERSION_LORA_RANK:-128}
+SFT_CONVERSION_LORA_ALPHA=${SFT_CONVERSION_LORA_ALPHA:-256}
+SFT_CONVERSION_LORA_DROPOUT=${SFT_CONVERSION_LORA_DROPOUT:-0.05}
 
 LEARNING_RATE=${LEARNING_RATE:-5e-6}
 WEIGHT_DECAY=${WEIGHT_DECAY:-0.0}
@@ -113,8 +126,10 @@ EVAL_EVERY_N_STEPS=${EVAL_EVERY_N_STEPS:-25}
 SAVE_EVERY_N_STEPS=${SAVE_EVERY_N_STEPS:-50}
 MAX_EVAL_BATCHES=${MAX_EVAL_BATCHES:-8}
 MAX_GRAD_NORM=${MAX_GRAD_NORM:-1.0}
+WEAVE_TRACE_BUDGET=${WEAVE_TRACE_BUDGET:-64}
 
 NUM_GENERATIONS=${NUM_GENERATIONS:-4}
+MIN_NEW_TOKENS=${MIN_NEW_TOKENS:-1}
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-768}
 TEMPERATURE=${TEMPERATURE:-0.7}
 TOP_P=${TOP_P:-0.95}
@@ -125,6 +140,34 @@ REWARD_WEIGHTS=${REWARD_WEIGHTS:-""}
 
 CHECKPOINT_ARTIFACT_NAME=${CHECKPOINT_ARTIFACT_NAME:-"train-rl-output"}
 CHECKPOINT_ARTIFACT_ALIASES=${CHECKPOINT_ARTIFACT_ALIASES:-"latest,213.221.225.228"}
+
+PREP_COMMAND=()
+TRAIN_COMMAND=()
+OPTIONAL_GO_EMBEDDINGS_ARG=()
+if as_bool "$TRAIN_USE_SRUN"; then
+  PREP_COMMAND+=(
+    srun
+    --job-name "${TRAIN_JOB_NAME}-prep"
+    --partition "$TRAIN_PARTITION"
+    --gpus "$TRAIN_NUM_GPUS"
+    --cpus-per-task "$TRAIN_CPUS_PER_TASK"
+    --mem "$TRAIN_MEM"
+    --time "$TRAIN_TIME_LIMIT"
+  )
+  TRAIN_COMMAND+=(
+    srun
+    --job-name "$TRAIN_JOB_NAME"
+    --partition "$TRAIN_PARTITION"
+    --gpus "$TRAIN_NUM_GPUS"
+    --cpus-per-task "$TRAIN_CPUS_PER_TASK"
+    --mem "$TRAIN_MEM"
+    --time "$TRAIN_TIME_LIMIT"
+  )
+fi
+
+if [ -n "$GO_EMBEDDINGS_PATH" ]; then
+  OPTIONAL_GO_EMBEDDINGS_ARG=(--precomputed_embeddings_path "$GO_EMBEDDINGS_PATH")
+fi
 
 resolve_artifact_dir() {
   local registry_path="$1"
@@ -185,7 +228,7 @@ if [ -n "$PRIMARY_BASE_CHECKPOINT" ]; then
       fi
 
       echo "--- Converting train-sft-output checkpoint to HF format"
-      python "$SFT_TO_HF_CONVERTER" \
+      "${PREP_COMMAND[@]}" python "$SFT_TO_HF_CONVERTER" \
         --checkpoint_path "$SFT_CKPT_PATH" \
         --save_dir "$TRAIN_SFT_HF_DIR" \
         --text_model_name "$PAPER_RL_MODEL_RESOLVED" \
@@ -193,19 +236,19 @@ if [ -n "$PRIMARY_BASE_CHECKPOINT" ]; then
         --cache_dir "$CACHE_DIR" \
         --max_length_text "$MAX_LENGTH_TEXT" \
         --max_length_protein "$MAX_LENGTH_PROTEIN" \
-        --lora_rank "$LORA_RANK" \
-        --lora_alpha "$LORA_ALPHA" \
-        --lora_dropout "$LORA_DROPOUT" \
+        --lora_rank "$SFT_CONVERSION_LORA_RANK" \
+        --lora_alpha "$SFT_CONVERSION_LORA_ALPHA" \
+        --lora_dropout "$SFT_CONVERSION_LORA_DROPOUT" \
         --protein_embedding_layer "$PROTEIN_EMBEDDING_LAYER" \
         --go_obo_path "$GO_OBO_PATH" \
-        --precomputed_embeddings_path "$GO_EMBEDDINGS_PATH" \
         --go_hidden_dim "$GO_HIDDEN_DIM" \
         --go_num_gat_layers "$GO_NUM_GAT_LAYERS" \
         --go_num_heads "$GO_NUM_HEADS" \
         --go_num_reduced_embeddings "$GO_NUM_REDUCED_EMBEDDINGS" \
         --go_embedding_dim "$GO_EMBEDDING_DIM" \
         --unified_go_encoder "$UNIFIED_GO_ENCODER" \
-        --protein_model_finetune "$PROTEIN_MODEL_FINETUNE"
+        --protein_model_finetune "$PROTEIN_MODEL_FINETUNE" \
+        "${OPTIONAL_GO_EMBEDDINGS_ARG[@]}"
     fi
 
     RESOLVED_BASE_MODEL_DIR="$TRAIN_SFT_HF_DIR"
@@ -232,9 +275,26 @@ if [ ! -f "$RESOLVED_BASE_MODEL_DIR/config.json" ]; then
   exit 1
 fi
 
+if [ -z "$CAFA5_DATASET" ]; then
+  echo "--- Resolving reasoning dataset source for RL from W&B Artifact"
+  CAFA5_DATASET=$(python "$DATA_BUNDLE_RESOLVER" \
+    --data-manifest-path "$DATA_MANIFEST_PATH" \
+    --data-bundle "$DATA_BUNDLE" \
+    --asset-key reasoning_dataset \
+    --print-field local_dir)
+fi
+if [ -z "$CAFA5_DATASET" ]; then
+  echo "Error: failed to resolve reasoning dataset source for RL"
+  exit 1
+fi
+echo "--- Reasoning dataset materialized at $CAFA5_DATASET"
+
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-BASE_MODEL_BASENAME=$(basename "$RESOLVED_BASE_MODEL_DIR")
-WANDB_RUN_NAME=${WANDB_RUN_NAME:-"train-rl-${BASE_MODEL_BASENAME}-${TIMESTAMP}"}
+RL_RUN_FAMILY="rl-sft"
+if as_bool "$ALLOW_PAPER_RL_ABLATION" && [ -z "$PRIMARY_BASE_CHECKPOINT" ]; then
+  RL_RUN_FAMILY="rl-paper"
+fi
+WANDB_RUN_NAME=${WANDB_RUN_NAME:-"${RL_RUN_FAMILY}-${TIMESTAMP}"}
 OUTPUT_DIR="${RL_OUTPUT_ROOT}/${WANDB_RUN_NAME}"
 mkdir -p "$RL_OUTPUT_ROOT"
 
@@ -247,12 +307,13 @@ if [ -n "$RESUME_FROM_RAW_CHECKPOINT" ]; then
   RESUME_ARGS=(--resume_from_raw_checkpoint "$RESUME_FROM_RAW_CHECKPOINT")
 fi
 
-stdbuf -oL -eL srun python train_protein_grpo.py \
+stdbuf -oL -eL "${TRAIN_COMMAND[@]}" python train_protein_grpo.py \
   --run_name "$WANDB_RUN_NAME" \
   --wandb_project "$BASE_WANDB_PROJECT" \
   --wandb_entity "$WANDB_ENTITY" \
   --wandb_mode "$WANDB_MODE" \
   --weave_project "$WEAVE_PROJECT" \
+  --weave_trace_budget "$WEAVE_TRACE_BUDGET" \
   --benchmark_version "$BENCHMARK_VERSION" \
   --temporal_split_artifact "$TEMPORAL_SPLIT_ARTIFACT" \
   --dataset_config "$DATASET_CONFIG" \
@@ -271,7 +332,6 @@ stdbuf -oL -eL srun python train_protein_grpo.py \
   --protein_model_name "$PROTEIN_MODEL_NAME" \
   --cache_dir "$CACHE_DIR" \
   --go_obo_path "$GO_OBO_PATH" \
-  --precomputed_embeddings_path "$GO_EMBEDDINGS_PATH" \
   --structure_dir "$STRUCTURE_DIR" \
   --dataset_cache_dir "$DATASET_CACHE_DIR" \
   --dataset_type cafa5 \
@@ -324,6 +384,7 @@ stdbuf -oL -eL srun python train_protein_grpo.py \
   --max_eval_batches "$MAX_EVAL_BATCHES" \
   --max_grad_norm "$MAX_GRAD_NORM" \
   --num_generations "$NUM_GENERATIONS" \
+  --min_new_tokens "$MIN_NEW_TOKENS" \
   --max_new_tokens "$MAX_NEW_TOKENS" \
   --temperature "$TEMPERATURE" \
   --top_p "$TOP_P" \
@@ -335,4 +396,5 @@ stdbuf -oL -eL srun python train_protein_grpo.py \
   --checkpoint_artifact_name "$CHECKPOINT_ARTIFACT_NAME" \
   --checkpoint_artifact_aliases "$CHECKPOINT_ARTIFACT_ALIASES" \
   --ablation_from_paper_rl "$ABLATION_FROM_PAPER_RL" \
+  "${OPTIONAL_GO_EMBEDDINGS_ARG[@]}" \
   "${RESUME_ARGS[@]}"

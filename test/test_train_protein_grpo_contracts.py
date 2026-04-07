@@ -2,10 +2,13 @@ import importlib.util
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = ROOT / "train_protein_grpo.py"
+SFT_SCRIPT_PATH = ROOT / "train_protein_llm.py"
+WRAPPER_PATH = ROOT / "scripts" / "sh_train_protein_grpo.sh"
 
 
 def load_grpo_module():
@@ -22,6 +25,30 @@ GRPO = load_grpo_module()
 
 
 class TrainProteinGrpoContractsTest(unittest.TestCase):
+    def test_resolve_attn_implementation_falls_back_without_flash_attn(self):
+        with mock.patch("importlib.util.find_spec", return_value=None):
+            self.assertEqual(GRPO.resolve_attn_implementation("flash_attention_2"), "sdpa")
+
+    def test_wrapper_uses_sft_conversion_lora_settings(self):
+        wrapper_text = WRAPPER_PATH.read_text()
+
+        self.assertIn('BASE_WANDB_PROJECT=${BASE_WANDB_PROJECT:-"${WANDB_PROJECT:-bioreason-pro-custom}"}', wrapper_text)
+        self.assertIn('SFT_CONVERSION_LORA_RANK=${SFT_CONVERSION_LORA_RANK:-128}', wrapper_text)
+        self.assertIn('SFT_CONVERSION_LORA_ALPHA=${SFT_CONVERSION_LORA_ALPHA:-256}', wrapper_text)
+        self.assertIn('SFT_CONVERSION_LORA_DROPOUT=${SFT_CONVERSION_LORA_DROPOUT:-0.05}', wrapper_text)
+        self.assertIn('CAFA5_DATASET=${CAFA5_DATASET:-""}', wrapper_text)
+        self.assertIn('WEAVE_TRACE_BUDGET=${WEAVE_TRACE_BUDGET:-64}', wrapper_text)
+        self.assertIn('MIN_NEW_TOKENS=${MIN_NEW_TOKENS:-1}', wrapper_text)
+        self.assertIn('RL_RUN_FAMILY="rl-sft"', wrapper_text)
+        self.assertIn('RL_RUN_FAMILY="rl-paper"', wrapper_text)
+        self.assertIn('WANDB_RUN_NAME=${WANDB_RUN_NAME:-"${RL_RUN_FAMILY}-${TIMESTAMP}"}', wrapper_text)
+        self.assertIn('--asset-key reasoning_dataset', wrapper_text)
+        self.assertIn('--lora_rank "$SFT_CONVERSION_LORA_RANK"', wrapper_text)
+        self.assertIn('--lora_alpha "$SFT_CONVERSION_LORA_ALPHA"', wrapper_text)
+        self.assertIn('--lora_dropout "$SFT_CONVERSION_LORA_DROPOUT"', wrapper_text)
+        self.assertIn('--weave_trace_budget "$WEAVE_TRACE_BUDGET"', wrapper_text)
+        self.assertIn('--min_new_tokens "$MIN_NEW_TOKENS"', wrapper_text)
+
     def test_extract_go_ids_preserves_order_and_deduplicates(self):
         text = "GO:0008150 and GO:0003674 and GO:0008150 again"
         self.assertEqual(GRPO.extract_go_ids(text), ["GO:0008150", "GO:0003674"])
@@ -77,7 +104,38 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertEqual(args.output_dir, "data/artifacts/models/train_rl_output")
         self.assertEqual(args.max_eval_samples, 100)
         self.assertEqual(args.eval_sample_strategy, "stratified_aspect_profile")
+        self.assertEqual(args.min_new_tokens, 1)
+        self.assertTrue(args.bnb_4bit_use_double_quant)
+        self.assertEqual(args.weave_trace_budget, 64)
         self.assertFalse(args.ablation_from_paper_rl)
+
+    def test_rl_script_uses_canonical_metrics_and_input_artifact_lineage(self):
+        source = SCRIPT_PATH.read_text()
+
+        self.assertIn("maybe_use_artifact_refs(", source)
+        self.assertIn("maybe_trace_generation(", source)
+        self.assertIn('"data/step_num_groups_submitted"', source)
+        self.assertIn('"data/step_num_groups_trainable"', source)
+        self.assertIn('"data/step_num_trajectories"', source)
+        self.assertIn('"data/step_num_datums"', source)
+        self.assertIn('"data/step_trainer_tokens"', source)
+        self.assertIn('"reward_std_dev"', source)
+        self.assertIn('"loss/train"', source)
+        self.assertIn('"loss/kl_div"', source)
+        self.assertIn('"loss/learning_rate"', source)
+        self.assertIn('"loss/grad_norm"', source)
+        self.assertNotIn("train_rl_rollouts", source)
+        self.assertNotIn("wandb.Table(", source)
+        self.assertNotIn('"dataset/train_size"', source)
+        self.assertNotIn('"dataset/validation_size"', source)
+
+    def test_sft_script_registers_input_artifact_lineage(self):
+        source = SFT_SCRIPT_PATH.read_text()
+
+        self.assertIn("maybe_use_artifact_refs(", source)
+        self.assertIn('"temporal_split_artifact": args.temporal_split_artifact', source)
+        self.assertIn('"dataset_artifact": args.dataset_artifact', source)
+        self.assertIn('"base_checkpoint": args.base_checkpoint', source)
 
 
 if __name__ == "__main__":

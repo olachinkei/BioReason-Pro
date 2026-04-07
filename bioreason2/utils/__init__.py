@@ -8,6 +8,8 @@ from .tracking import (
     build_training_tracking_config,
     extract_reasoning_fields,
     maybe_log_directory_artifact,
+    maybe_use_artifact,
+    maybe_use_artifact_refs,
     parse_artifact_aliases,
     sync_run_config,
 )
@@ -19,6 +21,8 @@ __all__ = [
     "build_training_tracking_config",
     "extract_reasoning_fields",
     "maybe_log_directory_artifact",
+    "maybe_use_artifact",
+    "maybe_use_artifact_refs",
     "parse_artifact_aliases",
     "str2bool",
     "sync_run_config",

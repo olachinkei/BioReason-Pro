@@ -1,33 +1,33 @@
-# 2026-04-07: comparison model を `bioreason-pro-rl-paper` に整理
+# 2026-04-07: Organizing the Comparison Model as `bioreason-pro-rl-paper`
 
-## 背景
+## Background
 
-- README / specification / PLAN / manifest の間で、公開論文モデルと、今後こちらで学習して作る tuned model が混在していた
-- `bioreason-pro-base` という名前は、実際に比較したい「独自 tuning 前の公開モデル」を正確に表していなかった
-- `BLAST / Diamond` と `ESM standalone` は比較対象として文書に残っていたが、現時点では再利用可能な公開 Artifact ref も、repo 内で即利用できる prediction source も確定していなかった
+- The public paper model and custom-trained tuned models were conflated across README / specification / PLAN / manifests
+- The name `bioreason-pro-base` did not accurately represent the "public model before custom tuning" that we actually want to compare against
+- `BLAST / Diamond` and `ESM standalone` remained in documents as comparison targets, but at this point there were no confirmed reusable public Artifact refs or readily available prediction sources in the repo
 
-## 今回の決定
+## Decision
 
-1. tuning 前の比較モデルは `bioreason-pro-rl-paper` に固定する
-2. `bioreason-pro-rl-paper` は公開 Hugging Face source `wanglab/bioreason-pro-rl` を指す
-3. W&B 上の実 ref は当面 `wandb-healthcare/bioreason-pro-custom/bioreason-pro-rl:production` を使う
-4. `BLAST / Diamond` と `ESM standalone` は specification / PLAN / RESEARCH_README の current scope から外す
-5. comparison model と、今後こちらで生成する `train_sft` / `train_rl` output は別名で管理する
+1. The pre-tuning comparison model is fixed to `bioreason-pro-rl-paper`
+2. `bioreason-pro-rl-paper` refers to the public Hugging Face source `wanglab/bioreason-pro-rl`
+3. The actual W&B ref used is `wandb-healthcare/bioreason-pro-custom/bioreason-pro-rl:production` for now
+4. `BLAST / Diamond` and `ESM standalone` are removed from the current scope of specification / PLAN / RESEARCH_README
+5. The comparison model and the `train_sft` / `train_rl` outputs generated later are managed under separate names
 
-## 変更した方針
+## Updated Policy
 
-- 比較対象:
+- Comparison targets:
   - `bioreason-pro-rl-paper`
   - `train_sft` output
   - `train_rl` output
-- target group:
+- Target groups:
   - `comparison-family`
   - `tuned-family`
   - `spec-comparison`
-- SFT の初期 checkpoint:
-  - `BIOREASON_RL_PAPER_MODEL_REGISTRY_PATH` を既定入力として使う
+- SFT initial checkpoint:
+  - `BIOREASON_RL_PAPER_MODEL_REGISTRY_PATH` is used as the default input
 
-## 反映先
+## Files Updated
 
 - `domain/specification/busiless-rules/specification.md`
 - `domain/specification/PLAN.md`
@@ -40,7 +40,7 @@
 - `configs/disease_benchmark/wandb_asset_sources.env.example`
 - `scripts/sh_train_protein_qwen_staged.sh`
 
-## 補足
+## Notes
 
-- W&B の Artifact family 自体は現時点では `bioreason-pro-rl` のままだが、repo 内の論理名は `bioreason-pro-rl-paper` として扱う
-- これは「公開論文モデル」と「こちらで後から作る custom RL output」を混同しないための整理である
+- The W&B Artifact family itself remains `bioreason-pro-rl` at this point, but the logical name within the repo is treated as `bioreason-pro-rl-paper`
+- This is an organizational measure to avoid conflating the "public paper model" with "custom RL outputs created later"

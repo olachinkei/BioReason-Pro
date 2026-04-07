@@ -34,6 +34,15 @@ def _setup_lora_for_checkpoint_loading(
     print("✅ Unsloth LoRA setup complete")
 
 
+def _save_component_state_dict(module, save_path: str, label: str) -> bool:
+    if module is None or not hasattr(module, "state_dict"):
+        print(f"ℹ️  Skipping {label}: module unavailable")
+        return False
+    torch.save(module.state_dict(), save_path)
+    print(f"💾 Saved {label} weights to {save_path}")
+    return True
+
+
 def save_lightning_ckpt(args):
     """Convert PyTorch Lightning checkpoint (with Unsloth) to HuggingFace format."""
     checkpoint_path = Path(args.checkpoint_path)
@@ -197,19 +206,19 @@ def save_lightning_ckpt(args):
     # Save all components
     model.text_model.save_pretrained(args.save_dir)
     model.text_tokenizer.save_pretrained(args.save_dir)
-    torch.save(model.protein_projection.state_dict(), f"{args.save_dir}/protein_projection.pt")
-    torch.save(model.go_projection.state_dict(), f"{args.save_dir}/go_projection.pt")
-    torch.save(model.go_encoder.state_dict(), f"{args.save_dir}/go_encoder.pt")
+    _save_component_state_dict(model.protein_projection, f"{args.save_dir}/protein_projection.pt", "protein projection")
+    _save_component_state_dict(model.go_projection, f"{args.save_dir}/go_projection.pt", "GO projection")
+    _save_component_state_dict(getattr(model, "go_encoder", None), f"{args.save_dir}/go_encoder.pt", "GO encoder")
     
     protein_model_dir = f"{args.save_dir}/protein_model"
     os.makedirs(protein_model_dir, exist_ok=True)
-    torch.save(model.protein_model.state_dict(), f"{protein_model_dir}/pytorch_model.bin")
+    _save_component_state_dict(model.protein_model, f"{protein_model_dir}/pytorch_model.bin", "protein model")
     
     # Report parameter counts
     total = sum(p.numel() for p in model.parameters())
     text = sum(p.numel() for p in model.text_model.parameters())
     protein = sum(p.numel() for p in model.protein_model.parameters())
-    go_enc = sum(p.numel() for p in model.go_encoder.parameters())
+    go_enc = sum(p.numel() for p in model.go_encoder.parameters()) if model.go_encoder is not None else 0
     go_proj = sum(p.numel() for p in model.go_projection.parameters())
     
     print(f"✅ Saved {total/1e6:.1f}M params (text {text/1e6:.1f}M • protein {protein/1e6:.1f}M • GO enc {go_enc/1e6:.1f}M • GO proj {go_proj/1e6:.1f}M)")
@@ -243,4 +252,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

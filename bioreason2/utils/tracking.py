@@ -130,6 +130,8 @@ def build_training_tracking_config(args: Any, run_name: str, job_type: Optional[
         "validation_subset_strategy": normalize_text(_get_arg(args, "validation_subset_strategy")),
         "max_eval_samples": _get_arg(args, "max_eval_samples"),
         "eval_sample_strategy": normalize_text(_get_arg(args, "eval_sample_strategy")),
+        "weave_project": normalize_text(_get_arg(args, "weave_project")),
+        "weave_trace_budget": _get_arg(args, "weave_trace_budget"),
         "job_time_limit": normalize_text(_get_arg(args, "job_time_limit", "12:00:00")),
         "run_name": run_name,
         "training_stage": _get_arg(args, "training_stage"),
@@ -167,6 +169,73 @@ def parse_artifact_aliases(raw_aliases: Any) -> List[str]:
         if alias and alias not in aliases:
             aliases.append(alias)
     return aliases
+
+
+def looks_like_wandb_artifact_ref(value: Any) -> bool:
+    """Return True when the value matches entity/project/artifact:alias style refs."""
+    text = normalize_text(value).strip()
+    return bool(text) and ":" in text and text.count("/") >= 2
+
+
+def maybe_use_artifact(
+    run: Any,
+    artifact_ref: Any,
+    artifact_type: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Register an input artifact on the active W&B run when a ref is available."""
+    resolved_ref = normalize_text(artifact_ref).strip()
+    if run is None or not resolved_ref:
+        return {
+            "used": False,
+            "artifact_ref": resolved_ref,
+            "artifact_type": artifact_type or "",
+            "reason": "missing_run_or_ref",
+        }
+
+    use_artifact = getattr(run, "use_artifact", None)
+    if use_artifact is None:
+        return {
+            "used": False,
+            "artifact_ref": resolved_ref,
+            "artifact_type": artifact_type or "",
+            "reason": "missing_use_artifact",
+        }
+
+    if not looks_like_wandb_artifact_ref(resolved_ref):
+        return {
+            "used": False,
+            "artifact_ref": resolved_ref,
+            "artifact_type": artifact_type or "",
+            "reason": "not_wandb_artifact_ref",
+        }
+
+    try:
+        if artifact_type:
+            use_artifact(resolved_ref, type=artifact_type)
+        else:
+            use_artifact(resolved_ref)
+    except TypeError:
+        use_artifact(resolved_ref)
+
+    return {
+        "used": True,
+        "artifact_ref": resolved_ref,
+        "artifact_type": artifact_type or "",
+        "reason": "",
+    }
+
+
+def maybe_use_artifact_refs(
+    run: Any,
+    artifact_refs: Mapping[str, Any],
+    artifact_types: Optional[Mapping[str, str]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Register multiple input artifacts and return per-key statuses."""
+    statuses: Dict[str, Dict[str, Any]] = {}
+    for key, artifact_ref in artifact_refs.items():
+        artifact_type = None if artifact_types is None else artifact_types.get(key)
+        statuses[key] = maybe_use_artifact(run, artifact_ref, artifact_type=artifact_type)
+    return statuses
 
 
 def build_checkpoint_artifact_metadata(

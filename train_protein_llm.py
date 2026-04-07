@@ -51,6 +51,7 @@ from bioreason2.utils import (
     build_sft_sample_row,
     build_training_tracking_config,
     maybe_log_directory_artifact,
+    maybe_use_artifact_refs,
     str2bool,
     sync_run_config,
 )
@@ -927,6 +928,14 @@ def main(args: ArgumentParser):
         job_type=args.wandb_job_type,
     )
     sync_run_config(logger.experiment, tracking_config)
+    maybe_use_artifact_refs(
+        logger.experiment,
+        {
+            "temporal_split_artifact": args.temporal_split_artifact,
+            "dataset_artifact": args.dataset_artifact,
+            "base_checkpoint": args.base_checkpoint,
+        },
+    )
 
     # Configure Lightning AdvancedProfiler (simple and robust)
     profiler = None

@@ -1,103 +1,103 @@
-# 注意: このファイルは変更しないで
-# 原則(Principles)
+# Note: Do not modify this file
+# Principles
 - Goal:
-    - BioReason-Pro デモ設計：問題設定・検証ステップ・実装手順
-    - 2022 年 11 月カットオフ以後の疾患関連 GO アノテーションだけで、疾患文脈に寄った追加学習は成立するか
+    - BioReason-Pro Demo Design: Problem Setting, Verification Steps, and Implementation Procedure
+    - Can additional training be established using only disease-related GO annotations after the November 2022 cutoff, oriented toward disease context?
 
-0. なぜこのデモンストレーションをやるのか
-0.1 このデモが答えようとしている問い
+0. Why We Are Doing This Demonstration
+0.1 The Question This Demo Aims to Answer
 
-「AIはタンパク質の機能をどこまで"理解して"予測できるか？」
+"To what extent can AI 'understand' and predict protein function?"
 
-現状の計算生物学ツールは「予測はできるが説明できない」という根本的な問題を抱えている。BLASTは配列が似ていれば機能を転用できるが、なぜその機能を持つかは語れない。深層学習モデルは精度を上げてきたが、ブラックボックスのままだ。
-BioReason-Proはこの問いに対して「推論トレース」という形で答えを出した最初のモデルである。このデモはその能力を、論文著者が明示した次の課題領域——疾患関連タンパク質——で検証し、さらにcheckpointからの追加学習によって能力を拡張できることを示すものである。
+Current computational biology tools suffer from a fundamental problem: they can predict but cannot explain. BLAST can transfer function based on sequence similarity, but it cannot articulate why a protein has that function. Deep learning models have improved accuracy but remain black boxes.
+BioReason-Pro is the first model to address this question through "reasoning traces." This demo validates that capability in the next challenge domain explicitly identified by the paper's authors — disease-associated proteins — and demonstrates that the capability can be extended through additional training from a checkpoint.
 
-0.2 想定される厳しい追求と回答
+0.2 Anticipated Tough Questions and Answers
 
-Q1. 「これは論文の再現実験にすぎないのでは？」
+Q1. "Isn't this just a reproduction experiment of the paper?"
 
-A. 論文はCAFA5ベンチマーク（汎用タンパク質）での評価にとどまっている。本デモは論文著者自身がfuture workとして挙げた「disease-associated proteins」という未検証領域に踏み込む。同じアーキテクチャを使いながら、論文が示せなかった疾患文脈での能力を検証する点で、再現実験ではなく拡張検証である。
-
-
-Q2. 「なぜcheckpointから追加学習する必要があるのか？汎用モデルで十分では？」
-
-A. BioReason-Pro RLは133,492タンパク質・3,135生物種という広範なデータで学習しているが、その訓練データは汎用的なGOアノテーションが中心であり、疾患関連タンパク質の特有の推論パターン——変異が経路異常を引き起こす機序、希少疾患タンパク質の機能的文脈——は相対的に薄い。
-追加学習の意義は2点ある。第一に、疾患関連タンパク質は類似配列が少なく（希少疾患の特性上）、配列類似性ベースの手法が最も機能しない領域である。第二に、推論トレースに疾患機序の記述が組み込まれるようになるかどうかを検証すること自体が、「BioReason-Proが本当に推論しているか、それとも高度なパターン模倣か」という論文の未解決問題への貢献になる。
+A. The paper only evaluated on the CAFA5 benchmark (general-purpose proteins). This demo ventures into the "disease-associated proteins" domain, an untested area that the paper's authors themselves listed as future work. While using the same architecture, this is an extension validation — not a reproduction experiment — in that it validates capabilities in a disease context that the paper could not demonstrate.
 
 
-Q3. 「BioReason-Proの学習データと重複していないか？」
+Q2. "Why is additional training from a checkpoint necessary? Isn't the general-purpose model sufficient?"
 
-A. BioReason-Proの学習データカットオフは2022年11月である。本デモのfine-tuning用データは2023年以降にUniProtへ実験的GOアノテーションが追加された疾患関連タンパク質のみを使用する。評価用データはさらに後続の期間（2025年以降）から取得する。時間的ホールドアウトによりデータの独立性を担保する。
-
-
-Q4. 「ProteinGymのフィットネス予測や、ウイルス-宿主相互作用予測ではダメなのか？」
-
-A. 検討した上で却下した。理由はアーキテクチャの根本的な不整合にある。BioReason-Proは「1タンパク質 → GO term + 推論トレース」という入出力に最適化されており、その中核コンポーネントであるGO-GPTはGOアノテーションのオートリグレッシブ予測に特化している。
-ProteinGymのフィットネス予測は「野生型と変異体の差分 → 連続値」であり、2配列入力と連続値出力ヘッドが必要になる。ウイルス-宿主相互作用予測は「2タンパク質ペア → 相互作用有無」であり、同様にアーキテクチャ変更が必要になる。どちらもGO-GPTが意味をなさず、「BioReason-Proを使う」という条件を名目上しか満たさない。
-疾患関連タンパク質のGO予測はアーキテクチャを一切変えずに成立し、GO-GPT・ESM3・RLの全コンポーネントがそのまま機能する。
+A. BioReason-Pro RL was trained on a broad dataset of 133,492 proteins across 3,135 species, but the training data is predominantly general-purpose GO annotations. Reasoning patterns specific to disease-associated proteins — mechanisms by which mutations cause pathway dysfunction, functional context of rare disease proteins — are relatively underrepresented.
+The significance of additional training is twofold. First, disease-associated proteins have few similar sequences (due to the nature of rare diseases), making this the domain where sequence-similarity-based methods perform worst. Second, verifying whether disease mechanism descriptions become incorporated into reasoning traces is itself a contribution to the paper's unresolved question: "Is BioReason-Pro truly reasoning, or performing sophisticated pattern mimicry?"
 
 
-Q5. 「DeepGOPlusを比較対象に入れなくていいのか？」
+Q3. "Is there no overlap with BioReason-Pro's training data?"
 
-A. DeepGOPlusはPython 3.7 + TensorFlow + CUDA 10.1という古い依存関係を持ち、現代GPU環境での安定動作が保証できない。公平な比較条件を確保できないため意図的に除外する。代わりにBLAST（配列類似性ベースの標準ベースライン）とESM3 alone（タンパク質基盤モデルの単体使用）を比較対象とし、「配列類似性ベースの限界」と「推論なし基盤モデルの限界」を明確に示す構成にする。
-
-
-Q6. 「推論トレースをGPT-5で合成することの問題は？」
-
-A. BioReason-Pro自体がGPT-5合成推論トレースでSFTされており、本デモも同じ方法論を踏襲する。論文が認めている通り「合成推論トレースに微妙な推論誤りが混入する可能性がある」という制限は存在するが、それはベースモデルと同じ条件である。合成後に疾患関連の生物学的事実との整合性チェックを10%サンプル単位で人手確認する。
+A. BioReason-Pro's training data cutoff is November 2022. The fine-tuning data for this demo uses only disease-associated proteins that received experimental GO annotations in UniProt after 2023. Evaluation data is drawn from an even later period (2025 onward). Temporal holdout ensures data independence.
 
 
-Q7. 「このデモから何が言えるのか？何が言えないのか？」
+Q4. "Why not ProteinGym fitness prediction or virus-host interaction prediction?"
 
-A. 言えること： 疾患関連タンパク質というドメインにおいて、汎用checkpointからの追加学習がGO予測精度（F_max）を改善するかどうか。推論トレースに疾患文脈の記述が増えるかどうか。
-言えないこと： BioReason-Proが「本当に推論しているか、高度なパターン模倣か」という根本問題への確定的な答え。これは論文著者自身が未解決問題として残しており、本デモもその限界を共有する。
+A. These were considered and rejected due to fundamental architectural incompatibility. BioReason-Pro is optimized for the input-output pattern "1 protein -> GO terms + reasoning trace," and its core component GO-GPT is specialized for autoregressive prediction of GO annotations.
+ProteinGym fitness prediction requires "wild-type vs. mutant delta -> continuous value," which needs dual-sequence input and a continuous-value output head. Virus-host interaction prediction requires "2 protein pairs -> interaction presence/absence," which similarly requires architectural changes. In both cases, GO-GPT would serve no purpose, and the condition of "using BioReason-Pro" would be satisfied only nominally.
+Disease-associated protein GO prediction is viable without any architectural changes, and all components — GO-GPT, ESM3, and RL — function as-is.
 
-# 進め方
-## レイヤーモデルで進めて
-- L4を確認または定義する
-- L3（仕様・ADR）を作成する
-- L3からL2（テスト）を転写する
-- L2を満たすようにL1（実装）を書く
+
+Q5. "Shouldn't DeepGOPlus be included as a comparison target?"
+
+A. DeepGOPlus has legacy dependencies (Python 3.7 + TensorFlow + CUDA 10.1), and stable operation on modern GPU environments cannot be guaranteed. It is intentionally excluded because fair comparison conditions cannot be ensured. Instead, we use BLAST (sequence-similarity-based standard baseline) and ESM3 alone (standalone use of a protein foundation model) as comparison targets, creating a setup that clearly demonstrates the "limits of sequence similarity-based methods" and the "limits of foundation models without reasoning."
+
+
+Q6. "What are the issues with synthesizing reasoning traces using GPT-5?"
+
+A. BioReason-Pro itself was SFT-trained using GPT-5-synthesized reasoning traces, and this demo follows the same methodology. As the paper acknowledges, the limitation that "subtle reasoning errors may be introduced in synthesized reasoning traces" exists, but this is the same condition as the base model. After synthesis, consistency checks against disease-related biological facts are performed via manual review on a 10% sample basis.
+
+
+Q7. "What can and cannot be concluded from this demo?"
+
+A. What can be concluded: Whether additional training from a general-purpose checkpoint improves GO prediction accuracy (F_max) in the domain of disease-associated proteins. Whether disease-context descriptions increase in reasoning traces.
+What cannot be concluded: A definitive answer to the fundamental question of whether BioReason-Pro is "truly reasoning or performing sophisticated pattern mimicry." The paper's authors themselves left this as an open question, and this demo shares that limitation.
+
+# Approach
+## Proceed using a layer model
+- Confirm or define L4
+- Create L3 (specification / ADR)
+- Transcribe L2 (tests) from L3
+- Write L1 (implementation) to satisfy L2
 - files
     - L4: domain/foundation/philosophy.md
     - L3: domain/specification/business-rules/specipication.md
    
-## 禁止事項
-- 仕様（L3）なしでコード（L1）を書いてはいけない
-- コードを読んでテスト（L2）を書いてはいけない
-- テストの期待値をコードから取得してはいけない
-- 「なんとなく動く実装」を生成してはいけない
+## Prohibitions
+- Do not write code (L1) without a specification (L3)
+- Do not write tests (L2) by reading code
+- Do not derive test expected values from code
+- Do not generate "implementations that just happen to work"
 
-## ドメイン設計ルール
-- ビジネスルールはEntityに書く
-- UseCaseはオーケストレーションのみ
-- 外部依存はAdapter/Repositoryに隔離
-- ドメイン用語（Ubiquitous Language）を統一する
+## Domain Design Rules
+- Write business rules in Entities
+- UseCases are for orchestration only
+- Isolate external dependencies in Adapters/Repositories
+- Unify domain terminology (Ubiquitous Language)
 
-## ADRルール
-以下の場合は必ず fileを作成する(.md)： 
-作成先: domain/specification/adr
-- 技術選定の判断
-- モデル/アルゴリズムの変更
-- ドメイン定義の変更
-- 構造変更（例：フラット→セグメント）
+## ADR Rules
+Create a file (.md) in the following cases:
+Destination: domain/specification/adr
+- Technology selection decisions
+- Model/algorithm changes
+- Domain definition changes
+- Structural changes (e.g., flat -> segmented)
 
-ADRには以下を含める：
+ADRs must include:
 - Context
 - Decision
 - Rationale
 - Consequences
 
-## 依存性ルール
-- UseCaseはインターフェースに依存する
-- RepositoryはDIで注入する
-- テストではInMemory実装を使用する
+## Dependency Rules
+- UseCases depend on interfaces
+- Repositories are injected via DI
+- Tests use InMemory implementations
 
-## 依存性ルール
-- UseCaseはインターフェースに依存する
-- RepositoryはDIで注入する
-- テストではInMemory実装を使用する
+## Dependency Rules
+- UseCases depend on interfaces
+- Repositories are injected via DI
+- Tests use InMemory implementations
 
-## Task管理
-- github repositoryで管理する
-- taskには並列実行ができるようにPhase, 順番, type（typeは独立して作業ができる粒度にする）をつけておく
+## Task Management
+- Managed via GitHub repository
+- Tasks are tagged with Phase, order, and type (type granularity should allow independent work) to enable parallel execution
