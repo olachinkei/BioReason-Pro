@@ -4,7 +4,10 @@ from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
 )
-from unsloth import FastLanguageModel
+try:
+    from unsloth import FastLanguageModel  # type: ignore
+except ImportError:  # pragma: no cover - optional in stable non-Unsloth runs
+    FastLanguageModel = None
 
 from typing import Optional, List, Union
 from pathlib import Path
@@ -103,6 +106,11 @@ class ProteinLLMModel(nn.Module):
         self.use_unsloth = use_unsloth
 
         if use_unsloth:
+            if FastLanguageModel is None:
+                raise RuntimeError(
+                    "use_unsloth=True but the unsloth package is not installed. "
+                    "Install unsloth or initialize ProteinLLMModel with use_unsloth=False."
+                )
             self.text_model, self.text_tokenizer = FastLanguageModel.from_pretrained(
                 model_name=text_model_name,
                 max_seq_length=max_length_text + max_length_protein + go_num_reduced_embeddings + 8,    # Use 8 for special tokens

@@ -40,10 +40,20 @@ class TrainProteinLLMTrackingContractsTest(unittest.TestCase):
         self.assertIn("generated_ids = torch.cat([generated_ids, next_token], dim=1)", source)
         self.assertIn("generated_inputs_embeds = torch.cat([generated_inputs_embeds, next_token_embeds], dim=1)", source)
 
+    def test_train_sft_tolerates_missing_unsloth_when_disabled(self):
+        source = TRAIN_PATH.read_text()
+        self.assertIn("except ImportError", source)
+        self.assertIn("use_unsloth=True but the unsloth package is not installed", source)
+        model_source = MODEL_PATH.read_text()
+        self.assertIn("except ImportError", model_source)
+        self.assertIn("initialize ProteinLLMModel with use_unsloth=False", model_source)
+
     def test_sft_wrapper_passes_weave_and_logs_more_frequently(self):
         wrapper = WRAPPER_PATH.read_text()
         self.assertIn('WEAVE_PROJECT=${WEAVE_PROJECT:-""}', wrapper)
         self.assertIn("WEAVE_TRACE_BUDGET=${WEAVE_TRACE_BUDGET:-64}", wrapper)
+        self.assertIn("USE_UNSLOTH=${USE_UNSLOTH:-False}", wrapper)
+        self.assertIn("ATTN_IMPLEMENTATION=${ATTN_IMPLEMENTATION:-sdpa}", wrapper)
         self.assertIn('STAGE2_LOG_EVERY_N_STEPS=${STAGE2_LOG_EVERY_N_STEPS:-10}', wrapper)
         self.assertIn(
             'STAGE2_SAMPLE_GENERATION_EVERY_N_STEPS=${STAGE2_SAMPLE_GENERATION_EVERY_N_STEPS:-500}',
@@ -51,6 +61,8 @@ class TrainProteinLLMTrackingContractsTest(unittest.TestCase):
         )
         self.assertIn('--weave_project "$WEAVE_PROJECT"', wrapper)
         self.assertIn('--weave_trace_budget "$WEAVE_TRACE_BUDGET"', wrapper)
+        self.assertIn('--use_unsloth "$USE_UNSLOTH"', wrapper)
+        self.assertIn('--attn_implementation "$ATTN_IMPLEMENTATION"', wrapper)
         self.assertIn('--every_n_train_steps "$STAGE2_SAMPLE_GENERATION_EVERY_N_STEPS"', wrapper)
 
 

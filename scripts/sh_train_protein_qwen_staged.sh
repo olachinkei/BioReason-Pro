@@ -111,6 +111,8 @@ STAGE2_LIMIT_VAL_BATCHES=${STAGE2_LIMIT_VAL_BATCHES:-1.0}
 STAGE2_LOG_EVERY_N_STEPS=${STAGE2_LOG_EVERY_N_STEPS:-10}
 STAGE2_SAMPLE_GENERATION_EVERY_N_STEPS=${STAGE2_SAMPLE_GENERATION_EVERY_N_STEPS:-500}
 STAGE2_RUN_LABEL=${STAGE2_RUN_LABEL:-""}
+USE_UNSLOTH=${USE_UNSLOTH:-False}
+ATTN_IMPLEMENTATION=${ATTN_IMPLEMENTATION:-sdpa}
 
 # --- Benchmark / Tracking Configuration ---
 BENCHMARK_VERSION="213 -> 221 -> 225 -> 228"
@@ -216,7 +218,7 @@ BASE_COMMAND+=(
     --protein_model_name esm3_sm_open_v1
     --strategy ddp_find_unused_parameters_false
     --use_qlora False
-    --use_unsloth True
+    --use_unsloth "$USE_UNSLOTH"
     --num_gpus "$TRAIN_NUM_GPUS"
     --batch_size 4
     --num_nodes "$TRAIN_NUM_NODES"
@@ -243,7 +245,7 @@ BASE_COMMAND+=(
     --protein_model_finetune False
     --protein_embedding_layer "$ESM_LAYER"
     --go_model_finetune True
-    --attn_implementation flash_attention_2
+    --attn_implementation "$ATTN_IMPLEMENTATION"
     --go_obo_path "$GO_OBO_PATH"
     --go_hidden_dim 512
     --go_num_gat_layers 3

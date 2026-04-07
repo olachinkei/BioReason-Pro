@@ -5,9 +5,13 @@ os.environ["NCCL_CUMEM_ENABLE"] = "1"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["UNSLOTH_DISABLE_FAST_GENERATION"] = "1"
 
-# Import unsloth
-import unsloth
-from unsloth import FastLanguageModel
+# Import unsloth when available. Stable SFT runs can fall back to standard PEFT.
+try:
+    import unsloth  # type: ignore
+    from unsloth import FastLanguageModel  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency on some remote environments
+    unsloth = None
+    FastLanguageModel = None
 
 # Standard library imports
 import os
@@ -463,6 +467,11 @@ class ProteinLLMFineTuner(pl.LightningModule):
                 target_modules = _get_target_modules(self.model)
 
                 if self.use_unsloth:
+                    if FastLanguageModel is None:
+                        raise RuntimeError(
+                            "use_unsloth=True but the unsloth package is not installed. "
+                            "Install unsloth or run with use_unsloth=False."
+                        )
                     self.model.text_model = FastLanguageModel.get_peft_model(
                         self.model.text_model,
                         r=self.lora_rank,
