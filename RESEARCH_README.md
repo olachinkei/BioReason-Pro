@@ -274,7 +274,7 @@ ssh -o IdentitiesOnly=yes kkamata+cwb607@sunk.cwb607-training.coreweave.app
 - 学習・評価は GPU node 上で回す
 - 終了後は node を解放する
 
-### 2.2 ローカル Mac からコードと data を送る
+### 2.2 ローカル Mac からコードだけ送る
 
 ローカル Mac 側で実行する。
 
@@ -282,11 +282,75 @@ ssh -o IdentitiesOnly=yes kkamata+cwb607@sunk.cwb607-training.coreweave.app
 cd /Users/keisuke/Project/learning/drug_discovery
 
 rsync -av --delete \
+  --exclude 'data/artifacts/' \
+  --exclude '.venv*/' \
   BioReason-Pro/ \
   kkamata+cwb607@sunk.cwb607-training.coreweave.app:~/BioReason-Pro/
 ```
 
-### 2.3 CoreWeave 上で uv 環境を作る
+`data/artifacts` はローカル生成物なので、この `rsync` には含めない。  
+benchmark / dataset data は、CoreWeave 側で **W&B Artifacts から取得する**。
+
+### 2.3 CoreWeave 側で data を W&B Artifacts から取得する
+
+CoreWeave 側で実行する。
+
+まず W&B に login する。
+
+```bash
+cd ~/BioReason-Pro
+source .venv-gpu/bin/activate || true
+
+uv run --active wandb login
+```
+
+main variant の Step 0 benchmark を取得する。
+
+```bash
+cd ~/BioReason-Pro
+
+mkdir -p data/artifacts/benchmarks/213_221_225_228/step0
+
+uv run --active wandb artifact get \
+  "${WANDB_ENTITY}/${WANDB_PROJECT}/disease-temporal-step0:production" \
+  --root data/artifacts/benchmarks/213_221_225_228/step0
+```
+
+comparison variant の Step 0 benchmark を取得する。
+
+```bash
+cd ~/BioReason-Pro
+
+mkdir -p data/artifacts/benchmarks/214_221_225_228/step0
+
+uv run --active wandb artifact get \
+  "${WANDB_ENTITY}/${WANDB_PROJECT}/disease-temporal-step0:214.221.225.228" \
+  --root data/artifacts/benchmarks/214_221_225_228/step0
+```
+
+supervised dataset と reasoning dataset を upload 済みなら、同様に取得する。
+
+```bash
+cd ~/BioReason-Pro
+
+mkdir -p data/artifacts/datasets/disease_temporal_hc_v1/213_221_225_228
+mkdir -p data/artifacts/datasets/disease_temporal_hc_reasoning_v1/213_221_225_228
+
+uv run --active wandb artifact get \
+  "${WANDB_ENTITY}/${WANDB_PROJECT}/disease-temporal-supervised:production" \
+  --root data/artifacts/datasets/disease_temporal_hc_v1/213_221_225_228
+
+uv run --active wandb artifact get \
+  "${WANDB_ENTITY}/${WANDB_PROJECT}/disease-temporal-reasoning:production" \
+  --root data/artifacts/datasets/disease_temporal_hc_reasoning_v1/213_221_225_228
+```
+
+つまり運用は次のとおり。
+
+- ローカル Mac: Step 0 実行と artifact upload
+- CoreWeave: code を `rsync`、data を W&B Artifact download
+
+### 2.4 CoreWeave 上で uv 環境を作る
 
 CoreWeave 側ではフル実装用の環境を作る。
 
@@ -302,7 +366,7 @@ uv pip install flash-attn --no-build-isolation --no-cache-dir
 uv pip install unsloth
 ```
 
-### 2.4 GPU node に入る
+### 2.5 GPU node に入る
 
 実際の partition 名や account 名は自分の環境に合わせて置き換える。
 
@@ -562,8 +626,9 @@ RL 実装が入ったら、README には次を追加する。
 2. `data/artifacts` を作る
 3. Step 0 を main variant / comparison variant で実行する
 4. Step 0 を W&B Artifact に upload する
-5. CoreWeave に repo と data を送る
-6. CoreWeave 上で `uv` 環境を作る
-7. base / sft / rl を順に評価する
-8. SFT を回す
-9. RL entry point が入ったら RL に進む
+5. CoreWeave に repo を送る
+6. CoreWeave で W&B Artifacts から data を取得する
+7. CoreWeave 上で `uv` 環境を作る
+8. base / sft / rl を順に評価する
+9. SFT を回す
+10. RL entry point が入ったら RL に進む
