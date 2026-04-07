@@ -168,6 +168,70 @@ class RunRegisteredEvalContractsTest(unittest.TestCase):
         self.assertEqual(captured["env"]["WANDB_RUN_NAME"], "eval-bioreason-pro-base-validation-213.221.225.228")
         self.assertEqual(captured["env"]["KEEP_LOCAL_EVAL_OUTPUTS"], "0")
 
+    def test_run_protein_llm_target_cleans_stale_scratch_before_execution(self):
+        bundle = {
+            "benchmark_version": "213 -> 221 -> 225 -> 228",
+            "benchmark_alias": "213.221.225.228",
+            "shortlist_mode": "high-confidence",
+            "shortlist_query": "demo query",
+            "train_start_release": 213,
+            "train_end_release": 221,
+            "dev_end_release": 225,
+            "test_end_release": 228,
+            "temporal_split_artifact": {"wandb_registry_path": "demo/project/disease-temporal-split:production"},
+            "reasoning_dataset": {
+                "wandb_registry_path": "demo/project/disease-temporal-reasoning:production",
+                "dataset_source": "wanglab/cafa5",
+                "dataset_name": "disease_temporal_hc_reasoning_v1",
+            },
+        }
+        target = {
+            "target_name": "bioreason-pro-base",
+            "display_name": "bioreason-pro-base",
+            "runner": "protein_llm",
+            "model_sources": [{"type": "wandb_artifact", "wandb_registry_path": "demo/project/base:production"}],
+        }
+        args = types.SimpleNamespace(
+            split="test",
+            wandb_project="demo-project",
+            wandb_entity="demo-entity",
+            wandb_mode="online",
+            weave_project="demo-entity/demo-project",
+            metric_threads=4,
+            metric_threshold_step=0.95,
+            max_samples=3,
+            sample_strategy="shuffled_prefix",
+            num_chunks=1,
+            chunk_id=0,
+            keep_local_eval_outputs=False,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_root = Path(tmpdir)
+            stale_file = output_root / "bioreason-pro-base" / "test" / "results" / "stale.json"
+            stale_file.parent.mkdir(parents=True, exist_ok=True)
+            stale_file.write_text("{}", encoding="utf-8")
+            runtime_paths = {
+                "output_root": str(output_root),
+                "go_obo_path": "/tmp/go-basic.obo",
+                "ia_file_path": "/tmp/IA.txt",
+                "go_embeddings_path": "/tmp/go-embeddings",
+                "dataset_cache_dir": "/tmp/hf-cache",
+                "structure_dir": "/tmp/structures",
+            }
+
+            with mock.patch.object(
+                REGISTERED_EVAL,
+                "materialize_first_available_source",
+                return_value={
+                    "local_path": "/tmp/bioreason-base",
+                    "source_ref": "demo/project/bioreason-pro-base:production",
+                },
+            ), mock.patch.object(REGISTERED_EVAL, "run_shell_command", return_value=None):
+                REGISTERED_EVAL.run_protein_llm_target(args, bundle, target, runtime_paths)
+
+            self.assertFalse(stale_file.exists())
+
     def test_resolve_effective_max_samples_defaults_validation_to_100(self):
         args = types.SimpleNamespace(split="validation", max_samples=None)
         self.assertEqual(REGISTERED_EVAL.resolve_effective_max_samples(args), 100)

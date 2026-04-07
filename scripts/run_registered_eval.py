@@ -283,6 +283,13 @@ def run_shell_command(command: Sequence[str], env: Mapping[str, str]) -> None:
     subprocess.run(list(command), cwd=str(ROOT), env=dict(env), check=True)
 
 
+def prepare_clean_eval_output_dir(path_value: Path) -> Path:
+    """Always start eval runs from a clean scratch directory."""
+    remove_local_eval_output(path_value)
+    path_value.mkdir(parents=True, exist_ok=True)
+    return path_value
+
+
 def run_protein_llm_target(
     args: argparse.Namespace,
     bundle: Mapping[str, Any],
@@ -297,7 +304,7 @@ def run_protein_llm_target(
         raise RegistryError(f"Could not resolve any model source for {target['target_name']}.")
 
     output_dir = Path(runtime_paths["output_root"]) / target["target_name"] / args.split
-    output_dir.mkdir(parents=True, exist_ok=True)
+    prepare_clean_eval_output_dir(output_dir)
 
     names = build_run_names(target["target_name"], args.split, bundle["benchmark_alias"])
     env = os.environ.copy()
@@ -594,6 +601,7 @@ def run_prediction_artifact_target(
         raise RegistryError(f"Could not resolve any prediction artifact for {target['target_name']}.")
 
     output_dir = Path(runtime_paths["output_root"]) / target["target_name"] / args.split
+    prepare_clean_eval_output_dir(output_dir)
     results_dir = output_dir / "results"
     prediction_input_dir = results_dir / "predictions"
     results_dir.mkdir(parents=True, exist_ok=True)

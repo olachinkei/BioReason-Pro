@@ -16,6 +16,8 @@ class TrainProteinLLMTrackingContractsTest(unittest.TestCase):
         self.assertIn("prefer_original_generate=True", source)
         self.assertIn('"failure_reason"', source)
         self.assertIn('"assistant_marker_found"', source)
+        self.assertNotIn("wandb.Table(", source)
+        self.assertNotIn('step_id = f"gen_', source)
 
     def test_train_sft_logs_core_metrics_to_wandb(self):
         source = TRAIN_PATH.read_text()

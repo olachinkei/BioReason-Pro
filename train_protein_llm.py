@@ -11,7 +11,6 @@ from unsloth import FastLanguageModel
 
 # Standard library imports
 import os
-import time
 from argparse import ArgumentParser
 from functools import partial
 from pathlib import Path
@@ -721,21 +720,6 @@ class ProteinLLMFineTuner(pl.LightningModule):
                 print(f"=====[User input]=====\n{result['user_input']}")
                 print(f"=====[Complete generation]=====\n{result['generation']}")
                 print(f"=====[Ground truth]=====\n{result['ground_truth']}")
-
-            # Log to wandb
-            timestamp = time.time()
-            step_id = f"gen_{self.global_step}-{timestamp}"
-            wandb_logger = self.logger.experiment
-            wandb_logger.log(
-                {
-                    step_id: wandb.Table(
-                        columns=["timestamp", "prefix", "batch_idx"] + SFT_SAMPLE_TABLE_COLUMNS,
-                        data=[
-                            [timestamp, prefix, batch_idx] + [sample_row[column] for column in SFT_SAMPLE_TABLE_COLUMNS]
-                        ],
-                    )
-                }
-            )
         else:
             failure_reason = normalize_tracking_text(result.get("failure_reason")) or "generation_failed"
             if self.verbose_sample_generation:
