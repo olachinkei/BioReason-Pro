@@ -73,15 +73,13 @@ class TrainProteinLLMTrackingContractsTest(unittest.TestCase):
     def test_train_sft_finishes_wandb_and_flushes_weave(self):
         source = TRAIN_PATH.read_text()
         self.assertIn('flush = getattr(weave_trace_state["client"], "flush", None)', source)
-        self.assertIn('finish = getattr(logger.experiment, "finish", None)', source)
-        self.assertIn("if callable(finish):", source)
-        self.assertIn("finish()", source)
+        self.assertIn('finalize = getattr(logger, "finalize", None)', source)
+        self.assertIn('finalize("success")', source)
 
-    def test_directory_artifact_logging_waits_for_completion(self):
+    def test_directory_artifact_logging_does_not_block_before_finish(self):
         source = TRACKING_PATH.read_text()
-        self.assertIn('wait = getattr(logged_artifact, "wait", None)', source)
-        self.assertIn("if callable(wait):", source)
-        self.assertIn("wait()", source)
+        self.assertIn("log_artifact(artifact, aliases=resolved_aliases or None)", source)
+        self.assertNotIn('wait = getattr(logged_artifact, "wait", None)', source)
 
 
 if __name__ == "__main__":

@@ -1253,9 +1253,13 @@ def main(args: ArgumentParser):
                 flush = getattr(weave_trace_state["client"], "flush", None)
                 if callable(flush):
                     flush()
-            finish = getattr(logger.experiment, "finish", None)
-            if callable(finish):
-                finish()
+            finalize = getattr(logger, "finalize", None)
+            if callable(finalize):
+                finalize("success")
+            else:
+                finish = getattr(logger.experiment, "finish", None)
+                if callable(finish):
+                    finish()
 
     # trainer.test(model, ckpt_path=args.ckpt_path if args.ckpt_path else "best")
 
