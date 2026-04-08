@@ -622,13 +622,6 @@ def build_tracking_config(args, run_summary: Dict[str, Any], metrics_summary: Di
         "successful_result_files_total": run_summary.get("successful_result_files_total"),
         "local_eval_outputs_retained": bool(getattr(args, "keep_local_eval_outputs", False)),
     }
-    config.update(
-        {
-            key: value
-            for key, value in normalize_metrics_summary(metrics_summary).items()
-            if isinstance(value, (int, float))
-        }
-    )
     return {key: value for key, value in config.items() if value not in (None, "")}
 
 
@@ -693,13 +686,26 @@ def build_wandb_table(rows: List[Dict[str, Any]]):
 
 
 def should_log_eval_tables(args) -> bool:
-    """Only final test runs need table-style eval outputs."""
-    return getattr(args, "eval_split", "validation") == "test"
+    """All eval runs should persist summary + sample tables to W&B."""
+    return True
+
+
+def resolve_weave_project(args) -> str:
+    """Resolve the canonical Weave project for traces and Evaluation logging."""
+    explicit_project = (getattr(args, "weave_project", None) or os.getenv("WEAVE_PROJECT") or "").strip()
+    if explicit_project:
+        return explicit_project
+
+    wandb_entity = (getattr(args, "wandb_entity", None) or os.getenv("WANDB_ENTITY") or "").strip()
+    wandb_project = (getattr(args, "wandb_project", None) or os.getenv("WANDB_PROJECT") or "").strip()
+    if wandb_entity and wandb_project:
+        return f"{wandb_entity}/{wandb_project}"
+    return ""
 
 
 def should_run_weave_evaluation(args) -> bool:
-    """Weave Evaluation is only required for final test reporting."""
-    return getattr(args, "eval_split", "validation") == "test"
+    """Weave Evaluation is required whenever a Weave project is configured."""
+    return bool(resolve_weave_project(args))
 
 
 def ensure_weave_server_cache_dir(args) -> str:
@@ -714,6 +720,27 @@ def ensure_weave_server_cache_dir(args) -> str:
 
     cache_dir.mkdir(parents=True, exist_ok=True)
     return str(cache_dir.resolve())
+
+
+def maybe_update_wandb_config(run, config_payload: Dict[str, Any]) -> None:
+    """Best-effort config update for an already initialized W&B run."""
+    if run is None:
+        return
+
+    config = getattr(run, "config", None)
+    if config is None:
+        return
+
+    update = getattr(config, "update", None)
+    if callable(update):
+        try:
+            update(config_payload, allow_val_change=True)
+        except TypeError:
+            update(config_payload)
+        return
+
+    if isinstance(config, dict):
+        config.update(config_payload)
 
 
 def maybe_init_wandb_run(args, run_summary: Dict[str, Any], metrics_summary: Dict[str, Any]):
@@ -762,6 +789,86 @@ def maybe_init_wandb_run(args, run_summary: Dict[str, Any], metrics_summary: Dic
         return None
 
 
+def maybe_init_eval_tracking(args) -> Dict[str, Any]:
+    """Initialize W&B and Weave before sample processing begins."""
+    tracking_state: Dict[str, Any] = {
+        "wandb_run": None,
+        "weave_client": None,
+        "trace_sample": None,
+        "weave_project": "",
+        "sample_traces_logged": 0,
+    }
+
+    tracking_state["wandb_run"] = maybe_init_wandb_run(args, {}, {})
+
+    if weave is None:
+        return tracking_state
+
+    weave_project = resolve_weave_project(args)
+    if not weave_project:
+        return tracking_state
+
+    try:
+        cache_dir = ensure_weave_server_cache_dir(args)
+        print(f"🧶 Using Weave cache directory: {cache_dir}")
+        client = weave.init(weave_project)
+
+        @weave.op(name="eval_sample_inference")
+        def trace_sample(payload: Dict[str, Any]) -> Dict[str, Any]:
+            return payload
+
+        tracking_state["weave_client"] = client
+        tracking_state["trace_sample"] = trace_sample
+        tracking_state["weave_project"] = weave_project
+        print("Weave initialization for eval tracing completed.")
+    except Exception as exc:
+        print(f"⚠️  Weave init failed, continuing without sample tracing: {exc}")
+
+    return tracking_state
+
+
+def maybe_trace_eval_sample(
+    tracking_state: Optional[Dict[str, Any]],
+    *,
+    args,
+    sample: Dict[str, Any],
+    protein_id: str,
+    go_aspect: str,
+    attempt_idx: int,
+    result_record: Optional[Dict[str, Any]] = None,
+    error_type: str = "",
+    error_message: str = "",
+) -> None:
+    """Emit one Weave trace per eval sample attempt."""
+    if not tracking_state:
+        return
+    trace_sample = tracking_state.get("trace_sample")
+    if not callable(trace_sample):
+        return
+
+    result_record = result_record or {}
+    prediction_fields = extract_reasoning_fields(result_record.get("generated_response", ""))
+    ground_truth = result_record.get("ground_truth") or _get_ground_truth(sample)
+    payload = {
+        "split": getattr(args, "eval_split", "validation"),
+        "benchmark_version": resolve_benchmark_version(args),
+        "protein_id": protein_id,
+        "go_aspect": go_aspect,
+        "attempt_idx": int(attempt_idx),
+        "success": bool(result_record.get("success", False)) and not error_type,
+        "error_type": error_type,
+        "error_message": error_message,
+        "prompt": result_record.get("input_prompt", ""),
+        "ground_truth": ground_truth,
+        "prediction": result_record.get("generated_response", ""),
+        "reasoning_full": prediction_fields.get("reasoning_full", ""),
+        "final_answer": prediction_fields.get("final_answer", ""),
+        "intermediate_trace": prediction_fields.get("intermediate_trace", ""),
+    }
+    trace_sample(payload)
+    tracking_state["sample_traces_logged"] = int(tracking_state.get("sample_traces_logged", 0)) + 1
+
+
 def log_eval_outputs_to_wandb(
     run,
     args,
@@ -769,9 +876,11 @@ def log_eval_outputs_to_wandb(
     metrics_summary: Dict[str, Any],
     sample_rows: List[Dict[str, Any]],
 ) -> bool:
-    """Log eval metrics and, for test runs only, W&B tables."""
+    """Log eval metrics plus summary/sample tables."""
     if run is None or wandb is None:
         return False
+
+    maybe_update_wandb_config(run, build_tracking_config(args, run_summary, metrics_summary))
 
     metrics_to_log = {
         key: value for key, value in normalize_metrics_summary(metrics_summary).items() if isinstance(value, (int, float))
@@ -797,29 +906,27 @@ def maybe_log_eval_to_weave(
     run_summary: Dict[str, Any],
     metrics_summary: Dict[str, Any],
     sample_rows: List[Dict[str, Any]],
+    tracking_state: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """Track eval rows with Weave Evaluation when configured."""
     if not should_run_weave_evaluation(args):
         return False
     if weave is None:
-        print("⚠️  Weave package is unavailable; final test eval requires `weave` to be installed.")
+        print("⚠️  Weave package is unavailable; evaluation requires `weave` to be installed.")
         return False
     if not sample_rows:
         return False
 
-    weave_project = (getattr(args, "weave_project", None) or "").strip()
-    if not weave_project:
-        wandb_entity = (getattr(args, "wandb_entity", None) or os.getenv("WANDB_ENTITY") or "").strip()
-        wandb_project = (getattr(args, "wandb_project", None) or os.getenv("WANDB_PROJECT") or "").strip()
-        if wandb_entity and wandb_project:
-            weave_project = f"{wandb_entity}/{wandb_project}"
+    weave_project = resolve_weave_project(args)
     if not weave_project:
         return False
 
     try:
-        cache_dir = ensure_weave_server_cache_dir(args)
-        print(f"🧶 Using Weave cache directory: {cache_dir}")
-        client = weave.init(weave_project)
+        client = None if tracking_state is None else tracking_state.get("weave_client")
+        if client is None:
+            cache_dir = ensure_weave_server_cache_dir(args)
+            print(f"🧶 Using Weave cache directory: {cache_dir}")
+            client = weave.init(weave_project)
 
         @weave.op
         def replay_prediction(
@@ -897,6 +1004,7 @@ def log_eval_tracking(
     run_summary: Dict[str, Any],
     result_rows: List[Dict[str, Any]],
     metrics_summary: Optional[Dict[str, Any]] = None,
+    tracking_state: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Log optional W&B / Weave tracking for the completed eval run."""
     if metrics_summary is None:
@@ -908,7 +1016,9 @@ def log_eval_tracking(
         "weave_logged": False,
     }
 
-    wandb_run = maybe_init_wandb_run(args, run_summary, metrics_summary)
+    wandb_run = None if tracking_state is None else tracking_state.get("wandb_run")
+    if wandb_run is None:
+        wandb_run = maybe_init_wandb_run(args, run_summary, metrics_summary)
     try:
         tracking_status["wandb_logged"] = log_eval_outputs_to_wandb(
             run=wandb_run,
@@ -918,7 +1028,8 @@ def log_eval_tracking(
             sample_rows=sample_rows,
         )
     finally:
-        if wandb_run is not None:
+        should_finish = tracking_state is None
+        if should_finish and wandb_run is not None:
             finish = getattr(wandb_run, "finish", None)
             if callable(finish):
                 finish()
@@ -928,6 +1039,7 @@ def log_eval_tracking(
         run_summary=run_summary,
         metrics_summary=metrics_summary,
         sample_rows=sample_rows,
+        tracking_state=tracking_state,
     )
     return tracking_status
 
@@ -1118,6 +1230,8 @@ def run_local_inference(args):
     """
     print("--- Starting Local CAFA-5 Inference ---")
 
+    tracking_state = maybe_init_eval_tracking(args)
+
     try:
         # Initialize model
         model = initialize_model(args)
@@ -1152,6 +1266,15 @@ def run_local_inference(args):
                     result_record = process_single_sample(model, sample, protein_id, go_aspect, go_bp, go_mf, go_cc, go_bp_leaf, go_mf_leaf, go_cc_leaf, args)
                     if result_record is not None:
                         save_result(result_record, protein_id, go_aspect, args.evals_path, k_idx=k_idx)
+                        maybe_trace_eval_sample(
+                            tracking_state,
+                            args=args,
+                            sample=sample,
+                            protein_id=protein_id,
+                            go_aspect=go_aspect,
+                            attempt_idx=k_idx,
+                            result_record=result_record,
+                        )
                         if not sample_has_success:
                             successfully_processed += 1
                             sample_has_success = True
@@ -1170,6 +1293,16 @@ def run_local_inference(args):
                         go_mf_leaf,
                         go_cc_leaf,
                     )
+                    maybe_trace_eval_sample(
+                        tracking_state,
+                        args=args,
+                        sample=sample,
+                        protein_id=protein_id,
+                        go_aspect=go_aspect,
+                        attempt_idx=k_idx,
+                        error_type="oom",
+                        error_message="CUDA Out of Memory",
+                    )
                     torch.cuda.empty_cache()
                     continue
 
@@ -1187,6 +1320,16 @@ def run_local_inference(args):
                         go_mf_leaf,
                         go_cc_leaf,
                         str(e),
+                    )
+                    maybe_trace_eval_sample(
+                        tracking_state,
+                        args=args,
+                        sample=sample,
+                        protein_id=protein_id,
+                        go_aspect=go_aspect,
+                        attempt_idx=k_idx,
+                        error_type="exception",
+                        error_message=str(e),
                     )
                     traceback.print_exc()
                     continue
@@ -1210,8 +1353,15 @@ def run_local_inference(args):
         if metrics_summary_path:
             run_summary["metrics_summary_path"] = metrics_summary_path
         summary_path = write_run_summary(run_summary, args.evals_path)
-        tracking_status = log_eval_tracking(args, run_summary, result_rows, metrics_summary=metrics_summary)
+        tracking_status = log_eval_tracking(
+            args,
+            run_summary,
+            result_rows,
+            metrics_summary=metrics_summary,
+            tracking_state=tracking_state,
+        )
         run_summary.update(tracking_status)
+        run_summary["sample_traces_logged"] = int(tracking_state.get("sample_traces_logged", 0))
         summary_path = write_run_summary(run_summary, args.evals_path)
         enforce_required_eval_outputs(args, tracking_status)
         cleanup_status = maybe_cleanup_local_eval_outputs(args, tracking_status)
@@ -1231,6 +1381,12 @@ def run_local_inference(args):
         print(f"Critical Error: {e}")
         traceback.print_exc()
         raise SystemExit(1)
+    finally:
+        wandb_run = tracking_state.get("wandb_run")
+        if wandb_run is not None:
+            finish = getattr(wandb_run, "finish", None)
+            if callable(finish):
+                finish()
 
 
 def setup_argument_parser() -> argparse.ArgumentParser:

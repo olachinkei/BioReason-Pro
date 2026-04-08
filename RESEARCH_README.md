@@ -335,22 +335,23 @@ srun \
 
 ### 3.4 評価で W&B に保存されるもの
 
-`validation` run では deterministic な **100-sample stratified subset** に対する metric のみを W&B に保存する。
+eval run では、`wandb.init(..., job_type="eval")` と `weave.init(...)` を開始時に行う。  
+そのうえで各 sample の推論は `@weave.op` で trace し、run の最後に Weave Evaluation を記録する。
+
+`validation` run では deterministic な **100-sample stratified subset** を使う。  
+`test` run では full split を使う。
+
+すべての eval run で次を W&B に保存する。
 
 - `fmax_mf`
 - `fmax_bp`
 - `fmax_cc`
 - `overall_mean_fmax`
-
-この 4 つの metric が揃わなかった run は失敗として扱う。
-
-`test` run では次も追加で保存する。
-
 - `eval_summary` table
 - `eval_samples` table
 - Weave evaluation record
 
-Weave evaluation record が作れなかった `test` run も失敗として扱う。
+この一式が揃わなかった run は失敗として扱う。
 
 local eval 出力は scratch とみなし、W&B 保存成功後は既定で cleanup される。  
 local に残したいときだけ `--keep-local-eval-outputs` を付ける。

@@ -116,6 +116,7 @@ def install_eval_test_stubs():
             self.artifacts = []
             self.used_artifact_refs = []
             self.finished = False
+            self.config = dict(kwargs.get("config", {}))
 
         def log_artifact(self, artifact):
             self.artifacts.append(artifact)
@@ -143,10 +144,28 @@ def install_eval_test_stubs():
     wandb_module.init = wandb_init
     wandb_module.log = wandb_log
 
-    def weave_op(func=None, **kwargs):
+    weave_module.op_calls = []
+
+    def weave_op(func=None, name=None, **kwargs):
+        def decorator(actual):
+            def wrapped(*args, **inner_kwargs):
+                result = actual(*args, **inner_kwargs)
+                weave_module.op_calls.append(
+                    {
+                        "name": name or actual.__name__,
+                        "args": args,
+                        "kwargs": inner_kwargs,
+                        "result": result,
+                    }
+                )
+                return result
+
+            wrapped.__name__ = actual.__name__
+            return wrapped
+
         if func is None:
-            return lambda actual: actual
-        return func
+            return decorator
+        return decorator(func)
 
     class FakeEvaluation:
         instances = []
@@ -341,6 +360,54 @@ def make_eval_args(**overrides):
 
 
 class EvalContractTests(unittest.TestCase):
+    def test_maybe_init_eval_tracking_initializes_wandb_and_weave_early(self):
+        EVAL.wandb.init_calls.clear()
+        EVAL.weave.init_calls.clear()
+        EVAL.weave.op_calls.clear()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = make_eval_args(
+                evals_path=tmpdir,
+                wandb_project="bioreason-pro",
+                wandb_entity="demo-entity",
+                weave_project="demo-entity/bioreason-pro",
+            )
+            tracking_state = EVAL.maybe_init_eval_tracking(args)
+
+            self.assertIsNotNone(tracking_state["wandb_run"])
+            self.assertIsNotNone(tracking_state["weave_client"])
+            self.assertTrue(callable(tracking_state["trace_sample"]))
+            self.assertEqual(EVAL.wandb.init_calls[0]["job_type"], "eval")
+            self.assertEqual(EVAL.weave.init_calls[0], "demo-entity/bioreason-pro")
+
+    def test_maybe_trace_eval_sample_emits_weave_payload(self):
+        EVAL.weave.op_calls.clear()
+        args = make_eval_args(eval_split="test", benchmark_version="213 -> 221 -> 225 -> 228")
+        tracking_state = {"trace_sample": lambda payload: EVAL.weave.op_calls.append({"name": "eval_sample_inference", "result": payload})}
+        sample = {
+            "prompt": [{"role": "assistant", "reasoning_content": "gold", "content": [{"text": "GO:1"}]}],
+        }
+        result_record = {
+            "success": True,
+            "ground_truth": "<think>gold</think>\nGO:1",
+            "generated_response": "<think>trace</think>\nGO:1",
+            "input_prompt": "prompt",
+        }
+
+        EVAL.maybe_trace_eval_sample(
+            tracking_state,
+            args=args,
+            sample=sample,
+            protein_id="P1",
+            go_aspect="molecular_function",
+            attempt_idx=0,
+            result_record=result_record,
+        )
+
+        self.assertEqual(tracking_state["sample_traces_logged"], 1)
+        self.assertEqual(EVAL.weave.op_calls[-1]["result"]["protein_id"], "P1")
+        self.assertEqual(EVAL.weave.op_calls[-1]["result"]["final_answer"], "GO:1")
+
     def test_argument_parser_defaults_to_validation_split(self):
         parser = EVAL.setup_argument_parser()
         args = parser.parse_args(
@@ -869,6 +936,7 @@ class EvalContractTests(unittest.TestCase):
         EVAL.weave.init_calls.clear()
         EVAL.weave.flush_calls = 0
         EVAL.weave.Evaluation.instances.clear()
+        EVAL.weave.op_calls.clear()
 
         result_rows = [
             {
@@ -935,7 +1003,7 @@ class EvalContractTests(unittest.TestCase):
         self.assertEqual(len(EVAL.weave.Evaluation.instances), 1)
         self.assertEqual(len(EVAL.weave.Evaluation.instances[0].dataset), 1)
 
-    def test_log_eval_tracking_logs_metrics_only_for_validation(self):
+    def test_log_eval_tracking_logs_tables_and_weave_for_validation(self):
         EVAL.wandb.init_calls.clear()
         EVAL.wandb.logged_payloads.clear()
         EVAL.wandb.last_run = None
@@ -978,13 +1046,13 @@ class EvalContractTests(unittest.TestCase):
         )
 
         self.assertTrue(tracking_status["wandb_logged"])
-        self.assertFalse(tracking_status["weave_logged"])
+        self.assertTrue(tracking_status["weave_logged"])
         self.assertTrue(any("fmax_mf" in payload for payload in EVAL.wandb.logged_payloads))
-        self.assertFalse(any("eval_summary" in payload for payload in EVAL.wandb.logged_payloads))
-        self.assertFalse(any("eval_samples" in payload for payload in EVAL.wandb.logged_payloads))
+        self.assertTrue(any("eval_summary" in payload for payload in EVAL.wandb.logged_payloads))
+        self.assertTrue(any("eval_samples" in payload for payload in EVAL.wandb.logged_payloads))
         self.assertEqual(EVAL.wandb.last_run.artifacts, [])
-        self.assertEqual(EVAL.weave.init_calls, [])
-        self.assertEqual(EVAL.weave.Evaluation.instances, [])
+        self.assertEqual(EVAL.weave.init_calls, ["demo-entity/bioreason-pro"])
+        self.assertEqual(len(EVAL.weave.Evaluation.instances), 1)
 
     def test_enforce_required_eval_outputs_requires_metrics_for_validation(self):
         args = make_eval_args(eval_split="validation")
@@ -1000,7 +1068,20 @@ class EvalContractTests(unittest.TestCase):
             )
 
     def test_enforce_required_eval_outputs_requires_weave_for_test(self):
-        args = make_eval_args(eval_split="test")
+        args = make_eval_args(eval_split="test", weave_project="demo-entity/bioreason-pro")
+
+        with self.assertRaisesRegex(RuntimeError, "Weave evaluation"):
+            EVAL.enforce_required_eval_outputs(
+                args,
+                {
+                    "wandb_logged": True,
+                    "metrics_loaded": True,
+                    "weave_logged": False,
+                },
+            )
+
+    def test_enforce_required_eval_outputs_requires_weave_for_validation_when_project_configured(self):
+        args = make_eval_args(eval_split="validation", weave_project="demo-entity/bioreason-pro")
 
         with self.assertRaisesRegex(RuntimeError, "Weave evaluation"):
             EVAL.enforce_required_eval_outputs(

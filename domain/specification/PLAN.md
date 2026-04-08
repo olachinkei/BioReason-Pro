@@ -175,7 +175,6 @@ Status: **Re-run after fixes**
 ### 3.1 Purpose
 
 Evaluate the pre-tuning comparison model `bioreason-pro-rl-paper` on the currently adopted benchmark using the `validation` split.  
-This phase saves **metrics only** to W&B; tables and eval artifacts are not required.  
 `validation` uses a deterministic **100-sample stratified subset** preserving `go_aspect` and label-profile, not the full split.
 
 ### 3.2 Evaluation Targets
@@ -217,10 +216,12 @@ Complete when the following are visible on W&B.
 - `fmax_bp`
 - `fmax_cc`
 - `overall_mean_fmax`
+- `eval_summary` table
+- `eval_samples` table
+- Weave Evaluation record
 
-For validation runs, having metrics saved is sufficient; `eval_summary` table, `eval_samples` table, and eval artifacts are not required.
 Sample count defaults to `100`; subset strategy is fixed to `stratified_aspect_profile`.
-Runs missing any of `fmax_mf`, `fmax_bp`, `fmax_cc` are not treated as complete.
+Runs missing any of `fmax_mf`, `fmax_bp`, `fmax_cc`, `eval_summary`, `eval_samples`, or Weave Evaluation are not treated as complete.
 
 ### 3.5 After This Phase
 

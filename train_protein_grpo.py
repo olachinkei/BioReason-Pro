@@ -761,6 +761,9 @@ def export_hf_model(model: Any, save_dir: Path) -> None:
         torch.save(model.go_projection.state_dict(), export_dir / "go_projection.pt")
     if getattr(model, "go_encoder", None) is not None:
         torch.save(model.go_encoder.state_dict(), export_dir / "go_encoder.pt")
+    protein_model_dir = export_dir / "protein_model"
+    protein_model_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(model.protein_model.state_dict(), protein_model_dir / "pytorch_model.bin")
     for item in export_dir.iterdir():
         target_path = save_dir / item.name
         if target_path.exists():
@@ -913,7 +916,7 @@ def evaluate_policy(
                     pad_token_id=tokenizer.pad_token_id,
                     eos_token_id=tokenizer.eos_token_id,
                 )
-                completion_ids = extract_completion_ids(generated_ids, prompt_input_ids)
+                completion_ids = extract_completion_ids(generated_ids, example["input_ids"])
                 completion_text = decode_completion(tokenizer, completion_ids)
                 rewards, _ = compute_group_rewards([completion_text], example["sample_meta"], reward_names, reward_weights)
                 total_reward += rewards[0]
@@ -1104,7 +1107,7 @@ def train(args: argparse.Namespace) -> None:
                         pad_token_id=tokenizer.pad_token_id,
                         eos_token_id=tokenizer.eos_token_id,
                     )
-                    completion_ids = extract_completion_ids(generated_ids, prompt_input_ids)
+                    completion_ids = extract_completion_ids(generated_ids, example["input_ids"])
                     print(
                         "Completed RL rollout generation: "
                         f"global_step={global_step}, completion_tokens={completion_ids.numel()}"

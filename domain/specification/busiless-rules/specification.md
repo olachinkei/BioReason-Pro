@@ -328,8 +328,12 @@ Each metric is saved via `wandb.log()`, with at minimum `fmax_mf`, `fmax_bp`, `f
 
 - Development comparisons, ablations, and checkpoint comparisons use `validation`
     - Use a deterministic **100-sample stratified subset**
-    - Only metrics are needed in this case
-    - Runs where `fmax_mf`, `fmax_bp`, `fmax_cc` cannot be saved are not treated as successful
+    - Initialize `wandb.init(..., job_type="eval")` and `weave.init(...)` before sample processing begins
+    - Trace each sample inference with `@weave.op`
+    - Save `fmax_mf`, `fmax_bp`, `fmax_cc`, `overall_mean_fmax`
+    - Save `eval_summary` table and `eval_samples` table to W&B
+    - Save a Weave Evaluation record
+    - Runs missing any of the above are not treated as successful
 
 ## 8. Training for SFT
 
@@ -362,7 +366,6 @@ Fixed rules:
 - The selected SFT setting is the compliant trial with the lowest `val_loss_epoch`
 - Train / validation metrics (`train_loss`, `train_loss_epoch`, `val_loss`, `val_loss_epoch`, `lr_step`, `lr_epoch`) are saved via `wandb.log()`
 - Training-time sample generation is traced with Weave
-- Sample table is saved as a W&B Table
 - Output checkpoint is registered as a W&B Artifact
 
 ### 8.3 Execution Conditions

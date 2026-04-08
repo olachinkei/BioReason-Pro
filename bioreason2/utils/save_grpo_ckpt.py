@@ -137,6 +137,9 @@ def save_grpo_ckpt(args):
     torch.save(model.protein_projection.state_dict(), os.path.join(args.save_dir, "protein_projection.pt"))
     torch.save(model.go_projection.state_dict(), os.path.join(args.save_dir, "go_projection.pt"))
     torch.save(model.go_encoder.state_dict(), os.path.join(args.save_dir, "go_encoder.pt"))
+    protein_model_dir = os.path.join(args.save_dir, "protein_model")
+    os.makedirs(protein_model_dir, exist_ok=True)
+    torch.save(model.protein_model.state_dict(), os.path.join(protein_model_dir, "pytorch_model.bin"))
     
     # Save key mismatch log
     with open(os.path.join(args.save_dir, "missing_and_unexpected_keys.txt"), "w") as f:

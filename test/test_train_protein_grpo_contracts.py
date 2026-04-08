@@ -164,12 +164,20 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertIn('"loss_grad_norm"', source)
         self.assertIn('"eval_reward"', source)
         self.assertIn('"train_skipped_update"', source)
+        self.assertIn('protein_model_dir = export_dir / "protein_model"', source)
+        self.assertIn('torch.save(model.protein_model.state_dict(), protein_model_dir / "pytorch_model.bin")', source)
         self.assertNotIn('"loss_train": 0.0', source)
         self.assertNotIn('"loss_kl_div": 0.0', source)
         self.assertNotIn("train_rl_rollouts", source)
         self.assertNotIn("wandb.Table(", source)
         self.assertNotIn('"dataset/train_size"', source)
         self.assertNotIn('"dataset/validation_size"', source)
+
+    def test_grpo_converter_saves_protein_model_weights(self):
+        source = (ROOT / "bioreason2" / "utils" / "save_grpo_ckpt.py").read_text()
+
+        self.assertIn('protein_model_dir = os.path.join(args.save_dir, "protein_model")', source)
+        self.assertIn('torch.save(model.protein_model.state_dict(), os.path.join(protein_model_dir, "pytorch_model.bin"))', source)
 
     def test_sft_script_registers_input_artifact_lineage(self):
         source = SFT_SCRIPT_PATH.read_text()
