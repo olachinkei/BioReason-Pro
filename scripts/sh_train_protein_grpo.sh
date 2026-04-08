@@ -175,9 +175,13 @@ TEMPERATURE=${TEMPERATURE:-1.0}
 TOP_P=${TOP_P:-0.95}
 TOP_K=${TOP_K:-20}
 DO_SAMPLE=${DO_SAMPLE:-"True"}
+EVAL_DO_SAMPLE=${EVAL_DO_SAMPLE:-"False"}
+EVAL_TEMPERATURE=${EVAL_TEMPERATURE:-0.1}
+EVAL_TOP_P=${EVAL_TOP_P:-0.9}
+EVAL_TOP_K=${EVAL_TOP_K:-20}
 KL_BETA=${KL_BETA:-0.02}
-REWARD_FUNCS=${REWARD_FUNCS:-"strict_format,summary_schema,go_overlap,structural_noise"}
-REWARD_WEIGHTS=${REWARD_WEIGHTS:-"0.5,0.75,2.0,1.0"}
+REWARD_FUNCS=${REWARD_FUNCS:-"strict_format,summary_schema,go_presence,go_aspect_coverage,go_overlap,structural_noise"}
+REWARD_WEIGHTS=${REWARD_WEIGHTS:-"0.25,0.75,1.5,0.5,2.5,1.0"}
 
 if [ "${CHECKPOINT_ARTIFACT_NAME+x}" = "x" ]; then
   CHECKPOINT_ARTIFACT_NAME="${CHECKPOINT_ARTIFACT_NAME}"
@@ -446,6 +450,10 @@ stdbuf -oL -eL "${TRAIN_COMMAND[@]}" python train_protein_grpo.py \
   --top_p "$TOP_P" \
   --top_k "$TOP_K" \
   --do_sample "$DO_SAMPLE" \
+  --eval_do_sample "$EVAL_DO_SAMPLE" \
+  --eval_temperature "$EVAL_TEMPERATURE" \
+  --eval_top_p "$EVAL_TOP_P" \
+  --eval_top_k "$EVAL_TOP_K" \
   --kl_beta "$KL_BETA" \
   --reward_funcs "$REWARD_FUNCS" \
   --reward_weights "$REWARD_WEIGHTS" \

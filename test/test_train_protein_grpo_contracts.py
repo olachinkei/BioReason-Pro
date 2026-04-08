@@ -54,8 +54,15 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertIn('ROTATING_EVAL_SAMPLE_STRATEGY=${ROTATING_EVAL_SAMPLE_STRATEGY:-"stratified_aspect_profile"}', wrapper_text)
         self.assertIn('ROTATING_EVAL_SEED_STRIDE=${ROTATING_EVAL_SEED_STRIDE:-9973}', wrapper_text)
         self.assertIn('NUM_GENERATIONS=${NUM_GENERATIONS:-8}', wrapper_text)
-        self.assertIn('REWARD_FUNCS=${REWARD_FUNCS:-"strict_format,summary_schema,go_overlap,structural_noise"}', wrapper_text)
-        self.assertIn('REWARD_WEIGHTS=${REWARD_WEIGHTS:-"0.5,0.75,2.0,1.0"}', wrapper_text)
+        self.assertIn('EVAL_DO_SAMPLE=${EVAL_DO_SAMPLE:-"False"}', wrapper_text)
+        self.assertIn('EVAL_TEMPERATURE=${EVAL_TEMPERATURE:-0.1}', wrapper_text)
+        self.assertIn('EVAL_TOP_P=${EVAL_TOP_P:-0.9}', wrapper_text)
+        self.assertIn('EVAL_TOP_K=${EVAL_TOP_K:-20}', wrapper_text)
+        self.assertIn(
+            'REWARD_FUNCS=${REWARD_FUNCS:-"strict_format,summary_schema,go_presence,go_aspect_coverage,go_overlap,structural_noise"}',
+            wrapper_text,
+        )
+        self.assertIn('REWARD_WEIGHTS=${REWARD_WEIGHTS:-"0.25,0.75,1.5,0.5,2.5,1.0"}', wrapper_text)
         self.assertIn('MIN_NEW_TOKENS=${MIN_NEW_TOKENS:-1}', wrapper_text)
         self.assertIn('MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-512}', wrapper_text)
         self.assertIn('TEMPERATURE=${TEMPERATURE:-1.0}', wrapper_text)
@@ -114,7 +121,43 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
             "<|FUNCTION_SUMMARY_START|>\nKinase-linked signaling regulator.\n<|FUNCTION_SUMMARY_END|>"
         )
 
-        self.assertEqual(GRPO.summary_schema_reward(completion, {}), 1.0)
+        self.assertEqual(GRPO.summary_schema_reward(completion, {"go_aspect": "bp"}), 1.0)
+
+    def test_go_presence_reward_penalizes_freeform_answers_without_go_ids(self):
+        completion = "<think>reasoning</think><answer>This protein likely regulates signaling.</answer>"
+
+        self.assertLess(GRPO.go_presence_reward(completion, {"go_bp": "GO:0007165"}), 0.0)
+
+    def test_go_presence_reward_rewards_tagged_go_summary(self):
+        completion = (
+            "<think>reasoning</think>"
+            "<|GO_SUMMARY_START|>\nBP: GO:0007165\n<|GO_SUMMARY_END|>\n\n"
+            "<|FUNCTION_SUMMARY_START|>\nKinase-linked signaling regulator.\n<|FUNCTION_SUMMARY_END|>"
+        )
+
+        self.assertEqual(GRPO.go_presence_reward(completion, {"go_bp": "GO:0007165"}), 1.0)
+
+    def test_go_aspect_coverage_reward_tracks_requested_aspects(self):
+        completion = (
+            "<think>reasoning</think>"
+            "<|GO_SUMMARY_START|>\nMF: GO:0005515\nBP: GO:0007165\n<|GO_SUMMARY_END|>\n\n"
+            "<|FUNCTION_SUMMARY_START|>\nSignal adaptor.\n<|FUNCTION_SUMMARY_END|>"
+        )
+
+        self.assertEqual(
+            GRPO.go_aspect_coverage_reward(
+                completion,
+                {"go_bp": "GO:0007165", "go_mf": "GO:0005515", "go_cc": "GO:0005737"},
+            ),
+            2.0 / 3.0,
+        )
+
+    def test_inspect_completion_accepts_go_ids_even_with_structural_noise(self):
+        completion = "<think>reasoning</think>GO:0007165</tool_call>"
+        meta = GRPO.inspect_completion(completion)
+
+        self.assertEqual(meta["predicted_go_ids"], ["GO:0007165"])
+        self.assertEqual(meta["prediction_source"], "final_answer")
 
     def test_standardize_group_rewards_returns_zeroes_for_constant_group(self):
         self.assertEqual(GRPO.standardize_group_rewards([0.5, 0.5, 0.5]), [0.0, 0.0, 0.0])
@@ -155,10 +198,17 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertEqual(args.max_new_tokens, 512)
         self.assertEqual(args.temperature, 1.0)
         self.assertEqual(args.top_k, 20)
+        self.assertFalse(args.eval_do_sample)
+        self.assertEqual(args.eval_temperature, 0.1)
+        self.assertEqual(args.eval_top_p, 0.9)
+        self.assertEqual(args.eval_top_k, 20)
         self.assertEqual(args.rotating_eval_every_n_steps, 100)
         self.assertEqual(args.rotating_eval_max_samples, 256)
-        self.assertEqual(args.reward_funcs, "strict_format,summary_schema,go_overlap,structural_noise")
-        self.assertEqual(args.reward_weights, "0.5,0.75,2.0,1.0")
+        self.assertEqual(
+            args.reward_funcs,
+            "strict_format,summary_schema,go_presence,go_aspect_coverage,go_overlap,structural_noise",
+        )
+        self.assertEqual(args.reward_weights, "0.25,0.75,1.5,0.5,2.5,1.0")
         self.assertEqual(args.min_new_tokens, 1)
         self.assertTrue(args.bnb_4bit_use_double_quant)
         self.assertEqual(args.weave_trace_budget, 64)
@@ -248,6 +298,10 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
             temperature=1.0,
             top_p=0.95,
             top_k=20,
+            eval_do_sample=False,
+            eval_temperature=0.1,
+            eval_top_p=0.9,
+            eval_top_k=20,
             min_new_tokens=1,
             max_new_tokens=32,
         )
@@ -267,6 +321,10 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
 
         self.assertEqual(len(model.generate_calls), 1)
         self.assertEqual(tuple(model.generate_calls[0]["input_ids"].shape), (2, 2))
+        self.assertFalse(model.generate_calls[0]["do_sample"])
+        self.assertEqual(model.generate_calls[0]["temperature"], 0.1)
+        self.assertEqual(model.generate_calls[0]["top_p"], 0.9)
+        self.assertEqual(model.generate_calls[0]["top_k"], 20)
         self.assertEqual(metrics["eval_completion_length"], 1.0)
         self.assertEqual(metrics["eval_data_step_num_datums"], 2.0)
         self.assertEqual(model.eval_calls, 1)

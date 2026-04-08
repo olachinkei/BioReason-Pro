@@ -32,10 +32,12 @@ GO_ID_PATTERN = re.compile(r"GO:\d{7}")
 THINK_TAG_PATTERN = re.compile(r"<think>\s*(.*?)\s*</think>", re.DOTALL)
 ANSWER_TAG_PATTERN = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.DOTALL)
 STRUCTURAL_TAG_PATTERN = re.compile(r"</?(?:think|answer|tool_call)>")
+GO_ASPECT_PATTERN = re.compile(r"(?im)^\s*(MF|BP|CC)\s*:\s*(.+)$")
 GO_SUMMARY_START = "<|GO_SUMMARY_START|>"
 GO_SUMMARY_END = "<|GO_SUMMARY_END|>"
 FUNCTION_SUMMARY_START = "<|FUNCTION_SUMMARY_START|>"
 FUNCTION_SUMMARY_END = "<|FUNCTION_SUMMARY_END|>"
+GO_ASPECT_ORDER = ("MF", "BP", "CC")
 
 
 def normalize_text(value: Any) -> str:
@@ -109,6 +111,16 @@ def extract_tagged_block(text: Any, start_marker: str, end_marker: str) -> str:
     return raw[start_idx + len(start_marker) : end_idx].strip()
 
 
+def extract_go_aspect_map(text: Any) -> Dict[str, List[str]]:
+    aspect_map: Dict[str, List[str]] = {}
+    for match in GO_ASPECT_PATTERN.finditer(normalize_text(text)):
+        aspect = match.group(1).upper()
+        go_ids = extract_go_ids(match.group(2))
+        if go_ids:
+            aspect_map[aspect] = go_ids
+    return aspect_map
+
+
 def extract_reasoning_and_answer(text: Any) -> Dict[str, str]:
     raw = normalize_text(text).strip()
     if not raw:
@@ -142,12 +154,26 @@ def has_meaningful_text(text: Any) -> bool:
     return bool(re.search(r"[A-Za-z0-9]", normalize_text(text)))
 
 
+def build_requested_go_aspects(sample_meta: Mapping[str, Any]) -> List[str]:
+    requested = normalize_text(sample_meta.get("go_aspect")).strip().lower()
+    if requested in {"mf", "bp", "cc"}:
+        return [requested.upper()]
+
+    target_aspects: List[str] = []
+    for aspect, field_name in (("MF", "go_mf"), ("BP", "go_bp"), ("CC", "go_cc")):
+        if extract_go_ids(sample_meta.get(field_name)):
+            target_aspects.append(aspect)
+    return target_aspects or list(GO_ASPECT_ORDER)
+
+
 @lru_cache(maxsize=8192)
 def inspect_completion_text(raw_completion: str) -> Dict[str, Any]:
     sections = extract_reasoning_and_answer(raw_completion)
     final_answer = sections["final_answer"].strip()
     go_summary = extract_tagged_block(final_answer, GO_SUMMARY_START, GO_SUMMARY_END)
     function_summary = extract_tagged_block(final_answer, FUNCTION_SUMMARY_START, FUNCTION_SUMMARY_END)
+    go_summary_aspects = extract_go_aspect_map(go_summary)
+    final_answer_aspects = extract_go_aspect_map(final_answer)
     structural_noise_count = count_structural_noise_tokens(final_answer)
     final_answer_clean = bool(final_answer) and structural_noise_count == 0 and has_meaningful_text(final_answer)
 
@@ -156,7 +182,7 @@ def inspect_completion_text(raw_completion: str) -> Dict[str, Any]:
     if go_summary:
         prediction_source = "go_summary"
         prediction_text = go_summary
-    elif final_answer_clean:
+    elif has_meaningful_text(final_answer):
         prediction_source = "final_answer"
         prediction_text = final_answer
 
@@ -165,6 +191,10 @@ def inspect_completion_text(raw_completion: str) -> Dict[str, Any]:
         "final_answer": final_answer,
         "go_summary": go_summary,
         "function_summary": function_summary,
+        "go_summary_aspects": go_summary_aspects,
+        "go_summary_aspect_labels": list(go_summary_aspects.keys()),
+        "final_answer_aspects": final_answer_aspects,
+        "final_answer_aspect_labels": list(final_answer_aspects.keys()),
         "has_go_summary": bool(go_summary),
         "has_function_summary": bool(function_summary),
         "has_complete_summary_schema": bool(go_summary and function_summary and has_meaningful_text(function_summary)),
@@ -222,11 +252,16 @@ def answer_nonempty_reward(completion: str, _: Mapping[str, Any]) -> float:
     return 1.0 if inspect_completion(completion)["final_answer_clean"] else 0.0
 
 
-def summary_schema_reward(completion: str, _: Mapping[str, Any]) -> float:
+def summary_schema_reward(completion: str, sample_meta: Mapping[str, Any]) -> float:
     meta = inspect_completion(completion)
-    if meta["has_complete_summary_schema"] and meta["predicted_go_ids"]:
+    requested_aspects = set(build_requested_go_aspects(sample_meta))
+    predicted_aspects = set(meta["go_summary_aspect_labels"])
+    matched_aspects = predicted_aspects & requested_aspects
+    if meta["has_complete_summary_schema"] and meta["predicted_go_ids"] and matched_aspects == requested_aspects:
         return 1.0
-    if meta["has_go_summary"] and meta["predicted_go_ids"]:
+    if meta["has_complete_summary_schema"] and meta["predicted_go_ids"] and matched_aspects:
+        return 0.75
+    if meta["has_go_summary"] and meta["predicted_go_ids"] and matched_aspects:
         return 0.5
     return 0.0
 
@@ -236,6 +271,35 @@ def structural_noise_reward(completion: str, _: Mapping[str, Any]) -> float:
     if noise_count <= 0:
         return 0.0
     return -min(1.0, 0.25 * float(noise_count))
+
+
+def go_presence_reward(completion: str, sample_meta: Mapping[str, Any]) -> float:
+    meta = inspect_completion(completion)
+    predicted_go_ids = meta["predicted_go_ids"]
+    if predicted_go_ids:
+        return 1.0 if meta["has_go_summary"] else 0.5
+
+    if not build_target_go_ids(sample_meta):
+        return 0.0
+    if meta["final_answer_has_text"] or meta["reasoning"]:
+        return -1.0
+    return -0.5
+
+
+def go_aspect_coverage_reward(completion: str, sample_meta: Mapping[str, Any]) -> float:
+    meta = inspect_completion(completion)
+    requested_aspects = set(build_requested_go_aspects(sample_meta))
+    if not requested_aspects or not meta["predicted_go_ids"]:
+        return 0.0
+
+    predicted_aspects = set(meta["go_summary_aspect_labels"])
+    if not predicted_aspects:
+        return 0.0
+
+    matched_aspects = predicted_aspects & requested_aspects
+    if not matched_aspects:
+        return 0.0
+    return len(matched_aspects) / len(requested_aspects)
 
 
 def go_overlap_reward(completion: str, sample_meta: Mapping[str, Any]) -> float:
@@ -265,6 +329,8 @@ def build_reward_registry() -> Dict[str, Any]:
         "concise_reasoning": concise_reasoning_reward,
         "answer_nonempty": answer_nonempty_reward,
         "summary_schema": summary_schema_reward,
+        "go_presence": go_presence_reward,
+        "go_aspect_coverage": go_aspect_coverage_reward,
         "structural_noise": structural_noise_reward,
         "go_overlap": go_overlap_reward,
         "exact_go_set": exact_go_set_reward,
@@ -403,17 +469,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--top_k", type=int, default=20)
     parser.add_argument("--do_sample", type=str, default="true")
+    parser.add_argument("--eval_do_sample", type=str, default="false")
+    parser.add_argument("--eval_temperature", type=float, default=0.1)
+    parser.add_argument("--eval_top_p", type=float, default=0.9)
+    parser.add_argument("--eval_top_k", type=int, default=20)
     parser.add_argument("--kl_beta", type=float, default=0.02)
     parser.add_argument(
         "--reward_funcs",
         type=str,
-        default="strict_format,summary_schema,go_overlap,structural_noise",
+        default="strict_format,summary_schema,go_presence,go_aspect_coverage,go_overlap,structural_noise",
         help="Comma-separated reward function names.",
     )
     parser.add_argument(
         "--reward_weights",
         type=str,
-        default="0.5,0.75,2.0,1.0",
+        default="0.25,0.75,1.5,0.5,2.5,1.0",
         help="Optional comma-separated reward weights aligned with --reward_funcs.",
     )
 
@@ -445,6 +515,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "use_qlora",
         "bnb_4bit_use_double_quant",
         "do_sample",
+        "eval_do_sample",
         "ablation_from_paper_rl",
     ]
 
@@ -1256,10 +1327,10 @@ def evaluate_policy_example(
         batch_idx_map=example["batch_idx_map"],
         structure_coords=example["structure_coords"],
         go_aspects=example["go_aspects"],
-        do_sample=args.do_sample,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        top_k=args.top_k,
+        do_sample=args.eval_do_sample,
+        temperature=args.eval_temperature,
+        top_p=args.eval_top_p,
+        top_k=args.eval_top_k,
         min_new_tokens=args.min_new_tokens,
         max_new_tokens=args.max_new_tokens,
         pad_token_id=tokenizer.pad_token_id,
@@ -1351,10 +1422,10 @@ def evaluate_policy_batch(
         batch_idx_map=batch_idx_map,
         structure_coords=structure_coords,
         go_aspects=go_aspects,
-        do_sample=args.do_sample,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        top_k=args.top_k,
+        do_sample=args.eval_do_sample,
+        temperature=args.eval_temperature,
+        top_p=args.eval_top_p,
+        top_k=args.eval_top_k,
         min_new_tokens=args.min_new_tokens,
         max_new_tokens=args.max_new_tokens,
         pad_token_id=tokenizer.pad_token_id,
@@ -1577,11 +1648,15 @@ def maybe_trace_generation(
         "final_answer_go_ids": meta["final_answer_go_ids"],
         "completion_go_ids": meta["completion_go_ids"],
         "prediction_source": meta["prediction_source"],
+        "go_summary_aspect_labels": meta["go_summary_aspect_labels"],
+        "final_answer_aspect_labels": meta["final_answer_aspect_labels"],
         "has_go_summary": bool(meta["has_go_summary"]),
         "has_function_summary": bool(meta["has_function_summary"]),
         "has_complete_summary_schema": bool(meta["has_complete_summary_schema"]),
         "final_answer_clean": bool(meta["final_answer_clean"]),
         "structural_noise_count": int(meta["structural_noise_count"]),
+        "predicted_go_id_count": int(len(meta["predicted_go_ids"])),
+        "requested_go_aspects": build_requested_go_aspects(sample_meta),
         "target_go_ids": build_target_go_ids(sample_meta),
         "reward_total": float(total_reward),
         "advantage": None if advantage is None else float(advantage),

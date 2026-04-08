@@ -153,8 +153,12 @@ class TrainingTrackingContractsTest(unittest.TestCase):
             temperature=1.0,
             top_p=0.95,
             top_k=20,
-            reward_funcs="strict_format,summary_schema,go_overlap,structural_noise",
-            reward_weights="0.5,0.75,2.0,1.0",
+            eval_do_sample=False,
+            eval_temperature=0.1,
+            eval_top_p=0.9,
+            eval_top_k=20,
+            reward_funcs="strict_format,summary_schema,go_presence,go_aspect_coverage,go_overlap,structural_noise",
+            reward_weights="0.25,0.75,1.5,0.5,2.5,1.0",
             kl_beta=0.02,
             job_time_limit="12:00:00",
             training_stage=None,
@@ -181,8 +185,15 @@ class TrainingTrackingContractsTest(unittest.TestCase):
         self.assertEqual(config["max_new_tokens"], 512)
         self.assertEqual(config["temperature"], 1.0)
         self.assertEqual(config["top_k"], 20)
-        self.assertEqual(config["reward_funcs"], "strict_format,summary_schema,go_overlap,structural_noise")
-        self.assertEqual(config["reward_weights"], "0.5,0.75,2.0,1.0")
+        self.assertFalse(config["eval_do_sample"])
+        self.assertEqual(config["eval_temperature"], 0.1)
+        self.assertEqual(config["eval_top_p"], 0.9)
+        self.assertEqual(config["eval_top_k"], 20)
+        self.assertEqual(
+            config["reward_funcs"],
+            "strict_format,summary_schema,go_presence,go_aspect_coverage,go_overlap,structural_noise",
+        )
+        self.assertEqual(config["reward_weights"], "0.25,0.75,1.5,0.5,2.5,1.0")
         self.assertEqual(config["rotating_eval_every_n_steps"], 100)
         self.assertEqual(metadata["checkpoint_dir"], "data/artifacts/models/train_rl_output/demo")
 
