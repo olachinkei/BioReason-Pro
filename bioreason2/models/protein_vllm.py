@@ -16,6 +16,13 @@ from bioreason2.models.go_graph_encoder import create_go_graph_encoder_pipeline
 from bioreason2.models.special_tokens import get_all_special_tokens, get_token
 
 
+def _load_text_tokenizer(model_name: str, **kwargs):
+    try:
+        return AutoTokenizer.from_pretrained(model_name, fix_mistral_regex=True, **kwargs)
+    except TypeError:
+        return AutoTokenizer.from_pretrained(model_name, **kwargs)
+
+
 class ProteinLLMModel(nn.Module):
     """
     A combined model that processes both protein sequences and text inputs.
@@ -104,7 +111,7 @@ class ProteinLLMModel(nn.Module):
             dtype=self.dtype
         )
 
-        self.text_tokenizer = AutoTokenizer.from_pretrained(ckpt_dir, trust_remote_code=True)
+        self.text_tokenizer = _load_text_tokenizer(ckpt_dir, trust_remote_code=True)
         self.text_config = AutoConfig.from_pretrained(ckpt_dir, trust_remote_code=True)
         self.text_tokenizer.chat_template = get_chat_template(text_model_name)
         self.text_tokenizer.pad_token = self.text_tokenizer.eos_token
@@ -565,6 +572,7 @@ class ProteinLLMModel(nn.Module):
         sampling_params = SamplingParams(
             temperature=generation_kwargs.get("temperature", 0),
             top_p=generation_kwargs.get("top_p", 0.95),
+            top_k=generation_kwargs.get("top_k", -1),
             max_tokens=generation_kwargs.get("max_new_tokens", 1000),
             stop=generation_kwargs.get("stop", ["<|im_end|>"]) + ["- Hypothesized Interaction Partners"],
         )

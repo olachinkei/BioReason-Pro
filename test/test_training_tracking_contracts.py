@@ -133,12 +133,29 @@ class TrainingTrackingContractsTest(unittest.TestCase):
             seed=23,
             learning_rate=5e-6,
             batch_size=1,
+            train_batch_size=1,
+            eval_batch_size=4,
             gradient_accumulation_steps=1,
             max_epochs=1,
             validation_subset_size=None,
             validation_subset_strategy=None,
             max_eval_samples=100,
             eval_sample_strategy="stratified_aspect_profile",
+            max_eval_batches=0,
+            eval_every_n_steps=50,
+            save_every_n_steps=50,
+            rotating_eval_every_n_steps=100,
+            rotating_eval_max_samples=256,
+            rotating_eval_sample_strategy="stratified_aspect_profile",
+            rotating_eval_seed_stride=9973,
+            num_generations=8,
+            max_new_tokens=512,
+            temperature=1.0,
+            top_p=0.95,
+            top_k=20,
+            reward_funcs="strict_format,summary_schema,go_overlap,structural_noise",
+            reward_weights="0.5,0.75,2.0,1.0",
+            kl_beta=0.02,
             job_time_limit="12:00:00",
             training_stage=None,
             cafa5_dataset_name="disease_temporal_hc_reasoning_v1",
@@ -155,8 +172,18 @@ class TrainingTrackingContractsTest(unittest.TestCase):
         )
 
         self.assertEqual(config["output_dir"], "data/artifacts/models/train_rl_output/demo")
+        self.assertEqual(config["train_batch_size"], 1)
+        self.assertEqual(config["eval_batch_size"], 4)
         self.assertEqual(config["max_eval_samples"], 100)
         self.assertEqual(config["eval_sample_strategy"], "stratified_aspect_profile")
+        self.assertEqual(config["max_eval_batches"], 0)
+        self.assertEqual(config["num_generations"], 8)
+        self.assertEqual(config["max_new_tokens"], 512)
+        self.assertEqual(config["temperature"], 1.0)
+        self.assertEqual(config["top_k"], 20)
+        self.assertEqual(config["reward_funcs"], "strict_format,summary_schema,go_overlap,structural_noise")
+        self.assertEqual(config["reward_weights"], "0.5,0.75,2.0,1.0")
+        self.assertEqual(config["rotating_eval_every_n_steps"], 100)
         self.assertEqual(metadata["checkpoint_dir"], "data/artifacts/models/train_rl_output/demo")
 
     def test_build_sft_sample_row_is_one_row_per_sample(self):

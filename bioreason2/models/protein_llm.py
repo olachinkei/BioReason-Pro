@@ -19,6 +19,13 @@ from bioreason2.models.go_graph_encoder import create_go_graph_encoder_pipeline
 from bioreason2.models.special_tokens import get_all_special_tokens, get_token
 
 
+def _load_text_tokenizer(model_name: str, **kwargs):
+    try:
+        return AutoTokenizer.from_pretrained(model_name, fix_mistral_regex=True, **kwargs)
+    except TypeError:
+        return AutoTokenizer.from_pretrained(model_name, **kwargs)
+
+
 def _get_target_modules(model):
     """Get target modules for LoRA fine-tuning."""
     return [
@@ -134,7 +141,7 @@ class ProteinLLMModel(nn.Module):
                 text_model_name,
                 **text_model_kwargs
             )
-            self.text_tokenizer = AutoTokenizer.from_pretrained(
+            self.text_tokenizer = _load_text_tokenizer(
                 text_model_name,
                 cache_dir=cache_dir,
                 trust_remote_code=True,

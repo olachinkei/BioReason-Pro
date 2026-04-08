@@ -10,6 +10,7 @@ GO encoder, and reasoning dataset format intact.
 from __future__ import annotations
 
 import argparse
+from functools import lru_cache
 import importlib.util
 import json
 import math
@@ -30,6 +31,13 @@ except ImportError:  # pragma: no cover - optional dependency at runtime
 GO_ID_PATTERN = re.compile(r"GO:\d{7}")
 THINK_TAG_PATTERN = re.compile(r"<think>\s*(.*?)\s*</think>", re.DOTALL)
 ANSWER_TAG_PATTERN = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.DOTALL)
+STRUCTURAL_TAG_PATTERN = re.compile(r"</?(?:think|answer|tool_call)>")
+GO_SUMMARY_START = "<|GO_SUMMARY_START|>"
+GO_SUMMARY_END = "<|GO_SUMMARY_END|>"
+FUNCTION_SUMMARY_START = "<|FUNCTION_SUMMARY_START|>"
+FUNCTION_SUMMARY_END = "<|FUNCTION_SUMMARY_END|>"
+
+
 def normalize_text(value: Any) -> str:
     if value is None:
         return ""
@@ -88,6 +96,19 @@ def extract_go_ids(text: Any) -> List[str]:
     return ordered
 
 
+def extract_tagged_block(text: Any, start_marker: str, end_marker: str) -> str:
+    raw = normalize_text(text)
+    if not raw:
+        return ""
+    start_idx = raw.find(start_marker)
+    if start_idx < 0:
+        return ""
+    end_idx = raw.find(end_marker, start_idx + len(start_marker))
+    if end_idx < 0:
+        return ""
+    return raw[start_idx + len(start_marker) : end_idx].strip()
+
+
 def extract_reasoning_and_answer(text: Any) -> Dict[str, str]:
     raw = normalize_text(text).strip()
     if not raw:
@@ -113,6 +134,55 @@ def extract_reasoning_and_answer(text: Any) -> Dict[str, str]:
     return {"reasoning": reasoning, "final_answer": final_answer}
 
 
+def count_structural_noise_tokens(text: Any) -> int:
+    return len(STRUCTURAL_TAG_PATTERN.findall(normalize_text(text)))
+
+
+def has_meaningful_text(text: Any) -> bool:
+    return bool(re.search(r"[A-Za-z0-9]", normalize_text(text)))
+
+
+@lru_cache(maxsize=8192)
+def inspect_completion_text(raw_completion: str) -> Dict[str, Any]:
+    sections = extract_reasoning_and_answer(raw_completion)
+    final_answer = sections["final_answer"].strip()
+    go_summary = extract_tagged_block(final_answer, GO_SUMMARY_START, GO_SUMMARY_END)
+    function_summary = extract_tagged_block(final_answer, FUNCTION_SUMMARY_START, FUNCTION_SUMMARY_END)
+    structural_noise_count = count_structural_noise_tokens(final_answer)
+    final_answer_clean = bool(final_answer) and structural_noise_count == 0 and has_meaningful_text(final_answer)
+
+    prediction_source = "none"
+    prediction_text = ""
+    if go_summary:
+        prediction_source = "go_summary"
+        prediction_text = go_summary
+    elif final_answer_clean:
+        prediction_source = "final_answer"
+        prediction_text = final_answer
+
+    return {
+        "reasoning": sections["reasoning"],
+        "final_answer": final_answer,
+        "go_summary": go_summary,
+        "function_summary": function_summary,
+        "has_go_summary": bool(go_summary),
+        "has_function_summary": bool(function_summary),
+        "has_complete_summary_schema": bool(go_summary and function_summary and has_meaningful_text(function_summary)),
+        "final_answer_clean": final_answer_clean,
+        "final_answer_has_text": has_meaningful_text(final_answer),
+        "structural_noise_count": structural_noise_count,
+        "prediction_source": prediction_source,
+        "prediction_text": prediction_text,
+        "predicted_go_ids": extract_go_ids(prediction_text),
+        "final_answer_go_ids": extract_go_ids(final_answer),
+        "completion_go_ids": extract_go_ids(raw_completion),
+    }
+
+
+def inspect_completion(completion: Any) -> Dict[str, Any]:
+    return dict(inspect_completion_text(normalize_text(completion).strip()))
+
+
 def build_target_go_ids(sample_meta: Mapping[str, Any]) -> List[str]:
     targets: List[str] = []
     for key in ("go_bp", "go_mf", "go_cc", "ground_truth_go_terms"):
@@ -128,18 +198,16 @@ def build_target_go_ids(sample_meta: Mapping[str, Any]) -> List[str]:
 
 
 def strict_format_reward(completion: str, _: Mapping[str, Any]) -> float:
-    has_think = "<think>" in completion and "</think>" in completion
-    sections = extract_reasoning_and_answer(completion)
-    return 1.0 if has_think and sections["final_answer"] else 0.0
+    meta = inspect_completion(completion)
+    return 1.0 if meta["reasoning"] and meta["final_answer_clean"] else 0.0
 
 
 def reasoning_presence_reward(completion: str, _: Mapping[str, Any]) -> float:
-    reasoning = extract_reasoning_and_answer(completion)["reasoning"]
-    return 1.0 if reasoning else 0.0
+    return 1.0 if inspect_completion(completion)["reasoning"] else 0.0
 
 
 def concise_reasoning_reward(completion: str, _: Mapping[str, Any]) -> float:
-    reasoning = extract_reasoning_and_answer(completion)["reasoning"]
+    reasoning = inspect_completion(completion)["reasoning"]
     if not reasoning:
         return 0.0
     length = len(reasoning.split())
@@ -151,12 +219,27 @@ def concise_reasoning_reward(completion: str, _: Mapping[str, Any]) -> float:
 
 
 def answer_nonempty_reward(completion: str, _: Mapping[str, Any]) -> float:
-    final_answer = extract_reasoning_and_answer(completion)["final_answer"]
-    return 1.0 if final_answer else 0.0
+    return 1.0 if inspect_completion(completion)["final_answer_clean"] else 0.0
+
+
+def summary_schema_reward(completion: str, _: Mapping[str, Any]) -> float:
+    meta = inspect_completion(completion)
+    if meta["has_complete_summary_schema"] and meta["predicted_go_ids"]:
+        return 1.0
+    if meta["has_go_summary"] and meta["predicted_go_ids"]:
+        return 0.5
+    return 0.0
+
+
+def structural_noise_reward(completion: str, _: Mapping[str, Any]) -> float:
+    noise_count = inspect_completion(completion)["structural_noise_count"]
+    if noise_count <= 0:
+        return 0.0
+    return -min(1.0, 0.25 * float(noise_count))
 
 
 def go_overlap_reward(completion: str, sample_meta: Mapping[str, Any]) -> float:
-    predicted = set(extract_go_ids(completion))
+    predicted = set(inspect_completion(completion)["predicted_go_ids"])
     target = set(build_target_go_ids(sample_meta))
     if not predicted or not target:
         return 0.0
@@ -170,7 +253,7 @@ def go_overlap_reward(completion: str, sample_meta: Mapping[str, Any]) -> float:
 
 
 def exact_go_set_reward(completion: str, sample_meta: Mapping[str, Any]) -> float:
-    predicted = set(extract_go_ids(completion))
+    predicted = set(inspect_completion(completion)["predicted_go_ids"])
     target = set(build_target_go_ids(sample_meta))
     return 1.0 if predicted and predicted == target else 0.0
 
@@ -181,6 +264,8 @@ def build_reward_registry() -> Dict[str, Any]:
         "reasoning_presence": reasoning_presence_reward,
         "concise_reasoning": concise_reasoning_reward,
         "answer_nonempty": answer_nonempty_reward,
+        "summary_schema": summary_schema_reward,
+        "structural_noise": structural_noise_reward,
         "go_overlap": go_overlap_reward,
         "exact_go_set": exact_go_set_reward,
     }
@@ -284,41 +369,51 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--learning_rate", type=float, default=5e-6)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--train_batch_size", type=int, default=1)
-    parser.add_argument("--eval_batch_size", type=int, default=1)
+    parser.add_argument("--eval_batch_size", type=int, default=4)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--max_steps", type=int, default=200)
     parser.add_argument("--max_epochs", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--max_train_samples", type=int, default=-1)
-    parser.add_argument("--max_eval_samples", type=int, default=100)
+    parser.add_argument("--max_eval_samples", type=int, default=128)
     parser.add_argument(
         "--eval_sample_strategy",
         type=str,
         default="stratified_aspect_profile",
         choices=["stratified_aspect_profile", "shuffled_prefix"],
     )
-    parser.add_argument("--eval_every_n_steps", type=int, default=25)
+    parser.add_argument("--eval_every_n_steps", type=int, default=50)
     parser.add_argument("--save_every_n_steps", type=int, default=50)
-    parser.add_argument("--max_eval_batches", type=int, default=8)
+    parser.add_argument("--max_eval_batches", type=int, default=0)
+    parser.add_argument("--rotating_eval_every_n_steps", type=int, default=100)
+    parser.add_argument("--rotating_eval_max_samples", type=int, default=256)
+    parser.add_argument(
+        "--rotating_eval_sample_strategy",
+        type=str,
+        default="stratified_aspect_profile",
+        choices=["stratified_aspect_profile", "shuffled_prefix"],
+    )
+    parser.add_argument("--rotating_eval_seed_stride", type=int, default=9973)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
 
-    parser.add_argument("--num_generations", type=int, default=4)
+    parser.add_argument("--num_generations", type=int, default=8)
     parser.add_argument("--min_new_tokens", type=int, default=1)
-    parser.add_argument("--max_new_tokens", type=int, default=768)
-    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--max_new_tokens", type=int, default=512)
+    parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top_p", type=float, default=0.95)
+    parser.add_argument("--top_k", type=int, default=20)
     parser.add_argument("--do_sample", type=str, default="true")
     parser.add_argument("--kl_beta", type=float, default=0.02)
     parser.add_argument(
         "--reward_funcs",
         type=str,
-        default="strict_format,reasoning_presence,go_overlap,answer_nonempty",
+        default="strict_format,summary_schema,go_overlap,structural_noise",
         help="Comma-separated reward function names.",
     )
     parser.add_argument(
         "--reward_weights",
         type=str,
-        default="",
+        default="0.5,0.75,2.0,1.0",
         help="Optional comma-separated reward weights aligned with --reward_funcs.",
     )
 
@@ -508,11 +603,40 @@ def limit_dataset(dataset: Any, max_samples: int) -> Any:
     return dataset.select(range(max_samples))
 
 
-def load_rl_datasets(args: argparse.Namespace) -> Tuple[Any, Any]:
-    from bioreason2.dataset.cafa5.load import load_cafa5_dataset
+def select_validation_subset(
+    dataset: Any,
+    *,
+    max_samples: int,
+    seed: int,
+    strategy: str,
+    label: str,
+) -> Tuple[Any, Dict[str, Any]]:
     from bioreason2.dataset.cafa5.subset import select_dataset_subset
 
-    train_dataset, val_dataset, _ = load_cafa5_dataset(
+    subset, subset_summary = select_dataset_subset(
+        dataset,
+        max_samples=max_samples,
+        seed=seed,
+        strategy=strategy,
+    )
+    print(
+        f"Using RL {label} validation subset: "
+        f"strategy={subset_summary['strategy']}, "
+        f"seed={seed}, "
+        f"requested={subset_summary['requested_samples']}, "
+        f"selected={subset_summary['selected_samples']}"
+    )
+    if subset_summary.get("group_counts"):
+        print(f"RL {label} validation group counts: {subset_summary['group_counts']}")
+    if subset_summary.get("aspect_coverage"):
+        print(f"RL {label} validation aspect coverage: {subset_summary['aspect_coverage']}")
+    return subset, subset_summary
+
+
+def load_rl_datasets(args: argparse.Namespace) -> Tuple[Any, Any, Any]:
+    from bioreason2.dataset.cafa5.load import load_cafa5_dataset
+
+    train_dataset, full_val_dataset, _ = load_cafa5_dataset(
         dataset=args.cafa5_dataset,
         dataset_name=args.cafa5_dataset_name,
         max_length=args.max_length_protein,
@@ -536,23 +660,14 @@ def load_rl_datasets(args: argparse.Namespace) -> Tuple[Any, Any]:
         return_as_chat_template=True,
     )
     train_dataset = limit_dataset(train_dataset, args.max_train_samples)
-    val_dataset, subset_summary = select_dataset_subset(
-        val_dataset,
+    fixed_val_dataset, _ = select_validation_subset(
+        full_val_dataset,
         max_samples=args.max_eval_samples,
         seed=args.seed,
         strategy=args.eval_sample_strategy,
+        label="fixed",
     )
-    print(
-        "Using RL validation subset: "
-        f"strategy={subset_summary['strategy']}, "
-        f"requested={subset_summary['requested_samples']}, "
-        f"selected={subset_summary['selected_samples']}"
-    )
-    if subset_summary.get("group_counts"):
-        print(f"RL validation subset group counts: {subset_summary['group_counts']}")
-    if subset_summary.get("aspect_coverage"):
-        print(f"RL validation subset aspect coverage: {subset_summary['aspect_coverage']}")
-    return train_dataset, val_dataset
+    return train_dataset, fixed_val_dataset, full_val_dataset
 
 
 def build_dataloader(dataset: Any, model: Any, batch_size: int, num_workers: int, shuffle: bool) -> Any:
@@ -625,6 +740,40 @@ def extract_example_from_batch(batch: Mapping[str, Any], example_idx: int, devic
     }
 
 
+def expand_example_for_rollouts(example: Mapping[str, Any], rollout_count: int) -> Dict[str, Any]:
+    import torch
+
+    if rollout_count <= 0:
+        raise ValueError(f"rollout_count must be positive, got {rollout_count}")
+
+    input_ids = example["input_ids"].repeat(rollout_count, 1)
+    attention_mask = example["attention_mask"].repeat(rollout_count, 1)
+
+    structure_coords = example.get("structure_coords")
+    if isinstance(structure_coords, torch.Tensor):
+        repeat_dims = [rollout_count] + [1] * max(structure_coords.dim() - 1, 0)
+        structure_coords = structure_coords.repeat(*repeat_dims)
+
+    base_sequences = list(example.get("protein_sequences") or [])
+    protein_sequences: List[str] = []
+    batch_idx_map: List[int] = []
+    for rollout_idx in range(rollout_count):
+        protein_sequences.extend(base_sequences)
+        batch_idx_map.extend([rollout_idx] * len(base_sequences))
+
+    base_go_aspects = list(example.get("go_aspects") or [])
+    rollout_go_aspect = base_go_aspects[0] if base_go_aspects else "all"
+
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "protein_sequences": protein_sequences,
+        "batch_idx_map": batch_idx_map,
+        "structure_coords": structure_coords,
+        "go_aspects": [rollout_go_aspect] * rollout_count,
+    }
+
+
 def decode_completion(tokenizer: Any, completion_ids: Any) -> str:
     text = tokenizer.decode(completion_ids, skip_special_tokens=False).strip()
     for marker in ("<|im_end|>", "<|endoftext|>"):
@@ -683,6 +832,55 @@ def extract_completion_ids_batch(generated_ids: Any, prompt_input_ids: Any) -> L
         else:
             completions.append(generated_tokens.detach())
     return completions
+
+
+def build_rollout_group_inputs(
+    example: Mapping[str, Any],
+    completion_ids_list: Sequence[Any],
+    pad_token_id: int,
+) -> Dict[str, Any]:
+    import torch
+
+    rollout_count = len(completion_ids_list)
+    if rollout_count <= 0:
+        raise ValueError("completion_ids_list must not be empty")
+
+    expanded_example = expand_example_for_rollouts(example, rollout_count)
+    prompt_input_ids = expanded_example["input_ids"]
+    prompt_attention_mask = expanded_example["attention_mask"]
+    max_completion_len = max((int(completion_ids.numel()) for completion_ids in completion_ids_list), default=0)
+    completion_batch = torch.full(
+        (rollout_count, max_completion_len),
+        int(pad_token_id),
+        dtype=prompt_input_ids.dtype,
+        device=prompt_input_ids.device,
+    )
+    completion_attention = torch.zeros(
+        (rollout_count, max_completion_len),
+        dtype=prompt_attention_mask.dtype,
+        device=prompt_attention_mask.device,
+    )
+
+    for rollout_idx, completion_ids in enumerate(completion_ids_list):
+        completion_len = int(completion_ids.numel())
+        if completion_len <= 0:
+            continue
+        completion_tensor = completion_ids.to(device=prompt_input_ids.device, dtype=prompt_input_ids.dtype)
+        completion_batch[rollout_idx, :completion_len] = completion_tensor
+        completion_attention[rollout_idx, :completion_len] = 1
+
+    combined_input_ids = torch.cat([prompt_input_ids, completion_batch], dim=1)
+    combined_attention_mask = torch.cat([prompt_attention_mask, completion_attention], dim=1)
+    return {
+        "combined_input_ids": combined_input_ids,
+        "combined_attention_mask": combined_attention_mask,
+        "completion_attention": completion_attention,
+        "prompt_token_len": prompt_input_ids.shape[1],
+        "protein_sequences": expanded_example["protein_sequences"],
+        "batch_idx_map": expanded_example["batch_idx_map"],
+        "structure_coords": expanded_example["structure_coords"],
+        "go_aspects": expanded_example["go_aspects"],
+    }
 
 
 def build_combined_inputs(prompt_input_ids: Any, prompt_attention_mask: Any, completion_ids: Any) -> Tuple[Any, Any, int]:
@@ -803,6 +1001,240 @@ def compute_batched_completion_kl(
     return float(per_example_kl[valid_counts > 0].sum().item())
 
 
+def compute_group_policy_losses_batched(
+    model: Any,
+    ref_model: Any,
+    example: Mapping[str, Any],
+    completion_ids_list: Sequence[Any],
+    advantages: Sequence[float],
+    pad_token_id: int,
+    kl_beta: float,
+) -> Tuple[List[Any], List[float], bool]:
+    import torch
+
+    rollout_group = build_rollout_group_inputs(example, completion_ids_list, pad_token_id)
+    valid_mask = rollout_group["completion_attention"].bool()
+    nonempty_rollouts = valid_mask.any(dim=1)
+    if not torch.any(nonempty_rollouts):
+        return [], [], False
+
+    current_log_probs = compute_completion_token_log_probs(
+        model,
+        rollout_group["combined_input_ids"],
+        rollout_group["combined_attention_mask"],
+        rollout_group["prompt_token_len"],
+        rollout_group["protein_sequences"],
+        rollout_group["batch_idx_map"],
+        rollout_group["structure_coords"],
+        rollout_group["go_aspects"],
+    )
+
+    with torch.no_grad():
+        if ref_model is not None:
+            ref_log_probs = compute_completion_token_log_probs(
+                ref_model,
+                rollout_group["combined_input_ids"],
+                rollout_group["combined_attention_mask"],
+                rollout_group["prompt_token_len"],
+                rollout_group["protein_sequences"],
+                rollout_group["batch_idx_map"],
+                rollout_group["structure_coords"],
+                rollout_group["go_aspects"],
+            )
+        else:
+            ref_log_probs = torch.zeros_like(current_log_probs)
+
+    token_mask = rollout_group["completion_attention"].to(
+        device=current_log_probs.device,
+        dtype=current_log_probs.dtype,
+    )
+    valid_counts = token_mask.sum(dim=1).clamp_min(1.0)
+    advantage_tensor = torch.tensor(
+        list(advantages),
+        device=current_log_probs.device,
+        dtype=current_log_probs.dtype,
+    ).unsqueeze(1)
+    log_ratio = current_log_probs - current_log_probs.detach()
+    policy_term = torch.exp(log_ratio) * advantage_tensor
+    kl_term = torch.exp(ref_log_probs - current_log_probs) - (ref_log_probs - current_log_probs) - 1.0
+    per_rollout_loss = -((policy_term - kl_beta * kl_term) * token_mask).sum(dim=1) / valid_counts
+    per_rollout_kl = ((kl_term * token_mask).sum(dim=1) / valid_counts)[nonempty_rollouts]
+    return (
+        list(per_rollout_loss[nonempty_rollouts].unbind()),
+        [float(value.detach().item()) for value in per_rollout_kl],
+        True,
+    )
+
+
+def compute_group_policy_losses_sequential(
+    model: Any,
+    ref_model: Any,
+    example: Mapping[str, Any],
+    completion_ids_list: Sequence[Any],
+    advantages: Sequence[float],
+    kl_beta: float,
+) -> Tuple[List[Any], List[float], bool]:
+    import torch
+
+    losses: List[Any] = []
+    kl_values: List[float] = []
+    trainable = False
+    for completion_ids, advantage in zip(completion_ids_list, advantages):
+        if completion_ids.numel() <= 0:
+            continue
+        trainable = True
+        combined_ids, combined_mask, prompt_token_len = build_combined_inputs(
+            example["input_ids"],
+            example["attention_mask"],
+            completion_ids,
+        )
+        current_log_probs = compute_completion_token_log_probs(
+            model,
+            combined_ids,
+            combined_mask,
+            prompt_token_len,
+            example["protein_sequences"],
+            example["batch_idx_map"],
+            example["structure_coords"],
+            example["go_aspects"],
+        )
+        with torch.no_grad():
+            if ref_model is not None:
+                ref_log_probs = compute_completion_token_log_probs(
+                    ref_model,
+                    combined_ids,
+                    combined_mask,
+                    prompt_token_len,
+                    example["protein_sequences"],
+                    example["batch_idx_map"],
+                    example["structure_coords"],
+                    example["go_aspects"],
+                )
+            else:
+                ref_log_probs = torch.zeros_like(current_log_probs)
+
+        log_ratio = current_log_probs - current_log_probs.detach()
+        policy_term = torch.exp(log_ratio) * float(advantage)
+        kl_term = torch.exp(ref_log_probs - current_log_probs) - (ref_log_probs - current_log_probs) - 1.0
+        losses.append(-(policy_term - kl_beta * kl_term).mean())
+        kl_values.append(float(kl_term.mean().detach().item()))
+
+    return losses, kl_values, trainable
+
+
+def generate_rollouts_sequential(
+    model: Any,
+    example: Mapping[str, Any],
+    tokenizer: Any,
+    args: argparse.Namespace,
+    *,
+    global_step: int,
+    epoch_idx: int,
+    prompt_len: int,
+) -> Tuple[List[Any], List[str]]:
+    completion_ids_list: List[Any] = []
+    completions: List[str] = []
+    for rollout_idx in range(args.num_generations):
+        print(
+            "Generating RL rollout: "
+            f"global_step={global_step}, epoch={epoch_idx}, rollout_idx={rollout_idx}, "
+            f"prompt_len={prompt_len}, max_new_tokens={args.max_new_tokens}"
+        )
+        generated_ids = model.generate(
+            input_ids=example["input_ids"],
+            attention_mask=example["attention_mask"],
+            protein_sequences=example["protein_sequences"],
+            batch_idx_map=example["batch_idx_map"],
+            structure_coords=example["structure_coords"],
+            go_aspects=example["go_aspects"],
+            do_sample=args.do_sample,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            min_new_tokens=args.min_new_tokens,
+            max_new_tokens=args.max_new_tokens,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+        completion_ids = extract_completion_ids(generated_ids, example["input_ids"])
+        print(
+            "Completed RL rollout generation: "
+            f"global_step={global_step}, rollout_idx={rollout_idx}, completion_tokens={completion_ids.numel()}"
+        )
+        completion_ids_list.append(completion_ids)
+        completions.append(decode_completion(tokenizer, completion_ids))
+    return completion_ids_list, completions
+
+
+def generate_rollouts_for_example(
+    model: Any,
+    example: Mapping[str, Any],
+    tokenizer: Any,
+    args: argparse.Namespace,
+    *,
+    global_step: int,
+    epoch_idx: int,
+) -> Tuple[List[Any], List[str]]:
+    import torch
+
+    prompt_len = example["input_ids"].shape[1]
+    rollout_batch = expand_example_for_rollouts(example, args.num_generations)
+    try:
+        print(
+            "Generating RL rollout batch: "
+            f"global_step={global_step}, epoch={epoch_idx}, num_generations={args.num_generations}, "
+            f"prompt_len={prompt_len}, max_new_tokens={args.max_new_tokens}"
+        )
+        generated_ids = model.generate(
+            input_ids=rollout_batch["input_ids"],
+            attention_mask=rollout_batch["attention_mask"],
+            protein_sequences=rollout_batch["protein_sequences"],
+            batch_idx_map=rollout_batch["batch_idx_map"],
+            structure_coords=rollout_batch["structure_coords"],
+            go_aspects=rollout_batch["go_aspects"],
+            do_sample=args.do_sample,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            min_new_tokens=args.min_new_tokens,
+            max_new_tokens=args.max_new_tokens,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+        completion_ids_list = extract_completion_ids_batch(generated_ids, rollout_batch["input_ids"])
+        print(
+            "Completed RL rollout batch generation: "
+            f"global_step={global_step}, num_generations={args.num_generations}, "
+            f"completion_tokens={[int(completion_ids.numel()) for completion_ids in completion_ids_list]}"
+        )
+        return completion_ids_list, [decode_completion(tokenizer, completion_ids) for completion_ids in completion_ids_list]
+    except torch.cuda.OutOfMemoryError:
+        print(
+            f"CUDA Out of Memory while generating {args.num_generations} RL rollouts in one batch; "
+            "falling back to sequential rollout generation for this prompt."
+        )
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception as exc:
+        print(
+            f"Batched RL rollout generation failed for num_generations={args.num_generations}: {exc}. "
+            "Falling back to sequential rollout generation for this prompt."
+        )
+        traceback.print_exc()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    return generate_rollouts_sequential(
+        model,
+        example,
+        tokenizer,
+        args,
+        global_step=global_step,
+        epoch_idx=epoch_idx,
+        prompt_len=prompt_len,
+    )
+
+
 def evaluate_policy_example(
     model: Any,
     ref_model: Any,
@@ -813,6 +1245,7 @@ def evaluate_policy_example(
     reward_weights: Sequence[float],
     trace_state: Optional[Dict[str, Any]] = None,
     global_step: int = 0,
+    trace_split_name: str = "validation",
 ) -> Dict[str, float]:
     import torch
 
@@ -826,6 +1259,7 @@ def evaluate_policy_example(
         do_sample=args.do_sample,
         temperature=args.temperature,
         top_p=args.top_p,
+        top_k=args.top_k,
         min_new_tokens=args.min_new_tokens,
         max_new_tokens=args.max_new_tokens,
         pad_token_id=tokenizer.pad_token_id,
@@ -833,15 +1267,16 @@ def evaluate_policy_example(
     )
     completion_ids = extract_completion_ids(generated_ids, example["input_ids"])
     completion_text = decode_completion(tokenizer, completion_ids)
-    rewards, _ = compute_group_rewards([completion_text], example["sample_meta"], reward_names, reward_weights)
+    rewards, reward_components = compute_group_rewards([completion_text], example["sample_meta"], reward_names, reward_weights)
     maybe_trace_generation(
         trace_state,
-        split="validation",
+        split=trace_split_name,
         global_step=global_step,
         sample_meta=example["sample_meta"],
         completion=completion_text,
         total_reward=rewards[0],
         advantage=None,
+        reward_components={name: scores[0] for name, scores in reward_components.items()},
     )
 
     kl_value = 0.0
@@ -893,6 +1328,7 @@ def evaluate_policy_batch(
     device: Any,
     trace_state: Optional[Dict[str, Any]] = None,
     global_step: int = 0,
+    trace_split_name: str = "validation",
 ) -> Dict[str, float]:
     import torch
 
@@ -918,6 +1354,7 @@ def evaluate_policy_batch(
         do_sample=args.do_sample,
         temperature=args.temperature,
         top_p=args.top_p,
+        top_k=args.top_k,
         min_new_tokens=args.min_new_tokens,
         max_new_tokens=args.max_new_tokens,
         pad_token_id=tokenizer.pad_token_id,
@@ -930,17 +1367,18 @@ def evaluate_policy_batch(
     for example_idx, completion_ids in enumerate(completion_ids_list):
         completion_text = decode_completion(tokenizer, completion_ids)
         sample_meta = extract_sample_meta_from_batch(batch, example_idx)
-        rewards, _ = compute_group_rewards([completion_text], sample_meta, reward_names, reward_weights)
+        rewards, reward_components = compute_group_rewards([completion_text], sample_meta, reward_names, reward_weights)
         reward_sum += float(rewards[0])
         length_sum += float(completion_ids.numel())
         maybe_trace_generation(
             trace_state,
-            split="validation",
+            split=trace_split_name,
             global_step=global_step,
             sample_meta=sample_meta,
             completion=completion_text,
             total_reward=rewards[0],
             advantage=None,
+            reward_components={name: scores[0] for name, scores in reward_components.items()},
         )
 
     pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
@@ -1119,12 +1557,13 @@ def maybe_trace_generation(
     completion: str,
     total_reward: float,
     advantage: Optional[float] = None,
+    reward_components: Optional[Mapping[str, float]] = None,
 ) -> None:
     if not trace_state or trace_state.get("remaining_budget", 0) <= 0:
         return
 
     trace_state["remaining_budget"] -= 1
-    sections = extract_reasoning_and_answer(completion)
+    meta = inspect_completion(completion)
     payload = {
         "split": split,
         "global_step": int(global_step),
@@ -1132,12 +1571,21 @@ def maybe_trace_generation(
         "go_aspect": normalize_text(sample_meta.get("go_aspect")),
         "prompt_preview": normalize_text(sample_meta.get("prompt_preview"))[:512],
         "completion": completion,
-        "reasoning": sections["reasoning"],
-        "final_answer": sections["final_answer"],
-        "predicted_go_ids": extract_go_ids(completion),
+        "reasoning": meta["reasoning"],
+        "final_answer": meta["final_answer"],
+        "predicted_go_ids": meta["predicted_go_ids"],
+        "final_answer_go_ids": meta["final_answer_go_ids"],
+        "completion_go_ids": meta["completion_go_ids"],
+        "prediction_source": meta["prediction_source"],
+        "has_go_summary": bool(meta["has_go_summary"]),
+        "has_function_summary": bool(meta["has_function_summary"]),
+        "has_complete_summary_schema": bool(meta["has_complete_summary_schema"]),
+        "final_answer_clean": bool(meta["final_answer_clean"]),
+        "structural_noise_count": int(meta["structural_noise_count"]),
         "target_go_ids": build_target_go_ids(sample_meta),
         "reward_total": float(total_reward),
         "advantage": None if advantage is None else float(advantage),
+        "reward_components": dict(reward_components or {}),
     }
     trace_state["trace_generation"](payload)
     trace_state["logged"] += 1
@@ -1154,6 +1602,7 @@ def evaluate_policy(
     device: Any,
     trace_state: Optional[Dict[str, Any]] = None,
     global_step: int = 0,
+    trace_split_name: str = "validation",
 ) -> Dict[str, float]:
     import torch
 
@@ -1186,6 +1635,7 @@ def evaluate_policy(
                         device=device,
                         trace_state=trace_state,
                         global_step=global_step,
+                        trace_split_name=trace_split_name,
                     )
                 except torch.cuda.OutOfMemoryError:
                     print(
@@ -1214,6 +1664,7 @@ def evaluate_policy(
                     device=device,
                     trace_state=trace_state,
                     global_step=global_step,
+                    trace_split_name=trace_split_name,
                 )
 
             if batch_metrics is not None:
@@ -1235,6 +1686,7 @@ def evaluate_policy(
                     reward_weights=reward_weights,
                     trace_state=trace_state,
                     global_step=global_step,
+                    trace_split_name=trace_split_name,
                 )
                 total_reward += example_metrics["reward_sum"]
                 total_length += example_metrics["length_sum"]
@@ -1255,6 +1707,54 @@ def evaluate_policy(
         "eval_loss_kl_div": total_kl / sample_count if sample_count else 0.0,
         "eval_data_step_num_datums": float(sample_count),
     }
+
+
+def maybe_run_rotating_validation_eval(
+    model: Any,
+    ref_model: Any,
+    full_val_dataset: Any,
+    tokenizer: Any,
+    args: argparse.Namespace,
+    reward_names: Sequence[str],
+    reward_weights: Sequence[float],
+    device: Any,
+    trace_state: Optional[Dict[str, Any]],
+    global_step: int,
+    wandb_run: Any,
+) -> Optional[Dict[str, float]]:
+    if args.rotating_eval_every_n_steps <= 0 or global_step % args.rotating_eval_every_n_steps != 0:
+        return None
+
+    rotating_seed = args.seed + global_step * max(args.rotating_eval_seed_stride, 1)
+    rotating_dataset, _ = select_validation_subset(
+        full_val_dataset,
+        max_samples=args.rotating_eval_max_samples,
+        seed=rotating_seed,
+        strategy=args.rotating_eval_sample_strategy,
+        label="rotating",
+    )
+    rotating_loader = build_dataloader(rotating_dataset, model, args.eval_batch_size, args.num_workers, shuffle=False)
+    print(f"Starting rotating RL validation eval at global_step={global_step} with seed={rotating_seed}.")
+    rotating_metrics = evaluate_policy(
+        model=model,
+        ref_model=ref_model,
+        dataloader=rotating_loader,
+        tokenizer=tokenizer,
+        args=args,
+        reward_names=reward_names,
+        reward_weights=reward_weights,
+        device=device,
+        trace_state=trace_state,
+        global_step=global_step,
+        trace_split_name="validation_rotating",
+    )
+    rotating_metrics = {f"rotating_{key}": value for key, value in rotating_metrics.items()}
+    rotating_metrics["rotating_eval_subset_seed"] = float(rotating_seed)
+    rotating_metrics["rotating_eval_selected_samples"] = float(len(rotating_dataset))
+    if wandb_run is not None:
+        wandb_run.log(rotating_metrics, step=global_step)
+        print(f"Rotating RL validation metrics logged at global_step={global_step}.")
+    return rotating_metrics
 
 
 def train(args: argparse.Namespace) -> None:
@@ -1291,9 +1791,9 @@ def train(args: argparse.Namespace) -> None:
     model = instantiate_model(args, trainable=True).to(device)
     ref_model = instantiate_model(args, trainable=False).to(device) if args.kl_beta > 0 else None
 
-    train_dataset, val_dataset = load_rl_datasets(args)
+    train_dataset, fixed_val_dataset, full_val_dataset = load_rl_datasets(args)
     train_loader = build_dataloader(train_dataset, model, args.train_batch_size, args.num_workers, shuffle=True)
-    val_loader = build_dataloader(val_dataset, model, args.eval_batch_size, args.num_workers, shuffle=False)
+    val_loader = build_dataloader(fixed_val_dataset, model, args.eval_batch_size, args.num_workers, shuffle=False)
 
     tokenizer = model.text_tokenizer
     reward_names = parse_csv_items(args.reward_funcs)
@@ -1319,7 +1819,8 @@ def train(args: argparse.Namespace) -> None:
             wandb_run,
             {
                 "dataset_train_size": len(train_dataset),
-                "dataset_validation_size": len(val_dataset),
+                "dataset_validation_size": len(fixed_val_dataset),
+                "dataset_validation_full_size": len(full_val_dataset),
             },
         )
         maybe_use_artifact_refs(
@@ -1356,54 +1857,35 @@ def train(args: argparse.Namespace) -> None:
             sample_losses: List[Any] = []
             reward_totals: List[float] = []
             reward_stds: List[float] = []
+            reward_component_scores: Dict[str, List[float]] = {reward_name: [] for reward_name in reward_names}
             completion_lengths: List[int] = []
             kl_values: List[float] = []
             trainable_group_count = 0
+            pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
 
             for example_idx in range(batch_size):
                 example = extract_example_from_batch(batch, example_idx, device)
-                prompt_len = example["input_ids"].shape[1]
 
                 model.eval()
-                completions: List[str] = []
-                completion_ids_list: List[Any] = []
-                for _ in range(args.num_generations):
-                    print(
-                        "Generating RL rollout: "
-                        f"global_step={global_step}, epoch={epoch_idx}, prompt_len={prompt_len}, "
-                        f"max_new_tokens={args.max_new_tokens}"
-                    )
-                    generated_ids = model.generate(
-                        input_ids=example["input_ids"],
-                        attention_mask=example["attention_mask"],
-                        protein_sequences=example["protein_sequences"],
-                        batch_idx_map=example["batch_idx_map"],
-                        structure_coords=example["structure_coords"],
-                        go_aspects=example["go_aspects"],
-                        do_sample=args.do_sample,
-                        temperature=args.temperature,
-                        top_p=args.top_p,
-                        min_new_tokens=args.min_new_tokens,
-                        max_new_tokens=args.max_new_tokens,
-                        pad_token_id=tokenizer.pad_token_id,
-                        eos_token_id=tokenizer.eos_token_id,
-                    )
-                    completion_ids = extract_completion_ids(generated_ids, example["input_ids"])
-                    print(
-                        "Completed RL rollout generation: "
-                        f"global_step={global_step}, completion_tokens={completion_ids.numel()}"
-                    )
-                    completion_ids_list.append(completion_ids)
-                    completions.append(decode_completion(tokenizer, completion_ids))
-                    completion_lengths.append(int(completion_ids.numel()))
+                completion_ids_list, completions = generate_rollouts_for_example(
+                    model,
+                    example,
+                    tokenizer,
+                    args,
+                    global_step=global_step,
+                    epoch_idx=epoch_idx,
+                )
                 model.train()
+                completion_lengths.extend(int(completion_ids.numel()) for completion_ids in completion_ids_list)
 
-                total_rewards, _ = compute_group_rewards(
+                total_rewards, reward_components = compute_group_rewards(
                     completions,
                     example["sample_meta"],
                     reward_names,
                     reward_weights,
                 )
+                for reward_name, scores in reward_components.items():
+                    reward_component_scores.setdefault(reward_name, []).extend(scores)
                 advantages = standardize_group_rewards(total_rewards)
                 reward_totals.extend(total_rewards)
                 if len(total_rewards) > 1:
@@ -1411,62 +1893,55 @@ def train(args: argparse.Namespace) -> None:
                 else:
                     reward_stds.append(0.0)
 
-                for generation_idx, (completion_ids, completion_text, total_reward, advantage) in enumerate(
-                    zip(completion_ids_list, completions, total_rewards, advantages)
+                for generation_idx, (completion_text, total_reward, advantage) in enumerate(
+                    zip(completions, total_rewards, advantages)
                 ):
-                    if generation_idx == 0:
-                        maybe_trace_generation(
-                            weave_trace_state,
-                            split="train",
-                            global_step=global_step,
-                            sample_meta=example["sample_meta"],
-                            completion=completion_text,
-                            total_reward=total_reward,
-                            advantage=advantage,
-                        )
-                    if completion_ids.numel() == 0:
+                    if generation_idx != 0:
                         continue
-
-                    if generation_idx == 0:
-                        trainable_group_count += 1
-
-                    combined_ids, combined_mask, prompt_token_len = build_combined_inputs(
-                        example["input_ids"],
-                        example["attention_mask"],
-                        completion_ids,
+                    maybe_trace_generation(
+                        weave_trace_state,
+                        split="train",
+                        global_step=global_step,
+                        sample_meta=example["sample_meta"],
+                        completion=completion_text,
+                        total_reward=total_reward,
+                        advantage=advantage,
+                        reward_components={
+                            reward_name: reward_components[reward_name][generation_idx]
+                            for reward_name in reward_components
+                        },
                     )
-                    current_log_probs = compute_completion_token_log_probs(
+
+                try:
+                    rollout_losses, rollout_kls, has_trainable_rollout = compute_group_policy_losses_batched(
                         model,
-                        combined_ids,
-                        combined_mask,
-                        prompt_token_len,
-                        example["protein_sequences"],
-                        example["batch_idx_map"],
-                        example["structure_coords"],
-                        example["go_aspects"],
+                        ref_model,
+                        example,
+                        completion_ids_list,
+                        advantages,
+                        pad_token_id,
+                        args.kl_beta,
+                    )
+                except torch.cuda.OutOfMemoryError:
+                    print(
+                        "CUDA Out of Memory during batched RL loss computation; "
+                        "falling back to sequential rollout loss computation for this prompt."
+                    )
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    rollout_losses, rollout_kls, has_trainable_rollout = compute_group_policy_losses_sequential(
+                        model,
+                        ref_model,
+                        example,
+                        completion_ids_list,
+                        advantages,
+                        args.kl_beta,
                     )
 
-                    with torch.no_grad():
-                        if ref_model is not None:
-                            ref_log_probs = compute_completion_token_log_probs(
-                                ref_model,
-                                combined_ids,
-                                combined_mask,
-                                prompt_token_len,
-                                example["protein_sequences"],
-                                example["batch_idx_map"],
-                                example["structure_coords"],
-                                example["go_aspects"],
-                            )
-                        else:
-                            ref_log_probs = torch.zeros_like(current_log_probs)
-
-                    log_ratio = current_log_probs - current_log_probs.detach()
-                    policy_term = torch.exp(log_ratio) * float(advantage)
-                    kl_term = torch.exp(ref_log_probs - current_log_probs) - (ref_log_probs - current_log_probs) - 1.0
-                    sample_loss = -(policy_term - args.kl_beta * kl_term).mean()
-                    sample_losses.append(sample_loss)
-                    kl_values.append(float(kl_term.mean().detach().item()))
+                if has_trainable_rollout:
+                    trainable_group_count += 1
+                    sample_losses.extend(rollout_losses)
+                    kl_values.extend(rollout_kls)
 
             if not sample_losses:
                 global_step += 1
@@ -1497,6 +1972,7 @@ def train(args: argparse.Namespace) -> None:
                         device=device,
                         trace_state=weave_trace_state,
                         global_step=global_step,
+                        trace_split_name="validation_fixed",
                     )
                     if wandb_run is not None:
                         wandb_run.log(val_metrics, step=global_step)
@@ -1505,6 +1981,19 @@ def train(args: argparse.Namespace) -> None:
                     if val_metrics["eval_reward"] > best_val_reward:
                         best_val_reward = val_metrics["eval_reward"]
                         save_raw_checkpoint(model, raw_checkpoint_dir / "best", global_step, args)
+                    maybe_run_rotating_validation_eval(
+                        model=model,
+                        ref_model=ref_model,
+                        full_val_dataset=full_val_dataset,
+                        tokenizer=tokenizer,
+                        args=args,
+                        reward_names=reward_names,
+                        reward_weights=reward_weights,
+                        device=device,
+                        trace_state=weave_trace_state,
+                        global_step=global_step,
+                        wandb_run=wandb_run,
+                    )
 
                 if args.save_every_n_steps > 0 and global_step % args.save_every_n_steps == 0:
                     save_raw_checkpoint(model, raw_checkpoint_dir, global_step, args)
@@ -1543,6 +2032,10 @@ def train(args: argparse.Namespace) -> None:
                 "data_step_trainer_tokens": float(sum(completion_lengths)),
                 "train_skipped_update": 0.0,
             }
+            for reward_name, scores in reward_component_scores.items():
+                if not scores:
+                    continue
+                log_payload[f"reward_component/{reward_name}"] = sum(scores) / len(scores)
             if wandb_run is not None:
                 print(f"Logging RL train metrics at global_step={global_step}.")
                 wandb_run.log(log_payload, step=global_step)
@@ -1561,6 +2054,7 @@ def train(args: argparse.Namespace) -> None:
                     device=device,
                     trace_state=weave_trace_state,
                     global_step=global_step,
+                    trace_split_name="validation_fixed",
                 )
                 if wandb_run is not None:
                     wandb_run.log(val_metrics, step=global_step)
@@ -1569,6 +2063,19 @@ def train(args: argparse.Namespace) -> None:
                 if val_metrics["eval_reward"] > best_val_reward:
                     best_val_reward = val_metrics["eval_reward"]
                     save_raw_checkpoint(model, raw_checkpoint_dir / "best", global_step, args)
+                maybe_run_rotating_validation_eval(
+                    model=model,
+                    ref_model=ref_model,
+                    full_val_dataset=full_val_dataset,
+                    tokenizer=tokenizer,
+                    args=args,
+                    reward_names=reward_names,
+                    reward_weights=reward_weights,
+                    device=device,
+                    trace_state=weave_trace_state,
+                    global_step=global_step,
+                    wandb_run=wandb_run,
+                )
 
             if args.save_every_n_steps > 0 and global_step % args.save_every_n_steps == 0:
                 save_raw_checkpoint(model, raw_checkpoint_dir, global_step, args)
@@ -1589,6 +2096,7 @@ def train(args: argparse.Namespace) -> None:
             device=device,
             trace_state=weave_trace_state,
             global_step=global_step,
+            trace_split_name="validation_final",
         )
         final_val_metrics = {f"final/{key}": value for key, value in final_val_metrics.items()}
         if wandb_run is not None:
