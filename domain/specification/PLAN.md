@@ -9,7 +9,7 @@ The purpose is to **eliminate ambiguity about what is done and what to do next**
 
 The fixed assumptions are as follows.
 
-- benchmark version: `213 -> 221 -> 225 -> 228`
+- benchmark version: `train=213->225, future=225->228, dev=200, holdout=400`
 - benchmark alias: `213.221.225.228`
 - primary dataset: `disease_temporal_hc_reasoning_v1`
 - comparison model: `bioreason-pro-rl-paper`
@@ -26,14 +26,13 @@ The fixed assumptions are as follows.
 | Reasoning dataset creation | Complete | `wandb-healthcare/bioreason-pro-custom/disease-temporal-reasoning:production` |
 | Comparison model artifact finalized | Complete | `wandb-healthcare/bioreason-pro-custom/bioreason-pro-rl:production` |
 | CoreWeave execution flow cleanup | Complete | `srun`-based execution, remote env, artifact resolution, 1-sample smoke verified |
-| Comparison model validation eval | Needs re-run | Re-run after fixing Weave non-integration and Fmax extraction failure |
-| SFT | Needs re-run | Previous run used full validation; redo with 100-sample subset |
-| RL | Ready | `train_protein_grpo.py` and `scripts/sh_train_protein_grpo.sh` implemented; run not yet executed |
+| Comparison model validation eval | Needs re-run | Re-run on the fixed 200-protein dev split |
+| RL | Needs re-run | Re-run directly from `bioreason-pro-rl-paper` with the fixed 200-protein dev split |
 
 ### 0.3 Immediate Next Steps
 
-The next execution target is to **verify `comparison-family` validation with 100-sample stratified, and in parallel check `stage 2 only` SFT progress**.  
-After that, review validation metrics and proceed to RL; final reported values will come from a separate `test` eval run.
+The next execution target is to **rebuild the benchmark with merged train + fixed dev/holdout, then verify `comparison-family` on the 200-protein dev split**.  
+After that, review dev metrics and proceed directly to RL from `bioreason-pro-rl-paper`; final reported values will come from a separate `test` eval run on the 400-protein holdout split.
 
 ## 1. Data Preparation
 
@@ -175,12 +174,12 @@ Status: **Re-run after fixes**
 ### 3.1 Purpose
 
 Evaluate the pre-tuning comparison model `bioreason-pro-rl-paper` on the currently adopted benchmark using the `validation` split.  
-`validation` uses a deterministic **100-sample stratified subset** preserving `go_aspect` and label-profile, not the full split.
+`validation` is the fixed **200-protein dev split** carved deterministically from the future pool, not an on-the-fly subset.
 
 ### 3.2 Evaluation Targets
 
 - `comparison-family`: `bioreason-pro-rl-paper`
-- `tuned-family`: `train-sft-output`, `train-rl-output`
+- `tuned-family`: `train-rl-output`
 - `spec-comparison`: all of the above
 
 At this stage, only `comparison-family` is actually being run.
@@ -220,89 +219,33 @@ Complete when the following are visible on W&B.
 - `eval_samples` table
 - Weave Evaluation record
 
-Sample count defaults to `100`; subset strategy is fixed to `stratified_aspect_profile`.
+Validation uses the full dev split of `100` proteins; split construction is fixed to `stratified_aspect_profile`.
 Runs missing any of `fmax_mf`, `fmax_bp`, `fmax_cc`, `eval_summary`, `eval_samples`, or Weave Evaluation are not treated as complete.
 
 ### 3.5 After This Phase
 
-Review results and proceed to SFT.  
+Review results and proceed directly to RL.  
 `test` is not used at this point.
 
-## 4. SFT
-
-Status: **In progress**
-
-### 4.1 Purpose
-
-Perform SFT using `bioreason-pro-rl-paper` as the initial checkpoint, with the `train` split of the reasoning dataset.
-The canonical run is **stage 2 only**, using projector / GO module weights from the comparison model as-is for warm-start.
-
-### 4.2 Input
-
-- temporal split artifact
-  - `BIOREASON_MAIN_TEMPORAL_SPLIT_REGISTRY_PATH`
-- reasoning dataset artifact
-  - `BIOREASON_MAIN_REASONING_DATASET_REGISTRY_PATH`
-- comparison model artifact
-  - `BIOREASON_RL_PAPER_MODEL_REGISTRY_PATH`
-
-### 4.3 Execution Commands
-
-```bash
-cd ~/BioReason-Pro
-source .venv-gpu/bin/activate
-
-bash scripts/sh_train_protein_qwen_staged.sh
-```
-
-This wrapper internally calls `srun python train_protein_llm.py ...`.
-
-### 4.4 Fixed Rules
-
-- Training uses the `train` split
-- Checkpoint selection uses a **100-sample stratified subset** deterministically drawn from `validation`
-- The `test` split is not used
-- `job_type=train_sft`
-- Wall time is `12:00:00`
-- Canonical is `stage 2 only`
-- `RUN_STAGE1=true` is used only for fallback / ablation
-- Validation subset is fixed to `VALIDATION_SUBSET_SIZE=100`, `VALIDATION_SUBSET_STRATEGY=stratified_aspect_profile`
-
-### 4.5 Completion Criteria
-
-Complete when the following are present on W&B.
-
-- `job_type=train_sft`
-- `train_loss`, `train_loss_epoch`, `val_loss`, `val_loss_epoch`, `lr_step`, `lr_epoch`
-- Weave generation trace
-- sample table
-- output checkpoint artifact
-
-After completion, add the following to `wandb_registry_paths.env`.
-
-```bash
-export BIOREASON_TRAIN_SFT_MODEL_REGISTRY_PATH="entity/project/train-sft-output:alias"
-```
-
-## 5. RL
+## 4. RL
 
 Status: **Ready, run not yet executed**
 
-### 5.1 Purpose
+### 4.1 Purpose
 
-Perform RL using `train-sft-output` as the canonical input.
+Perform RL using `bioreason-pro-rl-paper` as the canonical input.
 
-### 5.2 Fixed Rules
+### 4.2 Fixed Rules
 
 - Rollout / reward optimization uses the `train` split
-- Checkpoint selection and offline sanity-check use a **100-sample stratified subset** deterministically drawn from `validation`
+- Checkpoint selection and offline sanity-check use the full `validation` split of `200` proteins
 - The `test` split is not used
 - `job_type=train_rl`
 - Wall time is `12:00:00`
-- Starting RL directly from `bioreason-pro-rl-paper` is for ablation only
-- Validation subset is fixed to `MAX_EVAL_SAMPLES=100`, `EVAL_SAMPLE_STRATEGY=stratified_aspect_profile`
+- Canonical starting checkpoint is `bioreason-pro-rl-paper`
+- Validation split is fixed to `200` proteins and constructed with `EVAL_SAMPLE_STRATEGY=stratified_aspect_profile`
 
-### 5.3 Execution Commands
+### 4.3 Execution Commands
 
 ```bash
 cd ~/BioReason-Pro
@@ -312,9 +255,9 @@ bash scripts/sh_train_protein_grpo.sh
 ```
 
 This wrapper internally calls `srun python train_protein_grpo.py ...`.  
-Canonical uses `BIOREASON_TRAIN_SFT_MODEL_REGISTRY_PATH`; if only raw SFT checkpoint artifacts are available, convert to HF model before starting RL.
+Canonical uses `BIOREASON_RL_PAPER_MODEL_REGISTRY_PATH`.
 
-### 5.4 Completion Criteria
+### 4.4 Completion Criteria
 
 Complete when the following are present.
 
@@ -330,7 +273,7 @@ After completion, add the following to `wandb_registry_paths.env`.
 export BIOREASON_TRAIN_RL_MODEL_REGISTRY_PATH="entity/project/train-rl-output:alias"
 ```
 
-## 6. Final Evaluation
+## 5. Final Evaluation
 
 Status: **Not started**
 
@@ -372,7 +315,7 @@ Complete when the following are present on W&B.
 - `eval_samples` table
 - Weave Evaluation
 
-## 7. Next Actions
+## 6. Next Actions
 
 The nearest next actions are the following two.
 

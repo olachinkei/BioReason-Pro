@@ -3,7 +3,7 @@
   "bundles": {
     "main_production": {
       "display_name": "213-start main production bundle",
-      "benchmark_version": "213 -> 221 -> 225 -> 228",
+      "benchmark_version": "train=213->225, future=225->228, dev=200, holdout=400",
       "benchmark_alias": "213.221.225.228",
       "shortlist_mode": "high-confidence",
       "shortlist_query": "reviewed:true AND organism_id:9606 AND cc_disease:* AND (xref:mim-* OR xref:orphanet-*) AND (go_exp:* OR go_ida:* OR go_ipi:* OR go_igi:* OR go_imp:* OR go_iep:* OR go_ic:* OR go_tas:*)",

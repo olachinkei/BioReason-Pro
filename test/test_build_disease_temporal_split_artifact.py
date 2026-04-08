@@ -51,6 +51,9 @@ class BuildDiseaseTemporalSplitArtifactTests(unittest.TestCase):
         self.assertEqual(args.train_end_release, 221)
         self.assertEqual(args.dev_end_release, 225)
         self.assertEqual(args.test_end_release, 228)
+        self.assertEqual(args.validation_proteins, 200)
+        self.assertEqual(args.holdout_proteins, 400)
+        self.assertEqual(args.partition_seed, 23)
         self.assertEqual(args.shortlist_mode, "high-confidence")
 
         windows = TEMPORAL_SPLIT.build_windows(args)
@@ -58,6 +61,36 @@ class BuildDiseaseTemporalSplitArtifactTests(unittest.TestCase):
             windows,
             [("train", 213, 221), ("dev", 221, 225), ("test", 225, 228)],
         )
+
+        final_boundaries = TEMPORAL_SPLIT.build_final_split_boundaries(args)
+        self.assertEqual(final_boundaries["train"]["start_release"], 213)
+        self.assertEqual(final_boundaries["train"]["end_release"], 225)
+        self.assertEqual(final_boundaries["dev"]["target_proteins"], 200)
+        self.assertEqual(final_boundaries["test"]["target_proteins"], 400)
+
+    def test_partition_future_pool_builds_dev_test_and_reserve(self):
+        future_labels = make_label_df(
+            ("P1", "GO:0001", "P"),
+            ("P2", "GO:0002", "P"),
+            ("P3", "GO:0003", "F"),
+            ("P4", "GO:0004", "C"),
+            ("P5", "GO:0005", "P"),
+        )
+
+        partitions, metadata = TEMPORAL_SPLIT.partition_future_pool(
+            future_labels=future_labels,
+            validation_proteins=2,
+            holdout_proteins=2,
+            seed=7,
+        )
+
+        self.assertEqual(set(partitions.keys()), {"dev", "test", "reserve"})
+        self.assertEqual(partitions["dev"]["DB_ID"].nunique(), 2)
+        self.assertEqual(partitions["test"]["DB_ID"].nunique(), 2)
+        self.assertEqual(partitions["reserve"]["DB_ID"].nunique(), 1)
+        self.assertEqual(metadata["validation_partition"]["requested_proteins"], 2)
+        self.assertEqual(metadata["holdout_partition"]["requested_proteins"], 2)
+        self.assertEqual(metadata["reserve_proteins"], 1)
 
     def test_shortlist_query_for_mode_matches_spec_contract(self):
         main_query = TEMPORAL_SPLIT.shortlist_query_for_mode("main")
@@ -305,15 +338,19 @@ class BuildDiseaseTemporalSplitArtifactTests(unittest.TestCase):
                 "train_assigned_labels.tsv",
                 "dev_assigned_labels.tsv",
                 "test_assigned_labels.tsv",
+                "reserve_assigned_labels.tsv",
                 "train_assigned_propagated.tsv",
                 "dev_assigned_propagated.tsv",
                 "test_assigned_propagated.tsv",
+                "reserve_assigned_propagated.tsv",
                 "train_assigned_nk_lk.tsv",
                 "dev_assigned_nk_lk.tsv",
                 "test_assigned_nk_lk.tsv",
+                "reserve_assigned_nk_lk.tsv",
                 "train_assigned_nk_lk_propagated.tsv",
                 "dev_assigned_nk_lk_propagated.tsv",
                 "test_assigned_nk_lk_propagated.tsv",
+                "reserve_assigned_nk_lk_propagated.tsv",
                 "nk_lk_eda.tsv",
             ]
             for filename in required_files:
@@ -324,14 +361,22 @@ class BuildDiseaseTemporalSplitArtifactTests(unittest.TestCase):
             self.assertEqual(summary["shortlist_proteins"], 4)
             self.assertEqual(summary["nk_lk_status"], "skipped")
             self.assertIn("gated", summary["nk_lk_error"])
+            self.assertEqual(summary["benchmark_layout"]["train_definition"], "merge(213->221, 221->225)")
+            self.assertEqual(summary["benchmark_layout"]["validation_proteins"], 200)
+            self.assertEqual(summary["benchmark_layout"]["holdout_proteins"], 400)
             self.assertTrue(summary["split_validation"]["time_order_valid"])
             self.assertTrue(summary["split_validation"]["protein_disjoint_valid"])
-            self.assertEqual([window["split"] for window in summary["windows"]], ["train", "dev", "test"])
+            self.assertEqual([window["split"] for window in summary["windows"]], ["train", "dev", "test", "reserve"])
 
             window_by_split = {window["split"]: window for window in summary["windows"]}
-            self.assertEqual(window_by_split["train"]["disease_proteins_after_assignment"], 2)
+            self.assertEqual(window_by_split["train"]["start_release"], 213)
+            self.assertEqual(window_by_split["train"]["end_release"], 225)
+            self.assertEqual(window_by_split["train"]["disease_proteins_after_assignment"], 3)
+            self.assertEqual(window_by_split["dev"]["start_release"], 225)
+            self.assertEqual(window_by_split["dev"]["end_release"], 228)
             self.assertEqual(window_by_split["dev"]["disease_proteins_after_assignment"], 1)
-            self.assertEqual(window_by_split["test"]["disease_proteins_after_assignment"], 1)
+            self.assertEqual(window_by_split["test"]["disease_proteins_after_assignment"], 0)
+            self.assertEqual(window_by_split["reserve"]["disease_proteins_after_assignment"], 0)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ import gzip
 import io
 import json
 import os
+import random
 import re
 import shlex
 import shutil
@@ -25,7 +26,7 @@ import subprocess
 import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -177,19 +178,37 @@ def parse_args() -> argparse.Namespace:
         "--train-end-release",
         type=int,
         default=221,
-        help="GOA release used as the train/dev boundary. Default 221 (2024-02-09, HUMAN archive).",
+        help="GOA release used as the first train window boundary. Default 221 (2024-02-09, HUMAN archive).",
     )
     parser.add_argument(
         "--dev-end-release",
         type=int,
         default=225,
-        help="GOA release used as the dev/test boundary. Default 225 (2024-10-20, HUMAN archive).",
+        help="GOA release used as the second train window boundary. Default 225 (2024-10-20, HUMAN archive).",
     )
     parser.add_argument(
         "--test-end-release",
         type=int,
         default=228,
-        help="GOA release used as the test end snapshot. Default 228 (2025-05-03, HUMAN archive).",
+        help="GOA release used as the future holdout pool end snapshot. Default 228 (2025-05-03, HUMAN archive).",
+    )
+    parser.add_argument(
+        "--validation-proteins",
+        type=int,
+        default=200,
+        help="Number of proteins reserved for the dev/validation split from the future pool.",
+    )
+    parser.add_argument(
+        "--holdout-proteins",
+        type=int,
+        default=400,
+        help="Number of proteins reserved for the final holdout split from the future pool after validation selection.",
+    )
+    parser.add_argument(
+        "--partition-seed",
+        type=int,
+        default=23,
+        help="Deterministic seed used when partitioning the future pool into dev/test/reserve.",
     )
     parser.add_argument(
         "--force-download",
@@ -234,6 +253,41 @@ def build_windows(args: argparse.Namespace) -> List[Tuple[str, int, int]]:
         ("dev", args.train_end_release, args.dev_end_release),
         ("test", args.dev_end_release, args.test_end_release),
     ]
+
+
+def build_final_split_boundaries(args: argparse.Namespace) -> Dict[str, Dict[str, Any]]:
+    return {
+        "train": {
+            "start_release": args.train_start_release,
+            "end_release": args.dev_end_release,
+            "start_date": RELEASE_TO_DATE[args.train_start_release],
+            "end_date": RELEASE_TO_DATE[args.dev_end_release],
+            "source_windows": ["train", "dev"],
+        },
+        "dev": {
+            "start_release": args.dev_end_release,
+            "end_release": args.test_end_release,
+            "start_date": RELEASE_TO_DATE[args.dev_end_release],
+            "end_date": RELEASE_TO_DATE[args.test_end_release],
+            "source_windows": ["test"],
+            "target_proteins": args.validation_proteins,
+        },
+        "test": {
+            "start_release": args.dev_end_release,
+            "end_release": args.test_end_release,
+            "start_date": RELEASE_TO_DATE[args.dev_end_release],
+            "end_date": RELEASE_TO_DATE[args.test_end_release],
+            "source_windows": ["test"],
+            "target_proteins": args.holdout_proteins,
+        },
+        "reserve": {
+            "start_release": args.dev_end_release,
+            "end_release": args.test_end_release,
+            "start_date": RELEASE_TO_DATE[args.dev_end_release],
+            "end_date": RELEASE_TO_DATE[args.test_end_release],
+            "source_windows": ["test"],
+        },
+    }
 
 
 def log(message: str) -> None:
@@ -482,6 +536,245 @@ def aspect_counts(df: pd.DataFrame) -> Dict[str, int]:
     return {ASPECT_NAMES[k]: int(counts.get(k, 0)) for k in ["F", "P", "C"]}
 
 
+def aggregate_labels_by_protein(label_df: pd.DataFrame) -> pd.DataFrame:
+    protein_rows: List[Dict[str, Any]] = []
+    for protein_id, group in label_df.groupby("DB_ID"):
+        row = {
+            "protein_id": str(protein_id),
+            "go_bp": sorted(group.loc[group["Aspect"] == "P", "GO_ID"].astype(str).drop_duplicates().tolist()),
+            "go_mf": sorted(group.loc[group["Aspect"] == "F", "GO_ID"].astype(str).drop_duplicates().tolist()),
+            "go_cc": sorted(group.loc[group["Aspect"] == "C", "GO_ID"].astype(str).drop_duplicates().tolist()),
+        }
+        protein_rows.append(row)
+    protein_rows.sort(key=lambda item: item["protein_id"])
+    return pd.DataFrame(protein_rows)
+
+
+def count_terms(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return 0
+        return len([item for item in text.split(",") if item.strip()])
+    if isinstance(value, (list, tuple, set)):
+        return len([item for item in value if item not in (None, "")])
+    try:
+        return len(value)  # type: ignore[arg-type]
+    except TypeError:
+        return int(bool(value))
+
+
+def build_aspect_profile(example: Dict[str, Any]) -> str:
+    present_aspects = []
+    if count_terms(example.get("go_bp")) > 0:
+        present_aspects.append("BP")
+    if count_terms(example.get("go_mf")) > 0:
+        present_aspects.append("MF")
+    if count_terms(example.get("go_cc")) > 0:
+        present_aspects.append("CC")
+    if not present_aspects:
+        present_aspects = ["NONE"]
+
+    total_terms = count_terms(example.get("go_bp")) + count_terms(example.get("go_mf")) + count_terms(example.get("go_cc"))
+    if total_terms <= 2:
+        size_bucket = "labels:1-2"
+    elif total_terms <= 5:
+        size_bucket = "labels:3-5"
+    elif total_terms <= 10:
+        size_bucket = "labels:6-10"
+    else:
+        size_bucket = "labels:11+"
+    return f"profile:{'+'.join(present_aspects)}|{size_bucket}"
+
+
+def protein_aspects(example: Dict[str, Any]) -> Tuple[str, ...]:
+    aspects: List[str] = []
+    if count_terms(example.get("go_bp")) > 0:
+        aspects.append("BP")
+    if count_terms(example.get("go_mf")) > 0:
+        aspects.append("MF")
+    if count_terms(example.get("go_cc")) > 0:
+        aspects.append("CC")
+    return tuple(aspects)
+
+
+def allocate_group_counts(group_sizes: Dict[str, int], target_size: int) -> Dict[str, int]:
+    allocations = {key: 0 for key in group_sizes}
+    if target_size <= 0 or not group_sizes:
+        return allocations
+
+    keys = list(group_sizes.keys())
+    total_items = sum(group_sizes.values())
+    if total_items <= target_size:
+        return dict(group_sizes)
+
+    if target_size >= len(keys):
+        for key in keys:
+            allocations[key] = 1
+        remaining = target_size - len(keys)
+        capacities = {key: max(group_sizes[key] - 1, 0) for key in keys}
+    else:
+        remaining = target_size
+        capacities = dict(group_sizes)
+
+    if remaining <= 0:
+        return allocations
+
+    allocatable_total = sum(capacities.values())
+    if allocatable_total <= 0:
+        return allocations
+
+    raw_targets = {key: remaining * capacities[key] / allocatable_total for key in keys}
+    base_additions = {key: min(int(raw_targets[key]), capacities[key]) for key in keys}
+    for key in keys:
+        allocations[key] += base_additions[key]
+
+    leftover = remaining - sum(base_additions.values())
+    if leftover <= 0:
+        return allocations
+
+    ranked_keys = sorted(keys, key=lambda key: (-(raw_targets[key] - base_additions[key]), -capacities[key], key))
+    capacity_left = {key: capacities[key] - base_additions[key] for key in keys}
+    idx = 0
+    while leftover > 0 and any(value > 0 for value in capacity_left.values()):
+        key = ranked_keys[idx % len(ranked_keys)]
+        if capacity_left[key] > 0:
+            allocations[key] += 1
+            capacity_left[key] -= 1
+            leftover -= 1
+        idx += 1
+    return allocations
+
+
+def select_stratified_protein_ids(
+    protein_df: pd.DataFrame,
+    max_proteins: int,
+    seed: int,
+) -> Tuple[Set[str], Dict[str, Any]]:
+    if max_proteins <= 0 or protein_df.empty:
+        return set(), {
+            "requested_proteins": max_proteins,
+            "selected_proteins": 0,
+            "group_counts": {},
+            "aspect_coverage": {},
+        }
+
+    if len(protein_df) <= max_proteins:
+        selected = set(protein_df["protein_id"].astype(str).tolist())
+        aspect_coverage: Dict[str, int] = {}
+        for record in protein_df.to_dict(orient="records"):
+            for aspect in protein_aspects(record):
+                aspect_coverage[aspect] = aspect_coverage.get(aspect, 0) + 1
+        return selected, {
+            "requested_proteins": max_proteins,
+            "selected_proteins": len(selected),
+            "group_counts": {"full": len(selected)},
+            "aspect_coverage": aspect_coverage,
+        }
+
+    rng = random.Random(seed)
+    records = protein_df.to_dict(orient="records")
+    grouped_indices: Dict[str, List[int]] = {}
+    aspect_candidates: Dict[str, List[int]] = {}
+    for idx, record in enumerate(records):
+        profile = build_aspect_profile(record)
+        grouped_indices.setdefault(profile, []).append(idx)
+        for aspect in protein_aspects(record):
+            aspect_candidates.setdefault(aspect, []).append(idx)
+
+    selected_indices: Set[int] = set()
+    selected_group_counts: Dict[str, int] = {}
+    aspect_coverage: Dict[str, int] = {}
+
+    available_aspects = [aspect for aspect in ("BP", "MF", "CC") if aspect_candidates.get(aspect)]
+    if max_proteins >= len(available_aspects):
+        for aspect in available_aspects:
+            candidates = [idx for idx in aspect_candidates[aspect] if idx not in selected_indices]
+            if not candidates:
+                continue
+            rng.shuffle(candidates)
+            chosen = candidates[0]
+            selected_indices.add(chosen)
+            profile = build_aspect_profile(records[chosen])
+            selected_group_counts[profile] = selected_group_counts.get(profile, 0) + 1
+            aspect_coverage[aspect] = aspect_coverage.get(aspect, 0) + 1
+
+    remaining_grouped_indices: Dict[str, List[int]] = {}
+    for key, indices in grouped_indices.items():
+        remaining = [idx for idx in indices if idx not in selected_indices]
+        if remaining:
+            remaining_grouped_indices[key] = remaining
+
+    allocations = allocate_group_counts(
+        {key: len(indices) for key, indices in remaining_grouped_indices.items()},
+        max(max_proteins - len(selected_indices), 0),
+    )
+
+    ordered_selected = sorted(selected_indices)
+    for key in sorted(remaining_grouped_indices.keys()):
+        candidates = list(remaining_grouped_indices[key])
+        rng.shuffle(candidates)
+        take = allocations.get(key, 0)
+        if take <= 0:
+            continue
+        chosen_indices = sorted(candidates[:take])
+        ordered_selected.extend(chosen_indices)
+        selected_group_counts[key] = selected_group_counts.get(key, 0) + len(chosen_indices)
+        for idx in chosen_indices:
+            for aspect in protein_aspects(records[idx]):
+                aspect_coverage[aspect] = aspect_coverage.get(aspect, 0) + 1
+
+    selected_ids = {str(records[idx]["protein_id"]) for idx in ordered_selected}
+    return selected_ids, {
+        "requested_proteins": max_proteins,
+        "selected_proteins": len(selected_ids),
+        "group_counts": selected_group_counts,
+        "aspect_coverage": aspect_coverage,
+    }
+
+
+def partition_future_pool(
+    future_labels: pd.DataFrame,
+    validation_proteins: int,
+    holdout_proteins: int,
+    seed: int,
+) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Any]]:
+    if future_labels.empty:
+        empty = pd.DataFrame(columns=future_labels.columns)
+        return {"dev": empty.copy(), "test": empty.copy(), "reserve": empty.copy()}, {
+            "validation_partition": {"requested_proteins": validation_proteins, "selected_proteins": 0, "group_counts": {}, "aspect_coverage": {}},
+            "holdout_partition": {"requested_proteins": holdout_proteins, "selected_proteins": 0, "group_counts": {}, "aspect_coverage": {}},
+            "reserve_proteins": 0,
+        }
+
+    protein_df = aggregate_labels_by_protein(future_labels)
+    validation_ids, validation_meta = select_stratified_protein_ids(
+        protein_df=protein_df,
+        max_proteins=validation_proteins,
+        seed=seed,
+    )
+    remaining_df = protein_df[~protein_df["protein_id"].isin(validation_ids)].reset_index(drop=True)
+    holdout_ids, holdout_meta = select_stratified_protein_ids(
+        protein_df=remaining_df,
+        max_proteins=holdout_proteins,
+        seed=seed + 1,
+    )
+    reserve_ids = set(remaining_df["protein_id"].astype(str).tolist()) - holdout_ids
+
+    partitions = {
+        "dev": future_labels[future_labels["DB_ID"].isin(validation_ids)].reset_index(drop=True),
+        "test": future_labels[future_labels["DB_ID"].isin(holdout_ids)].reset_index(drop=True),
+        "reserve": future_labels[future_labels["DB_ID"].isin(reserve_ids)].reset_index(drop=True),
+    }
+    return partitions, {
+        "validation_partition": validation_meta,
+        "holdout_partition": holdout_meta,
+        "reserve_proteins": len(reserve_ids),
+    }
+
+
 def compute_delta(old_df: pd.DataFrame, new_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     raw_key_cols = ["DB_ID", "GO_ID", "Aspect", "Evidence_Code"]
     label_key_cols = ["DB_ID", "GO_ID", "Aspect"]
@@ -582,6 +875,41 @@ def validate_split_integrity(
             }
             for split, start_release, end_release in windows
         },
+        "protein_overlap_counts": overlap_counts,
+    }
+
+
+def validate_final_split_integrity(
+    args: argparse.Namespace,
+    final_labels: Dict[str, pd.DataFrame],
+) -> Dict[str, Any]:
+    train_end_date = pd.Timestamp(RELEASE_TO_DATE[args.dev_end_release])
+    future_start_date = pd.Timestamp(RELEASE_TO_DATE[args.dev_end_release])
+    future_end_date = pd.Timestamp(RELEASE_TO_DATE[args.test_end_release])
+    if future_start_date >= future_end_date:
+        raise ValueError(
+            f"Future pool order is invalid: {args.dev_end_release} ({future_start_date.date()}) !< "
+            f"{args.test_end_release} ({future_end_date.date()})"
+        )
+
+    split_order = ["train", "dev", "test", "reserve"]
+    protein_sets = {
+        split: set(df["DB_ID"].drop_duplicates().tolist())
+        for split, df in final_labels.items()
+    }
+    overlap_counts: Dict[str, int] = {}
+    for idx, left_split in enumerate(split_order):
+        for right_split in split_order[idx + 1 :]:
+            overlap = protein_sets[left_split] & protein_sets[right_split]
+            overlap_counts[f"{left_split}__{right_split}"] = len(overlap)
+            if overlap:
+                sample = sorted(overlap)[:5]
+                raise ValueError(f"Protein overlap detected between {left_split} and {right_split}: {sample}")
+
+    return {
+        "time_order_valid": True,
+        "protein_disjoint_valid": True,
+        "window_boundaries": build_final_split_boundaries(args),
         "protein_overlap_counts": overlap_counts,
     }
 
@@ -770,6 +1098,9 @@ def write_markdown_report(
         )
 
     lines.extend(["", "## Notes", ""])
+    lines.append("- Final train merges the first two temporal windows (213->221 and 221->225).")
+    lines.append("- Dev (validation) and test (holdout) are deterministic protein-disjoint partitions of the future pool 225->228.")
+    lines.append("- Reserve is the unused remainder of the future pool and is not consumed by train / dev / holdout runs.")
     lines.append("- Counts are based on protein-disjoint assignment by earliest temporal appearance.")
     lines.append("- Unique labels are counted as `(DB_ID, GO_ID, Aspect)` after collapsing evidence codes.")
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -842,20 +1173,44 @@ def main() -> int:
             f"labels={len(disease_labels):,} proteins={disease_labels['DB_ID'].nunique():,}"
         )
 
-    assigned_labels, earliest_split = assign_earliest_split(label_deltas, windows=windows)
-    split_validation = validate_split_integrity(
+    assigned_labels_by_window, earliest_split = assign_earliest_split(label_deltas, windows=windows)
+    initial_split_validation = validate_split_integrity(
         windows=windows,
         window_to_labels=label_deltas,
-        assigned_labels=assigned_labels,
+        assigned_labels=assigned_labels_by_window,
         earliest_split=earliest_split,
     )
     with (output_dir / "earliest_split_by_protein.json").open("w", encoding="utf-8") as f:
         json.dump(earliest_split, f, indent=2, sort_keys=True)
 
+    merged_train_labels = pd.concat(
+        [assigned_labels_by_window["train"], assigned_labels_by_window["dev"]],
+        ignore_index=True,
+    ).drop_duplicates(["DB_ID", "GO_ID", "Aspect"]).reset_index(drop=True)
+    future_partitions, future_partition_meta = partition_future_pool(
+        future_labels=assigned_labels_by_window["test"],
+        validation_proteins=args.validation_proteins,
+        holdout_proteins=args.holdout_proteins,
+        seed=args.partition_seed,
+    )
+    final_assigned_labels: Dict[str, pd.DataFrame] = {
+        "train": merged_train_labels,
+        "dev": future_partitions["dev"],
+        "test": future_partitions["test"],
+        "reserve": future_partitions["reserve"],
+    }
+    split_validation = validate_final_split_integrity(args=args, final_labels=final_assigned_labels)
+
     summaries: List[SplitSummary] = []
-    for split, start_release, end_release in windows:
-        labels = assigned_labels[split]
-        raw = raw_records_for_labels(raw_deltas[split], labels)
+    final_split_specs = [
+        ("train", args.train_start_release, args.dev_end_release, pd.concat([raw_deltas["train"], raw_deltas["dev"]], ignore_index=True)),
+        ("dev", args.dev_end_release, args.test_end_release, raw_deltas["test"]),
+        ("test", args.dev_end_release, args.test_end_release, raw_deltas["test"]),
+        ("reserve", args.dev_end_release, args.test_end_release, raw_deltas["test"]),
+    ]
+    for split, start_release, end_release, source_raw in final_split_specs:
+        labels = final_assigned_labels[split]
+        raw = raw_records_for_labels(source_raw, labels)
         propagated = (
             propagate_labels(labels, obo_path) if not args.skip_propagation else labels.copy()
         )
@@ -876,7 +1231,7 @@ def main() -> int:
             split=split,
             start_release=start_release,
             end_release=end_release,
-            disease_raw=raw_deltas[split],
+            disease_raw=raw,
             assigned_labels=labels,
             propagated_assigned=propagated,
             nk_lk_stats=nk_lk_stats,
@@ -918,7 +1273,16 @@ def main() -> int:
         "shortlist_proteins": len(shortlist_set),
         "nk_lk_status": nk_lk_status,
         "nk_lk_error": nk_lk_error,
+        "benchmark_layout": {
+            "train_definition": "merge(213->221, 221->225)",
+            "future_pool_definition": "225->228",
+            "validation_proteins": args.validation_proteins,
+            "holdout_proteins": args.holdout_proteins,
+            "partition_seed": args.partition_seed,
+        },
+        "initial_split_validation": initial_split_validation,
         "split_validation": split_validation,
+        "future_partition": future_partition_meta,
         "release_archives": {str(release): RELEASE_TO_ARCHIVE[release] for release in releases},
         "windows": [asdict(summary) for summary in summaries],
     }

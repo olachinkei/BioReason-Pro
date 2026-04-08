@@ -18,7 +18,7 @@ The problem addressed by this specification is **protein-level GO term predictio
 
 Fixed questions:
 
-- Is there value in performing additional RL tuning on BioReason-Pro's public model for disease-associated human proteins?
+- Is there value in performing additional training on BioReason-Pro's public model for disease-associated human proteins?
 - On a temporally independent benchmark, does custom tuning produce better predictions and reasoning than the pre-tuning comparison model?
 
 Not addressed by this specification:
@@ -46,11 +46,12 @@ Comparison targets are fixed to the following 3 families.
 
 | Method | Role |
 |---|---|
-| `bioreason-pro-rl-paper` | Pre-tuning comparison model and canonical RL starting checkpoint |
+| `bioreason-pro-rl-paper` | Pre-tuning comparison model |
+| `train-sft-output` | Output artifact produced by custom `train_sft` run |
 | `train-rl-output` | Output artifact produced by custom `train_rl` run |
 
 The only model artifact ref needed initially is `bioreason-pro-rl-paper`.  
-`train-rl-output` appears as an artifact after RL training is executed.
+`train-sft-output` and `train-rl-output` appear as artifacts after their respective training runs are executed.
 
 ## 3. Benchmark
 
@@ -157,11 +158,12 @@ Required columns:
 Split names are fixed to `train` / `validation` / `test`.  
 Even if optional columns do not exist, the columns themselves are retained and filled with empty strings.
 
-### 4.3 RL / Eval Split Usage Rules
+### 4.3 SFT / RL Split Usage Rules
 
 Fixed rules:
 
-- RL / eval use **the same benchmark split**
+- SFT / RL / eval use **the same benchmark split**
+- SFT uses the `train` split of the reasoning dataset for training
 - The `validation` split itself is fixed to **200 proteins**
 - RL rollout / reward optimization uses `train`
 - RL checkpoint selection and offline sanity-check use the full `validation` split
@@ -207,7 +209,7 @@ Fixed rules:
 
 - Local output is treated as scratch and is not assumed to be permanently stored
 - After successful upload to W&B Artifact, local scratch may be cleaned up
-- Downstream eval / RL resolve from W&B Artifact ref, not from local directories
+- Downstream eval / SFT / RL resolve from W&B Artifact ref, not from local directories
 - Unnecessary datasets and supplementary files are not generated
 
 ## 6. Data and Model Upload to W&B
@@ -244,7 +246,7 @@ Fixed rules:
 
 - Datasets are registered as W&B Artifacts
 - Dataset artifact version / alias is recorded in run config
-- Downstream eval / RL resolve datasets from W&B Artifact ref
+- Downstream eval / SFT / RL resolve datasets from W&B Artifact ref
 
 ### 6.3 Model Upload
 
@@ -254,7 +256,7 @@ Fixed rules:
 - Model artifact version / alias is recorded in run config
 - The comparison model is fixed to `bioreason-pro-rl-paper`
 - `bioreason-pro-rl-paper` is materialized once from the public Hugging Face source `wanglab/bioreason-pro-rl` and pinned as a W&B model artifact
-- `train_rl` outputs are registered as output artifacts of their respective runs
+- `train_sft` and `train_rl` outputs are registered as output artifacts of their respective runs
 
 ### 6.4 Artifact Ref Manifest
 
@@ -272,7 +274,7 @@ Fixed rules:
 
 - Refs passed to manifests use `entity/project/artifact_name:alias` format
 - The only model ref that must be explicitly prepared initially is `BIOREASON_RL_PAPER_MODEL_REGISTRY_PATH`
-- Refs for `train-rl-output` are determined as artifacts after RL training runs complete
+- Refs for `train-sft-output` and `train-rl-output` are determined as artifacts after their respective training runs complete
 
 ## 7. Evaluation
 
@@ -301,12 +303,13 @@ The primary metric is **F_max**. Required namespaces are:
 Evaluation targets:
 
 - `bioreason-pro-rl-paper`
+- `train-sft-output`
 - `train-rl-output` if available
 
 Target families:
 
 - `comparison-family`: `bioreason-pro-rl-paper`
-- `tuned-family`: `train-rl-output`
+- `tuned-family`: `train-sft-output`, `train-rl-output`
 - `spec-comparison`: all of the above
 
 Each metric is saved via `wandb.log()`, with at minimum `fmax_mf`, `fmax_bp`, `fmax_cc`.
@@ -315,7 +318,7 @@ Each metric is saved via `wandb.log()`, with at minimum `fmax_mf`, `fmax_bp`, `f
 
 - Inference functions are traced with Weave
 - test (final reported values)
-    - Executed as a **separate run** after RL
+    - Executed as a **separate run** after SFT / RL
     - Uses the full `test` split
     - Initialize `wandb.init(..., job_type="eval")` and `weave.init(...)` before sample processing begins
     - Evaluation is performed using Weave's Evaluation Logger, following W&B's imperative evaluation logging pattern
@@ -338,19 +341,62 @@ Each metric is saved via `wandb.log()`, with at minimum `fmax_mf`, `fmax_bp`, `f
     - Save a Weave Evaluation Logger record and include `fmax_mf`, `fmax_bp`, `fmax_cc`, `overall_mean_fmax` via `ev.log_summary(...)`
     - Runs missing any of the above are not treated as successful
 
-## 8. Training for RL
+## 8. Training for SFT
 
-### 8.1 train_rl Phase
+### 8.1 train_sft Phase
 
-The logical phase name for RL is fixed to `train_rl`.  
-Entry points are fixed to `train_protein_grpo.py` and `scripts/sh_train_protein_grpo.sh`.  
-W&B runs are started with `wandb.init(..., job_type="train_rl")`.
+The logical phase name for SFT is fixed to `train_sft`.  
+Entry points are `train_protein_llm.py` and `scripts/sh_train_protein_qwen_staged.sh`.  
+W&B runs are started with `wandb.init(..., job_type="train_sft")`.
 
 ### 8.2 Input and Strict Rules
 
 Input:
 
-- Canonically, the `bioreason-pro-rl-paper` checkpoint
+- `disease_temporal_hc_reasoning_v1`
+- `bioreason-pro-rl-paper` checkpoint artifact
+
+Fixed rules:
+
+- Training uses the `train` split of the reasoning dataset
+- Checkpoint selection uses the full `validation` split of **200 proteins**
+- The `test` split is not used for SFT training
+- The pre-tuning comparison model is materialized from W&B Artifact ref
+- Canonical SFT execution is **stage 2 only**
+- In canonical mode, projector / GO module weights from the comparison model are used as-is for warm-start
+- Stage 1 projector warm-up is treated only as a fallback for training instability or as an ablation
+- Validation split construction is fixed to deterministic `stratified_aspect_profile`
+- Checkpoint selection validation split must show `selected_proteins=100` in artifact metadata
+- Hyperparameter search is allowed only within the same `stage 2 only` setting, same comparison model input, and same 200-protein validation rule
+- SFT search may run multiple trials in parallel, but all trials must keep the same benchmark version and artifact lineage
+- The selected SFT setting is the compliant trial with the lowest `val_loss_epoch`
+- Train / validation metrics (`train_loss`, `train_loss_epoch`, `val_loss`, `val_loss_epoch`, `lr_step`, `lr_epoch`) are saved via `wandb.log()`
+- Training-time sample generation is traced with Weave
+- Output checkpoint is registered as a W&B Artifact
+
+### 8.3 Execution Conditions
+
+Fixed rules:
+
+- Training requires GPU
+- Dataset config is supplied assuming `dataset_type=cafa5`
+- Maximum wall time for training jobs is 12 hours
+- Time limit at submission is `12:00:00`
+- Operations assume checkpoint / resume
+
+## 9. Training for RL
+
+### 9.1 train_rl Phase
+
+The logical phase name for RL is fixed to `train_rl`.  
+Entry points are fixed to `train_protein_grpo.py` and `scripts/sh_train_protein_grpo.sh`.  
+W&B runs are started with `wandb.init(..., job_type="train_rl")`.
+
+### 9.2 Input and Strict Rules
+
+Input:
+
+- Canonically, the `train-sft-output` checkpoint
 - Reward configuration
 - The same benchmark definition
 
@@ -360,13 +406,15 @@ Fixed rules:
 - Checkpoint selection and offline sanity-check use the full `validation` split of **200 proteins**
 - The `test` split is not used for RL training
 - When deriving RL datasets, source data comes from the `train` split only
-- Canonical input is the `bioreason-pro-rl-paper` artifact
+- Canonical input is the `train-sft-output` artifact
+- If the `train-sft-output` artifact contains only raw Lightning checkpoints, convert to HF model before starting RL
+- Starting RL directly from `bioreason-pro-rl-paper` is treated as an ablation, used only when necessary
 - Validation split construction is fixed to deterministic `stratified_aspect_profile`
 - Reward metrics, KL metrics, and training stability indicators are saved via `wandb.log()`
 - Rollout traces are saved with Weave
 - RL output checkpoint is registered as a W&B Artifact
 
-### 8.3 Execution Conditions
+### 9.3 Execution Conditions
 
 Fixed rules:
 
