@@ -586,6 +586,7 @@ def build_eval_summary_row(args, run_summary: Dict[str, Any], metrics_summary: D
         "fmax_mf": metrics_summary.get("fmax_mf"),
         "fmax_bp": metrics_summary.get("fmax_bp"),
         "fmax_cc": metrics_summary.get("fmax_cc"),
+        "overall_mean_fmax": metrics_summary.get("overall_mean_fmax"),
         "macro_note": (
             f"loaded={run_summary['loaded_samples']}, "
             f"processed={run_summary['newly_processed_samples']}, "
@@ -703,6 +704,29 @@ def resolve_weave_project(args) -> str:
     return ""
 
 
+def resolve_weave_eval_name(args) -> str:
+    """Resolve the canonical name shared by W&B and Weave eval logging."""
+    return (
+        getattr(args, "wandb_run_name", None)
+        or getattr(args, "weave_eval_name", None)
+        or f"eval-{resolve_model_name(args)}-{args.eval_split}"
+    )
+
+
+def build_weave_eval_attributes(args) -> Dict[str, Any]:
+    """Build metadata for Weave EvaluationLogger sessions."""
+    attributes = {
+        "job_type": "eval",
+        "benchmark_version": resolve_benchmark_version(args),
+        "eval_split": args.eval_split,
+        "dataset_config": args.cafa5_dataset_name,
+        "dataset_artifact": getattr(args, "dataset_artifact", None),
+        "model_artifact": getattr(args, "model_artifact", None),
+        "temporal_split_artifact": getattr(args, "temporal_split_artifact", None),
+    }
+    return {key: value for key, value in attributes.items() if value not in (None, "")}
+
+
 def should_run_weave_evaluation(args) -> bool:
     """Weave Evaluation is required whenever a Weave project is configured."""
     return bool(resolve_weave_project(args))
@@ -794,6 +818,7 @@ def maybe_init_eval_tracking(args) -> Dict[str, Any]:
     tracking_state: Dict[str, Any] = {
         "wandb_run": None,
         "weave_client": None,
+        "weave_eval_logger": None,
         "trace_sample": None,
         "weave_project": "",
         "sample_traces_logged": 0,
@@ -817,7 +842,17 @@ def maybe_init_eval_tracking(args) -> Dict[str, Any]:
         def trace_sample(payload: Dict[str, Any]) -> Dict[str, Any]:
             return payload
 
+        weave_eval_logger = None
+        if hasattr(weave, "EvaluationLogger") and should_run_weave_evaluation(args):
+            weave_eval_logger = weave.EvaluationLogger(
+                name=resolve_weave_eval_name(args),
+                model=getattr(args, "model_artifact", None) or resolve_model_name(args),
+                dataset=getattr(args, "dataset_artifact", None) or args.cafa5_dataset_name,
+                eval_attributes=build_weave_eval_attributes(args),
+            )
+
         tracking_state["weave_client"] = client
+        tracking_state["weave_eval_logger"] = weave_eval_logger
         tracking_state["trace_sample"] = trace_sample
         tracking_state["weave_project"] = weave_project
         print("Weave initialization for eval tracing completed.")
@@ -875,10 +910,15 @@ def log_eval_outputs_to_wandb(
     run_summary: Dict[str, Any],
     metrics_summary: Dict[str, Any],
     sample_rows: List[Dict[str, Any]],
-) -> bool:
+) -> Dict[str, bool]:
     """Log eval metrics plus summary/sample tables."""
+    status = {
+        "wandb_logged": False,
+        "summary_table_logged": False,
+        "sample_table_logged": False,
+    }
     if run is None or wandb is None:
-        return False
+        return status
 
     maybe_update_wandb_config(run, build_tracking_config(args, run_summary, metrics_summary))
 
@@ -887,18 +927,52 @@ def log_eval_outputs_to_wandb(
     }
     if metrics_to_log:
         wandb.log(metrics_to_log)
+        status["wandb_logged"] = True
 
     if should_log_eval_tables(args):
         summary_row = build_eval_summary_row(args, run_summary, metrics_summary)
         summary_table = build_wandb_table([summary_row])
         if summary_table is not None:
             wandb.log({"eval_summary": summary_table})
+            status["wandb_logged"] = True
+            status["summary_table_logged"] = True
 
         sample_table = build_wandb_table(sample_rows)
         if sample_table is not None:
             wandb.log({"eval_samples": sample_table})
+            status["wandb_logged"] = True
+            status["sample_table_logged"] = True
 
-    return True
+    return status
+
+
+def build_weave_prediction_payload(row: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    """Convert one sample row into Weave EvaluationLogger input/output/score payloads."""
+    prediction_fields = extract_reasoning_fields(row.get("prediction", ""))
+    expected_fields = extract_reasoning_fields(row.get("expected_output", ""))
+    predicted_final = _normalize_text_for_match(prediction_fields["final_answer"])
+    expected_final = _normalize_text_for_match(expected_fields["final_answer"])
+    exact_match = bool(predicted_final and expected_final and predicted_final == expected_final)
+
+    inputs = {
+        "protein_id": row.get("protein_id", ""),
+        "go_aspect": row.get("go_aspect", ""),
+        "split": row.get("split", ""),
+        "prompt": row.get("prompt", ""),
+    }
+    output = {
+        "prediction": row.get("prediction", ""),
+        "reasoning_full": row.get("reasoning_full", ""),
+        "final_answer": row.get("final_answer", ""),
+        "intermediate_trace": row.get("intermediate_trace", ""),
+    }
+    scores = {
+        "success": float(bool(row.get("success", False))),
+        "exact_match": float(exact_match),
+        "attempt_count": float(row.get("attempt_count", 0)),
+        "successful_attempt_count": float(row.get("successful_attempt_count", 0)),
+    }
+    return inputs, output, scores
 
 
 def maybe_log_eval_to_weave(
@@ -908,7 +982,7 @@ def maybe_log_eval_to_weave(
     sample_rows: List[Dict[str, Any]],
     tracking_state: Optional[Dict[str, Any]] = None,
 ) -> bool:
-    """Track eval rows with Weave Evaluation when configured."""
+    """Track eval rows with Weave EvaluationLogger when configured."""
     if not should_run_weave_evaluation(args):
         return False
     if weave is None:
@@ -929,75 +1003,31 @@ def maybe_log_eval_to_weave(
             print(f"🧶 Using Weave cache directory: {cache_dir}")
             client = weave.init(weave_project)
 
-        metric_keys = ["fmax_mf", "fmax_bp", "fmax_cc", "overall_mean_fmax"]
         weave_summary_row = build_eval_summary_row(args, run_summary, metrics_summary)
-        weave_summary_row["expected_output"] = {
-            key: metrics_summary.get(key) for key in metric_keys if metrics_summary.get(key) is not None
-        }
+        eval_logger = None if tracking_state is None else tracking_state.get("weave_eval_logger")
+        if eval_logger is None:
+            eval_logger = weave.EvaluationLogger(
+                name=resolve_weave_eval_name(args),
+                model=getattr(args, "model_artifact", None) or resolve_model_name(args),
+                dataset=getattr(args, "dataset_artifact", None) or args.cafa5_dataset_name,
+                eval_attributes=build_weave_eval_attributes(args),
+            )
 
-        @weave.op(name="eval_summary_metrics")
-        def replay_summary_metrics(
-            fmax_mf: Optional[float] = None,
-            fmax_bp: Optional[float] = None,
-            fmax_cc: Optional[float] = None,
-            overall_mean_fmax: Optional[float] = None,
-        ) -> Dict[str, Optional[float]]:
-            return {
-                "fmax_mf": fmax_mf,
-                "fmax_bp": fmax_bp,
-                "fmax_cc": fmax_cc,
-                "overall_mean_fmax": overall_mean_fmax,
-            }
+        for sample_row in sample_rows:
+            inputs, output, scores = build_weave_prediction_payload(sample_row)
+            score_logger = eval_logger.log_prediction(inputs=inputs, output=output)
+            for scorer_name, score_value in scores.items():
+                score_logger.log_score(scorer=scorer_name, score=score_value)
+            score_logger.finish()
 
-        @weave.op(name="fmax_mf")
-        def score_fmax_mf(expected_output: Dict[str, Any], model_output: Dict[str, Optional[float]]) -> float:
-            return float(model_output.get("fmax_mf") or 0.0)
-
-        @weave.op(name="fmax_bp")
-        def score_fmax_bp(expected_output: Dict[str, Any], model_output: Dict[str, Optional[float]]) -> float:
-            return float(model_output.get("fmax_bp") or 0.0)
-
-        @weave.op(name="fmax_cc")
-        def score_fmax_cc(expected_output: Dict[str, Any], model_output: Dict[str, Optional[float]]) -> float:
-            return float(model_output.get("fmax_cc") or 0.0)
-
-        @weave.op(name="overall_mean_fmax")
-        def score_overall_mean_fmax(expected_output: Dict[str, Any], model_output: Dict[str, Optional[float]]) -> float:
-            return float(model_output.get("overall_mean_fmax") or 0.0)
-
-        evaluation = weave.Evaluation(
-            name=(
-                getattr(args, "wandb_run_name", None)
-                or getattr(args, "weave_eval_name", None)
-                or f"eval-{resolve_model_name(args)}-{args.eval_split}"
-            ),
-            dataset=[weave_summary_row],
-            scorers=[score_fmax_mf, score_fmax_bp, score_fmax_cc, score_overall_mean_fmax],
-            preprocess_model_input=lambda row: {
-                "fmax_mf": row.get("fmax_mf"),
-                "fmax_bp": row.get("fmax_bp"),
-                "fmax_cc": row.get("fmax_cc"),
-                "overall_mean_fmax": row.get("overall_mean_fmax"),
-            },
-            metadata={
-                "job_type": "eval",
-                "benchmark_version": resolve_benchmark_version(args),
-                "eval_split": args.eval_split,
+        eval_logger.log_summary(
+            {
+                **weave_summary_row,
+                "sample_rows_logged": len(sample_rows),
                 "result_files_total": run_summary.get("result_files_total"),
                 "metrics_loaded": bool(metrics_summary),
-                "sample_rows_logged": len(sample_rows),
-            },
+            }
         )
-        evaluation_result = evaluation.evaluate(replay_summary_metrics)
-        if inspect.isawaitable(evaluation_result):
-            try:
-                asyncio.run(evaluation_result)
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                try:
-                    loop.run_until_complete(evaluation_result)
-                finally:
-                    loop.close()
         if hasattr(client, "flush"):
             client.flush()
         return True
@@ -1011,6 +1041,10 @@ def enforce_required_eval_outputs(args, tracking_status: Dict[str, Any]) -> None
     missing = []
     if not tracking_status.get("wandb_logged"):
         missing.append("W&B logging")
+    if should_log_eval_tables(args) and not tracking_status.get("summary_table_logged"):
+        missing.append("W&B eval_summary table")
+    if should_log_eval_tables(args) and not tracking_status.get("sample_table_logged"):
+        missing.append("W&B eval_samples table")
     if not tracking_status.get("metrics_loaded"):
         missing.append("Fmax metrics")
     if should_run_weave_evaluation(args) and not tracking_status.get("weave_logged"):
@@ -1033,6 +1067,8 @@ def log_eval_tracking(
     tracking_status = {
         "metrics_loaded": bool(metrics_summary),
         "wandb_logged": False,
+        "summary_table_logged": False,
+        "sample_table_logged": False,
         "weave_logged": False,
     }
 
@@ -1040,13 +1076,14 @@ def log_eval_tracking(
     if wandb_run is None:
         wandb_run = maybe_init_wandb_run(args, run_summary, metrics_summary)
     try:
-        tracking_status["wandb_logged"] = log_eval_outputs_to_wandb(
+        wandb_status = log_eval_outputs_to_wandb(
             run=wandb_run,
             args=args,
             run_summary=run_summary,
             metrics_summary=metrics_summary,
             sample_rows=sample_rows,
         )
+        tracking_status.update(wandb_status)
     finally:
         should_finish = tracking_state is None
         if should_finish and wandb_run is not None:

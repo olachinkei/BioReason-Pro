@@ -317,12 +317,15 @@ Each metric is saved via `wandb.log()`, with at minimum `fmax_mf`, `fmax_bp`, `f
 - test (final reported values)
     - Executed as a **separate run** after SFT / RL
     - Uses the full `test` split
-    - Evaluation is performed using Weave's Evaluation Logger
+    - Initialize `wandb.init(..., job_type="eval")` and `weave.init(...)` before sample processing begins
+    - Evaluation is performed using Weave's Evaluation Logger, following W&B's imperative evaluation logging pattern
     - Runs where Weave logging fails are not treated as successful
-    - Weave is used, but simultaneously the evaluation summary is saved as a **W&B Table with 1 evaluated target = 1 row**
-        - Columns: model_name, split, benchmark_version, <accuracy metrics follow in subsequent columns>
+    - Each sample inference is traced with `@weave.op`
+    - The evaluation summary is saved as a **W&B Table with 1 evaluated target = 1 row**
+        - Required columns: `model_name`, `split`, `benchmark_version`, `fmax_mf`, `fmax_bp`, `fmax_cc`, `overall_mean_fmax`
     - Sample-level results are saved as a **W&B Table with 1 sample = 1 row**
     - For reasoning tasks, `reasoning_full`, `final_answer`, `intermediate_trace` are retained
+    - The final evaluation record is saved through Weave's Evaluation Logger and `ev.log_summary(...)` must include `fmax_mf`, `fmax_bp`, `fmax_cc`, `overall_mean_fmax`
     - JSON results, summary exports, and sample exports are not version-managed as W&B Artifacts. The basic philosophy is to not hold results locally
     - Local eval output is treated as scratch and may be cleaned up by default after successful W&B save
 
@@ -331,8 +334,8 @@ Each metric is saved via `wandb.log()`, with at minimum `fmax_mf`, `fmax_bp`, `f
     - Initialize `wandb.init(..., job_type="eval")` and `weave.init(...)` before sample processing begins
     - Trace each sample inference with `@weave.op`
     - Save `fmax_mf`, `fmax_bp`, `fmax_cc`, `overall_mean_fmax`
-    - Save `eval_summary` table and `eval_samples` table to W&B
-    - Save a Weave Evaluation record
+    - Save a one-row `eval_summary` table and a one-sample-per-row `eval_samples` table to W&B
+    - Save a Weave Evaluation Logger record and include `fmax_mf`, `fmax_bp`, `fmax_cc`, `overall_mean_fmax` via `ev.log_summary(...)`
     - Runs missing any of the above are not treated as successful
 
 ## 8. Training for SFT

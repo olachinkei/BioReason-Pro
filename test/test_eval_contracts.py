@@ -167,47 +167,58 @@ def install_eval_test_stubs():
             return decorator
         return decorator(func)
 
-    class FakeEvaluation:
+    class FakeScoreLogger:
+        def __init__(self, parent, inputs, output=None):
+            self.parent = parent
+            self.record = {
+                "inputs": inputs,
+                "output": output,
+                "scores": [],
+                "finished": False,
+            }
+            self.parent.predictions.append(self.record)
+
+        def log_score(self, scorer, score=None):
+            self.record["scores"].append({"scorer": scorer, "score": score})
+            return None
+
+        def finish(self, output=None):
+            if output is not None:
+                self.record["output"] = output
+            self.record["finished"] = True
+
+    class FakeEvaluationLogger:
         instances = []
-        async_mode = False
 
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-            self.dataset = kwargs.get("dataset", [])
-            self.scorers = kwargs.get("scorers", [])
-            self.preprocess_model_input = kwargs.get("preprocess_model_input", lambda row: row)
-            self.last_result = None
-            FakeEvaluation.instances.append(self)
+        def __init__(self, name=None, model=None, dataset=None, eval_attributes=None, scorers=None):
+            self.kwargs = {
+                "name": name,
+                "model": model,
+                "dataset": dataset,
+                "eval_attributes": eval_attributes,
+                "scorers": scorers,
+            }
+            self.predictions = []
+            self.examples = []
+            self.summary = None
+            FakeEvaluationLogger.instances.append(self)
 
-        def _run_evaluation(self, model):
-            rows = []
-            for row in self.dataset:
-                model_inputs = self.preprocess_model_input(row)
-                model_output = model(**model_inputs)
-                scorer_outputs = []
-                for scorer in self.scorers:
-                    scorer_outputs.append(
-                        scorer(
-                            expected_output=row.get("expected_output", ""),
-                            model_output=model_output,
-                        )
-                    )
-                rows.append({"row": row, "model_output": model_output, "scores": scorer_outputs})
-            self.last_result = {"rows": rows}
-            return self.last_result
+        def log_prediction(self, inputs, output=None):
+            return FakeScoreLogger(self, inputs, output=output)
 
-        def evaluate(self, model):
-            if self.async_mode:
-                async def _evaluate_async():
-                    return self._run_evaluation(model)
+        def log_example(self, inputs, output, scores):
+            self.examples.append({"inputs": inputs, "output": output, "scores": scores})
 
-                return _evaluate_async()
-            return self._run_evaluation(model)
+        def log_summary(self, summary=None, auto_summarize=True):
+            self.summary = {
+                "summary": dict(summary or {}),
+                "auto_summarize": auto_summarize,
+            }
 
     weave_module.init_calls = []
     weave_module.flush_calls = 0
     weave_module.op = weave_op
-    weave_module.Evaluation = FakeEvaluation
+    weave_module.EvaluationLogger = FakeEvaluationLogger
 
     def weave_init(project_name):
         weave_module.init_calls.append(project_name)
@@ -823,7 +834,7 @@ class EvalContractTests(unittest.TestCase):
         EVAL.wandb.last_run = None
         EVAL.weave.init_calls.clear()
         EVAL.weave.flush_calls = 0
-        EVAL.weave.Evaluation.instances.clear()
+        EVAL.weave.EvaluationLogger.instances.clear()
 
         result_rows = [
             {
@@ -873,22 +884,26 @@ class EvalContractTests(unittest.TestCase):
 
         self.assertTrue(tracking_status["metrics_loaded"])
         self.assertTrue(tracking_status["wandb_logged"])
+        self.assertTrue(tracking_status["summary_table_logged"])
+        self.assertTrue(tracking_status["sample_table_logged"])
         self.assertTrue(tracking_status["weave_logged"])
         self.assertEqual(EVAL.weave.flush_calls, 1)
         self.assertEqual(len(sample_rows), 1)
         self.assertEqual(sample_rows[0]["reasoning_full"], "model trace")
         self.assertEqual(sample_rows[0]["final_answer"], "GO:0001111")
         self.assertIn("exact_match=True", sample_rows[0]["accuracy_or_match_note"])
+        self.assertEqual(len(EVAL.weave.EvaluationLogger.instances), 1)
+        self.assertEqual(EVAL.weave.EvaluationLogger.instances[0].summary["summary"]["fmax_mf"], 0.9)
+        self.assertEqual(EVAL.weave.EvaluationLogger.instances[0].summary["summary"]["fmax_bp"], 0.2)
+        self.assertEqual(EVAL.weave.EvaluationLogger.instances[0].summary["summary"]["fmax_cc"], 0.7)
 
-    def test_log_eval_tracking_awaits_async_weave_evaluation(self):
+    def test_log_eval_tracking_uses_wandb_run_name_for_weave_logger(self):
         EVAL.wandb.init_calls.clear()
         EVAL.wandb.logged_payloads.clear()
         EVAL.wandb.last_run = None
         EVAL.weave.init_calls.clear()
         EVAL.weave.flush_calls = 0
-        EVAL.weave.Evaluation.instances.clear()
-        EVAL.weave.Evaluation.async_mode = True
-        self.addCleanup(setattr, EVAL.weave.Evaluation, "async_mode", False)
+        EVAL.weave.EvaluationLogger.instances.clear()
 
         result_rows = [
             {
@@ -927,9 +942,9 @@ class EvalContractTests(unittest.TestCase):
 
         self.assertTrue(tracking_status["weave_logged"])
         self.assertEqual(EVAL.weave.flush_calls, 1)
-        self.assertEqual(len(EVAL.weave.Evaluation.instances), 1)
-        self.assertIsNotNone(EVAL.weave.Evaluation.instances[0].last_result)
-        self.assertEqual(EVAL.weave.Evaluation.instances[0].kwargs["name"], "eval-run-test")
+        self.assertEqual(len(EVAL.weave.EvaluationLogger.instances), 1)
+        self.assertEqual(EVAL.weave.EvaluationLogger.instances[0].kwargs["name"], "eval-run-test")
+        self.assertEqual(EVAL.weave.EvaluationLogger.instances[0].summary["summary"]["fmax_mf"], 0.9)
 
     def test_log_eval_tracking_sets_default_weave_cache_dir(self):
         EVAL.wandb.init_calls.clear()
@@ -937,7 +952,7 @@ class EvalContractTests(unittest.TestCase):
         EVAL.wandb.last_run = None
         EVAL.weave.init_calls.clear()
         EVAL.weave.flush_calls = 0
-        EVAL.weave.Evaluation.instances.clear()
+        EVAL.weave.EvaluationLogger.instances.clear()
         EVAL.weave.op_calls.clear()
 
         result_rows = [
@@ -964,7 +979,10 @@ class EvalContractTests(unittest.TestCase):
             EVAL.os.environ.pop("WEAVE_SERVER_CACHE_DIR", None)
             wandb_dir = str(Path(tmpdir) / "wandb")
             metrics_path = Path(tmpdir) / "metrics_summary.json"
-            metrics_path.write_text(json.dumps({"molecular_function_f1": 0.9}), encoding="utf-8")
+            metrics_path.write_text(
+                json.dumps({"molecular_function_f1": 0.9, "overall_mean_f1": 0.6}),
+                encoding="utf-8",
+            )
             args = make_eval_args(
                 eval_split="test",
                 evals_path=tmpdir,
@@ -1003,21 +1021,20 @@ class EvalContractTests(unittest.TestCase):
         self.assertTrue(any("eval_samples" in payload for payload in EVAL.wandb.logged_payloads))
 
         self.assertEqual(EVAL.weave.init_calls[0], "demo-entity/bioreason-pro")
-        self.assertEqual(len(EVAL.weave.Evaluation.instances), 1)
-        self.assertEqual(len(EVAL.weave.Evaluation.instances[0].dataset), 1)
-        self.assertEqual(EVAL.weave.Evaluation.instances[0].kwargs["name"], "eval-run-test")
-        scorer_names = {call["name"] for call in EVAL.weave.op_calls}
-        self.assertIn("fmax_mf", scorer_names)
-        self.assertIn("fmax_bp", scorer_names)
-        self.assertIn("fmax_cc", scorer_names)
-        self.assertIn("overall_mean_fmax", scorer_names)
+        self.assertEqual(len(EVAL.weave.EvaluationLogger.instances), 1)
+        self.assertEqual(EVAL.weave.EvaluationLogger.instances[0].kwargs["name"], "eval-run-test")
+        self.assertEqual(len(EVAL.weave.EvaluationLogger.instances[0].predictions), 1)
+        self.assertEqual(
+            EVAL.weave.EvaluationLogger.instances[0].summary["summary"]["overall_mean_fmax"],
+            0.6,
+        )
 
     def test_log_eval_tracking_logs_tables_and_weave_for_validation(self):
         EVAL.wandb.init_calls.clear()
         EVAL.wandb.logged_payloads.clear()
         EVAL.wandb.last_run = None
         EVAL.weave.init_calls.clear()
-        EVAL.weave.Evaluation.instances.clear()
+        EVAL.weave.EvaluationLogger.instances.clear()
 
         result_rows = [
             {
@@ -1062,8 +1079,9 @@ class EvalContractTests(unittest.TestCase):
         self.assertTrue(any("eval_samples" in payload for payload in EVAL.wandb.logged_payloads))
         self.assertEqual(EVAL.wandb.last_run.artifacts, [])
         self.assertEqual(EVAL.weave.init_calls, ["demo-entity/bioreason-pro"])
-        self.assertEqual(len(EVAL.weave.Evaluation.instances), 1)
-        self.assertEqual(EVAL.weave.Evaluation.instances[0].kwargs["name"], "eval-run-validation")
+        self.assertEqual(len(EVAL.weave.EvaluationLogger.instances), 1)
+        self.assertEqual(EVAL.weave.EvaluationLogger.instances[0].kwargs["name"], "eval-run-validation")
+        self.assertEqual(EVAL.weave.EvaluationLogger.instances[0].summary["summary"]["fmax_bp"], 0.4)
 
     def test_enforce_required_eval_outputs_requires_metrics_for_validation(self):
         args = make_eval_args(eval_split="validation")

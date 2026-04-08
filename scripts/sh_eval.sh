@@ -34,6 +34,17 @@ cd "$(dirname "$0")/.."
 export PYTHONUNBUFFERED=1
 export PYTHONDONTWRITEBYTECODE=1
 
+PYTHON_BIN=${PYTHON_BIN:-}
+if [ -z "$PYTHON_BIN" ]; then
+    if [ -x "./.venv-gpu/bin/python" ]; then
+        PYTHON_BIN="./.venv-gpu/bin/python"
+    elif [ -x "./.venv/bin/python" ]; then
+        PYTHON_BIN="./.venv/bin/python"
+    else
+        PYTHON_BIN="python"
+    fi
+fi
+
 EVALS_DIR=${EVALS_DIR:-"./evals"}
 mkdir -p "$EVALS_DIR"
 
@@ -166,7 +177,7 @@ echo "Scratch directory: $EVALS_PATH"
 DEFAULT_DATASET_SOURCE="wanglab/cafa5"
 if [ -n "$DATASET_ARTIFACT" ] && { [ -z "$CAFA5_DATASET" ] || [ "$CAFA5_DATASET" = "$DEFAULT_DATASET_SOURCE" ]; }; then
     echo "--- Resolving reasoning dataset source for eval from W&B Artifact"
-    RESOLVED_REASONING_DATASET_DIR=$(python "$DATA_BUNDLE_RESOLVER" \
+    RESOLVED_REASONING_DATASET_DIR=$("$PYTHON_BIN" "$DATA_BUNDLE_RESOLVER" \
         --data-manifest-path "$DATA_MANIFEST_PATH" \
         --data-bundle "$DATA_BUNDLE" \
         --asset-key reasoning_dataset \
@@ -177,7 +188,7 @@ if [ -n "$DATASET_ARTIFACT" ] && { [ -z "$CAFA5_DATASET" ] || [ "$CAFA5_DATASET"
     fi
     CAFA5_DATASET="$RESOLVED_REASONING_DATASET_DIR"
     if [ -z "$DATASET_NAME" ] || [ "$DATASET_NAME" = "interlabel_test_dataset_with_gogpt_memorized_copy" ]; then
-        RESOLVED_REASONING_DATASET_NAME=$(python "$DATA_BUNDLE_RESOLVER" \
+        RESOLVED_REASONING_DATASET_NAME=$("$PYTHON_BIN" "$DATA_BUNDLE_RESOLVER" \
             --data-manifest-path "$DATA_MANIFEST_PATH" \
             --data-bundle "$DATA_BUNDLE" \
             --asset-key reasoning_dataset \
@@ -276,7 +287,7 @@ case "${KEEP_LOCAL_EVAL_OUTPUTS,,}" in
         ;;
 esac
 
-python "$EVAL_SCRIPT" \
+"$PYTHON_BIN" "$EVAL_SCRIPT" \
     --ckpt_dir "$MODEL_PATH" \
     --protein_model_name "$PROTEIN_MODEL_NAME" \
     --protein_embedding_layer "$PROTEIN_EMBEDDING_LAYER" \
