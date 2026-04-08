@@ -142,11 +142,98 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
 
         self.assertTrue(torch.equal(completion_ids, torch.tensor([21, 22])))
 
+    def test_extract_completion_ids_batch_handles_prompt_inclusive_output(self):
+        if torch is None:
+            self.skipTest("torch is not available in the contract test environment")
+
+        prompt_ids = torch.tensor([[11, 12, 13], [21, 22, 23]])
+        generated_ids = torch.tensor([[11, 12, 13, 31, 32], [21, 22, 23, 41]])
+
+        completion_ids_list = GRPO.extract_completion_ids_batch(generated_ids, prompt_ids)
+
+        self.assertEqual(len(completion_ids_list), 2)
+        self.assertTrue(torch.equal(completion_ids_list[0], torch.tensor([31, 32])))
+        self.assertTrue(torch.equal(completion_ids_list[1], torch.tensor([41])))
+
+    def test_evaluate_policy_uses_batched_generation_for_eval_batches(self):
+        if torch is None:
+            self.skipTest("torch is not available in the contract test environment")
+
+        class FakeModel:
+            def __init__(self):
+                self.generate_calls = []
+                self.eval_calls = 0
+                self.train_calls = 0
+
+            def eval(self):
+                self.eval_calls += 1
+
+            def train(self):
+                self.train_calls += 1
+
+            def generate(self, **kwargs):
+                self.generate_calls.append(kwargs)
+                return torch.tensor([[11, 12, 31], [21, 22, 32]])
+
+        class FakeTokenizer:
+            pad_token_id = 0
+            eos_token_id = 2
+
+            def decode(self, completion_ids, skip_special_tokens=False):
+                values = completion_ids.tolist()
+                return " ".join(str(value) for value in values)
+
+        batch = {
+            "input_ids": torch.tensor([[11, 12], [21, 22]]),
+            "attention_mask": torch.tensor([[1, 1], [1, 1]]),
+            "protein_sequences": ["AAA", "BBB"],
+            "batch_idx_map": [0, 1],
+            "batch_go_aspects": ["bp", "mf"],
+            "protein_ids": ["P1", "P2"],
+            "sample_splits": ["validation", "validation"],
+            "go_bp_targets": ["", ""],
+            "go_mf_targets": ["", ""],
+            "go_cc_targets": ["", ""],
+            "reasoning_targets": ["", ""],
+            "final_answers": ["", ""],
+            "prompt": ["prompt-1", "prompt-2"],
+        }
+        args = mock.Mock(
+            max_eval_batches=8,
+            do_sample=False,
+            temperature=0.7,
+            top_p=0.95,
+            min_new_tokens=1,
+            max_new_tokens=32,
+        )
+        model = FakeModel()
+        metrics = GRPO.evaluate_policy(
+            model=model,
+            ref_model=None,
+            dataloader=[batch],
+            tokenizer=FakeTokenizer(),
+            args=args,
+            reward_names=[],
+            reward_weights=[],
+            device=torch.device("cpu"),
+            trace_state=None,
+            global_step=25,
+        )
+
+        self.assertEqual(len(model.generate_calls), 1)
+        self.assertEqual(tuple(model.generate_calls[0]["input_ids"].shape), (2, 2))
+        self.assertEqual(metrics["eval_completion_length"], 1.0)
+        self.assertEqual(metrics["eval_data_step_num_datums"], 2.0)
+        self.assertEqual(model.eval_calls, 1)
+        self.assertEqual(model.train_calls, 1)
+
     def test_rl_script_uses_canonical_metrics_and_input_artifact_lineage(self):
         source = SCRIPT_PATH.read_text()
 
         self.assertIn("maybe_use_artifact_refs(", source)
         self.assertIn("maybe_trace_generation(", source)
+        self.assertIn("extract_completion_ids_batch(", source)
+        self.assertIn("evaluate_policy_batch(", source)
         self.assertIn("candidate.is_file()", source)
         self.assertIn("precomputed_go_embedding_cache_path", source)
         self.assertIn("model.load_precomputed_go_embedding_cache(", source)

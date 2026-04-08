@@ -17,6 +17,7 @@ import os
 import random
 import re
 import time
+import traceback
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
@@ -578,6 +579,23 @@ def build_dataloader(dataset: Any, model: Any, batch_size: int, num_workers: int
     )
 
 
+def extract_sample_meta_from_batch(batch: Mapping[str, Any], example_idx: int) -> Dict[str, str]:
+    return {
+        "protein_id": batch.get("protein_ids", [""])[example_idx] if example_idx < len(batch.get("protein_ids", [])) else "",
+        "split": batch.get("sample_splits", [""])[example_idx] if example_idx < len(batch.get("sample_splits", [])) else "",
+        "go_bp": batch.get("go_bp_targets", [""])[example_idx] if example_idx < len(batch.get("go_bp_targets", [])) else "",
+        "go_mf": batch.get("go_mf_targets", [""])[example_idx] if example_idx < len(batch.get("go_mf_targets", [])) else "",
+        "go_cc": batch.get("go_cc_targets", [""])[example_idx] if example_idx < len(batch.get("go_cc_targets", [])) else "",
+        "reasoning": batch.get("reasoning_targets", [""])[example_idx]
+        if example_idx < len(batch.get("reasoning_targets", []))
+        else "",
+        "final_answer": batch.get("final_answers", [""])[example_idx]
+        if example_idx < len(batch.get("final_answers", []))
+        else "",
+        "prompt_preview": batch.get("prompt", [""])[example_idx] if example_idx < len(batch.get("prompt", [])) else "",
+    }
+
+
 def extract_example_from_batch(batch: Mapping[str, Any], example_idx: int, device: Any) -> Dict[str, Any]:
     import torch
 
@@ -596,17 +614,6 @@ def extract_example_from_batch(batch: Mapping[str, Any], example_idx: int, devic
     if example_idx < len(go_aspects):
         example_go_aspect = go_aspects[example_idx]
 
-    sample_meta = {
-        "protein_id": batch.get("protein_ids", [""])[example_idx] if example_idx < len(batch.get("protein_ids", [])) else "",
-        "split": batch.get("sample_splits", [""])[example_idx] if example_idx < len(batch.get("sample_splits", [])) else "",
-        "go_bp": batch.get("go_bp_targets", [""])[example_idx] if example_idx < len(batch.get("go_bp_targets", [])) else "",
-        "go_mf": batch.get("go_mf_targets", [""])[example_idx] if example_idx < len(batch.get("go_mf_targets", [])) else "",
-        "go_cc": batch.get("go_cc_targets", [""])[example_idx] if example_idx < len(batch.get("go_cc_targets", [])) else "",
-        "reasoning": batch.get("reasoning_targets", [""])[example_idx] if example_idx < len(batch.get("reasoning_targets", [])) else "",
-        "final_answer": batch.get("final_answers", [""])[example_idx] if example_idx < len(batch.get("final_answers", [])) else "",
-        "prompt_preview": batch.get("prompt", [""])[example_idx] if example_idx < len(batch.get("prompt", [])) else "",
-    }
-
     return {
         "input_ids": batch["input_ids"][example_idx : example_idx + 1].to(device),
         "attention_mask": batch["attention_mask"][example_idx : example_idx + 1].to(device),
@@ -614,7 +621,7 @@ def extract_example_from_batch(batch: Mapping[str, Any], example_idx: int, devic
         "batch_idx_map": [0] * len(example_sequences),
         "structure_coords": example_structure,
         "go_aspects": [example_go_aspect if example_go_aspect is not None else "all"],
-        "sample_meta": sample_meta,
+        "sample_meta": extract_sample_meta_from_batch(batch, example_idx),
     }
 
 
@@ -651,6 +658,31 @@ def extract_completion_ids(generated_ids: Any, prompt_input_ids: Any) -> Any:
     if generated_tokens.shape[0] >= prompt_len and torch.equal(generated_tokens[:prompt_len], prompt_tokens):
         return generated_tokens[prompt_len:].detach()
     return generated_tokens.detach()
+
+
+def extract_completion_ids_batch(generated_ids: Any, prompt_input_ids: Any) -> List[Any]:
+    import torch
+
+    if generated_ids.dim() != 2:
+        raise ValueError(f"Expected rank-2 generated ids, got shape {tuple(generated_ids.shape)}")
+    if prompt_input_ids.dim() != 2:
+        raise ValueError(f"Expected rank-2 prompt ids for batched extraction, got shape {tuple(prompt_input_ids.shape)}")
+    if generated_ids.shape[0] != prompt_input_ids.shape[0]:
+        raise ValueError(
+            "Generated ids and prompt ids must have the same batch size for batched extraction: "
+            f"{generated_ids.shape[0]} != {prompt_input_ids.shape[0]}"
+        )
+
+    completions: List[Any] = []
+    for row_idx in range(generated_ids.shape[0]):
+        prompt_tokens = prompt_input_ids[row_idx].detach().to(device=generated_ids.device, dtype=generated_ids.dtype)
+        generated_tokens = generated_ids[row_idx]
+        prompt_len = int(prompt_tokens.shape[0])
+        if generated_tokens.shape[0] >= prompt_len and torch.equal(generated_tokens[:prompt_len], prompt_tokens):
+            completions.append(generated_tokens[prompt_len:].detach())
+        else:
+            completions.append(generated_tokens.detach())
+    return completions
 
 
 def build_combined_inputs(prompt_input_ids: Any, prompt_attention_mask: Any, completion_ids: Any) -> Tuple[Any, Any, int]:
@@ -692,6 +724,244 @@ def compute_completion_token_log_probs(
 
     start_index = max(prompt_len - 1, 0)
     return token_log_probs[:, start_index:]
+
+
+def compute_batched_completion_kl(
+    model: Any,
+    ref_model: Any,
+    prompt_input_ids: Any,
+    prompt_attention_mask: Any,
+    completion_ids_list: Sequence[Any],
+    protein_sequences: Sequence[str],
+    batch_idx_map: Sequence[int],
+    structure_coords: Any,
+    go_aspects: Sequence[str],
+    pad_token_id: int,
+) -> float:
+    import torch
+
+    if ref_model is None:
+        return 0.0
+
+    max_completion_len = max((int(completion_ids.numel()) for completion_ids in completion_ids_list), default=0)
+    if max_completion_len <= 0:
+        return 0.0
+
+    completion_batch = torch.full(
+        (len(completion_ids_list), max_completion_len),
+        int(pad_token_id),
+        dtype=prompt_input_ids.dtype,
+        device=prompt_input_ids.device,
+    )
+    completion_attention = torch.zeros(
+        (len(completion_ids_list), max_completion_len),
+        dtype=prompt_attention_mask.dtype,
+        device=prompt_attention_mask.device,
+    )
+
+    for example_idx, completion_ids in enumerate(completion_ids_list):
+        completion_len = int(completion_ids.numel())
+        if completion_len <= 0:
+            continue
+        completion_tensor = completion_ids.to(device=prompt_input_ids.device, dtype=prompt_input_ids.dtype)
+        completion_batch[example_idx, :completion_len] = completion_tensor
+        completion_attention[example_idx, :completion_len] = 1
+
+    combined_input_ids = torch.cat([prompt_input_ids, completion_batch], dim=1)
+    combined_attention_mask = torch.cat([prompt_attention_mask, completion_attention], dim=1)
+    prompt_len = prompt_input_ids.shape[1]
+
+    current_lp = compute_completion_token_log_probs(
+        model,
+        combined_input_ids,
+        combined_attention_mask,
+        prompt_len,
+        protein_sequences,
+        batch_idx_map,
+        structure_coords,
+        go_aspects,
+    )
+    ref_lp = compute_completion_token_log_probs(
+        ref_model,
+        combined_input_ids,
+        combined_attention_mask,
+        prompt_len,
+        protein_sequences,
+        batch_idx_map,
+        structure_coords,
+        go_aspects,
+    )
+    valid_mask = completion_attention.bool()
+    if not torch.any(valid_mask):
+        return 0.0
+
+    kl_term = torch.exp(ref_lp - current_lp) - (ref_lp - current_lp) - 1.0
+    valid_counts = valid_mask.sum(dim=1)
+    per_example_kl = (kl_term * valid_mask.to(dtype=kl_term.dtype)).sum(dim=1) / valid_counts.clamp_min(1).to(
+        dtype=kl_term.dtype
+    )
+    return float(per_example_kl[valid_counts > 0].sum().item())
+
+
+def evaluate_policy_example(
+    model: Any,
+    ref_model: Any,
+    example: Mapping[str, Any],
+    tokenizer: Any,
+    args: argparse.Namespace,
+    reward_names: Sequence[str],
+    reward_weights: Sequence[float],
+    trace_state: Optional[Dict[str, Any]] = None,
+    global_step: int = 0,
+) -> Dict[str, float]:
+    import torch
+
+    generated_ids = model.generate(
+        input_ids=example["input_ids"],
+        attention_mask=example["attention_mask"],
+        protein_sequences=example["protein_sequences"],
+        batch_idx_map=example["batch_idx_map"],
+        structure_coords=example["structure_coords"],
+        go_aspects=example["go_aspects"],
+        do_sample=args.do_sample,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        min_new_tokens=args.min_new_tokens,
+        max_new_tokens=args.max_new_tokens,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+    )
+    completion_ids = extract_completion_ids(generated_ids, example["input_ids"])
+    completion_text = decode_completion(tokenizer, completion_ids)
+    rewards, _ = compute_group_rewards([completion_text], example["sample_meta"], reward_names, reward_weights)
+    maybe_trace_generation(
+        trace_state,
+        split="validation",
+        global_step=global_step,
+        sample_meta=example["sample_meta"],
+        completion=completion_text,
+        total_reward=rewards[0],
+        advantage=None,
+    )
+
+    kl_value = 0.0
+    if ref_model is not None and completion_ids.numel() > 0:
+        combined_ids, combined_mask, prompt_token_len = build_combined_inputs(
+            example["input_ids"],
+            example["attention_mask"],
+            completion_ids,
+        )
+        current_lp = compute_completion_token_log_probs(
+            model,
+            combined_ids,
+            combined_mask,
+            prompt_token_len,
+            example["protein_sequences"],
+            example["batch_idx_map"],
+            example["structure_coords"],
+            example["go_aspects"],
+        )
+        ref_lp = compute_completion_token_log_probs(
+            ref_model,
+            combined_ids,
+            combined_mask,
+            prompt_token_len,
+            example["protein_sequences"],
+            example["batch_idx_map"],
+            example["structure_coords"],
+            example["go_aspects"],
+        )
+        kl_term = torch.exp(ref_lp - current_lp) - (ref_lp - current_lp) - 1.0
+        kl_value = float(kl_term.mean().item())
+
+    return {
+        "reward_sum": float(rewards[0]),
+        "length_sum": float(completion_ids.numel()),
+        "kl_sum": kl_value,
+        "sample_count": 1.0,
+    }
+
+
+def evaluate_policy_batch(
+    model: Any,
+    ref_model: Any,
+    batch: Mapping[str, Any],
+    tokenizer: Any,
+    args: argparse.Namespace,
+    reward_names: Sequence[str],
+    reward_weights: Sequence[float],
+    device: Any,
+    trace_state: Optional[Dict[str, Any]] = None,
+    global_step: int = 0,
+) -> Dict[str, float]:
+    import torch
+
+    input_ids = batch["input_ids"].to(device)
+    attention_mask = batch["attention_mask"].to(device)
+    batch_size = input_ids.shape[0]
+    structure_coords = batch.get("structure_coords")
+    if isinstance(structure_coords, torch.Tensor):
+        structure_coords = structure_coords.to(device)
+
+    protein_sequences = list(batch.get("protein_sequences") or [])
+    batch_idx_map = list(batch.get("batch_idx_map") or [])
+    raw_go_aspects = list(batch.get("batch_go_aspects") or [])
+    go_aspects = [raw_go_aspects[idx] if idx < len(raw_go_aspects) and raw_go_aspects[idx] is not None else "all" for idx in range(batch_size)]
+
+    generated_ids = model.generate(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        protein_sequences=protein_sequences,
+        batch_idx_map=batch_idx_map,
+        structure_coords=structure_coords,
+        go_aspects=go_aspects,
+        do_sample=args.do_sample,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        min_new_tokens=args.min_new_tokens,
+        max_new_tokens=args.max_new_tokens,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+    )
+    completion_ids_list = extract_completion_ids_batch(generated_ids, input_ids)
+
+    reward_sum = 0.0
+    length_sum = 0.0
+    for example_idx, completion_ids in enumerate(completion_ids_list):
+        completion_text = decode_completion(tokenizer, completion_ids)
+        sample_meta = extract_sample_meta_from_batch(batch, example_idx)
+        rewards, _ = compute_group_rewards([completion_text], sample_meta, reward_names, reward_weights)
+        reward_sum += float(rewards[0])
+        length_sum += float(completion_ids.numel())
+        maybe_trace_generation(
+            trace_state,
+            split="validation",
+            global_step=global_step,
+            sample_meta=sample_meta,
+            completion=completion_text,
+            total_reward=rewards[0],
+            advantage=None,
+        )
+
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    kl_sum = compute_batched_completion_kl(
+        model,
+        ref_model,
+        input_ids,
+        attention_mask,
+        completion_ids_list,
+        protein_sequences,
+        batch_idx_map,
+        structure_coords,
+        go_aspects,
+        pad_token_id,
+    )
+    return {
+        "reward_sum": reward_sum,
+        "length_sum": length_sum,
+        "kl_sum": kl_sum,
+        "sample_count": float(batch_size),
+    }
 
 
 def compute_group_rewards(
@@ -898,67 +1168,78 @@ def evaluate_policy(
             if args.max_eval_batches > 0 and batch_idx >= args.max_eval_batches:
                 break
             batch_size = batch["input_ids"].shape[0]
+            batch_metrics: Optional[Dict[str, float]] = None
+            if batch_size > 1:
+                try:
+                    print(
+                        f"Running batched RL validation eval: batch_idx={batch_idx}, "
+                        f"batch_size={batch_size}, global_step={global_step}."
+                    )
+                    batch_metrics = evaluate_policy_batch(
+                        model=model,
+                        ref_model=ref_model,
+                        batch=batch,
+                        tokenizer=tokenizer,
+                        args=args,
+                        reward_names=reward_names,
+                        reward_weights=reward_weights,
+                        device=device,
+                        trace_state=trace_state,
+                        global_step=global_step,
+                    )
+                except torch.cuda.OutOfMemoryError:
+                    print(
+                        f"CUDA Out of Memory during RL validation eval batch of size {batch_size}; "
+                        "falling back to single-sample validation for this batch."
+                    )
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception as exc:
+                    print(
+                        f"Batched RL validation eval failed for batch size {batch_size}: {exc}. "
+                        "Falling back to single-sample validation for this batch."
+                    )
+                    traceback.print_exc()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+            else:
+                batch_metrics = evaluate_policy_batch(
+                    model=model,
+                    ref_model=ref_model,
+                    batch=batch,
+                    tokenizer=tokenizer,
+                    args=args,
+                    reward_names=reward_names,
+                    reward_weights=reward_weights,
+                    device=device,
+                    trace_state=trace_state,
+                    global_step=global_step,
+                )
+
+            if batch_metrics is not None:
+                total_reward += batch_metrics["reward_sum"]
+                total_length += batch_metrics["length_sum"]
+                total_kl += batch_metrics["kl_sum"]
+                sample_count += int(batch_metrics["sample_count"])
+                continue
+
             for example_idx in range(batch_size):
                 example = extract_example_from_batch(batch, example_idx, device)
-                prompt_len = example["input_ids"].shape[1]
-                generated_ids = model.generate(
-                    input_ids=example["input_ids"],
-                    attention_mask=example["attention_mask"],
-                    protein_sequences=example["protein_sequences"],
-                    batch_idx_map=example["batch_idx_map"],
-                    structure_coords=example["structure_coords"],
-                    go_aspects=example["go_aspects"],
-                    do_sample=args.do_sample,
-                    temperature=args.temperature,
-                    top_p=args.top_p,
-                    min_new_tokens=args.min_new_tokens,
-                    max_new_tokens=args.max_new_tokens,
-                    pad_token_id=tokenizer.pad_token_id,
-                    eos_token_id=tokenizer.eos_token_id,
-                )
-                completion_ids = extract_completion_ids(generated_ids, example["input_ids"])
-                completion_text = decode_completion(tokenizer, completion_ids)
-                rewards, _ = compute_group_rewards([completion_text], example["sample_meta"], reward_names, reward_weights)
-                total_reward += rewards[0]
-                total_length += float(completion_ids.numel())
-                maybe_trace_generation(
-                    trace_state,
-                    split="validation",
+                example_metrics = evaluate_policy_example(
+                    model=model,
+                    ref_model=ref_model,
+                    example=example,
+                    tokenizer=tokenizer,
+                    args=args,
+                    reward_names=reward_names,
+                    reward_weights=reward_weights,
+                    trace_state=trace_state,
                     global_step=global_step,
-                    sample_meta=example["sample_meta"],
-                    completion=completion_text,
-                    total_reward=rewards[0],
-                    advantage=None,
                 )
-                if ref_model is not None and completion_ids.numel() > 0:
-                    combined_ids, combined_mask, prompt_token_len = build_combined_inputs(
-                        example["input_ids"],
-                        example["attention_mask"],
-                        completion_ids,
-                    )
-                    current_lp = compute_completion_token_log_probs(
-                        model,
-                        combined_ids,
-                        combined_mask,
-                        prompt_token_len,
-                        example["protein_sequences"],
-                        example["batch_idx_map"],
-                        example["structure_coords"],
-                        example["go_aspects"],
-                    )
-                    ref_lp = compute_completion_token_log_probs(
-                        ref_model,
-                        combined_ids,
-                        combined_mask,
-                        prompt_token_len,
-                        example["protein_sequences"],
-                        example["batch_idx_map"],
-                        example["structure_coords"],
-                        example["go_aspects"],
-                    )
-                    kl_term = torch.exp(ref_lp - current_lp) - (ref_lp - current_lp) - 1.0
-                    total_kl += float(kl_term.mean().item())
-                sample_count += 1
+                total_reward += example_metrics["reward_sum"]
+                total_length += example_metrics["length_sum"]
+                total_kl += example_metrics["kl_sum"]
+                sample_count += int(example_metrics["sample_count"])
 
     model.train()
     if sample_count == 0:

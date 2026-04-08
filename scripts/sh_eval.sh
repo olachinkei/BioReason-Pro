@@ -98,9 +98,12 @@ MAX_NEW_TOKENS=5000
 TEMPERATURE=0
 TOP_P=0.95
 REPETITION_PENALTY=1.0
+INFERENCE_BATCH_SIZE=${INFERENCE_BATCH_SIZE:-1}
 PASS_AT_K=1
 PROTEIN_EMBEDDING_LAYER=37
 UNIFIED_GO_ENCODER=True
+VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION:-0.4}
+VLLM_MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:-256}
 
 # GO Model Architecture (must match training config)
 GO_HIDDEN_DIM=512
@@ -173,6 +176,9 @@ echo "Model checkpoint: $MODEL_PATH"
 echo "Protein model: $PROTEIN_MODEL_NAME"
 echo "Evaluation split: $EVAL_SPLIT"
 echo "Scratch directory: $EVALS_PATH"
+echo "Inference batch size: $INFERENCE_BATCH_SIZE"
+echo "vLLM gpu_memory_utilization: $VLLM_GPU_MEMORY_UTILIZATION"
+echo "vLLM max_num_seqs: $VLLM_MAX_NUM_SEQS"
 
 DEFAULT_DATASET_SOURCE="wanglab/cafa5"
 if [ -n "$DATASET_ARTIFACT" ] && { [ -z "$CAFA5_DATASET" ] || [ "$CAFA5_DATASET" = "$DEFAULT_DATASET_SOURCE" ]; }; then
@@ -324,8 +330,11 @@ esac
     --max_new_tokens $MAX_NEW_TOKENS \
     --temperature $TEMPERATURE \
     --top_p $TOP_P \
+    --inference_batch_size $INFERENCE_BATCH_SIZE \
     --pass_at_k $PASS_AT_K \
     --repetition_penalty $REPETITION_PENALTY \
+    --vllm_gpu_memory_utilization $VLLM_GPU_MEMORY_UTILIZATION \
+    --vllm_max_num_seqs $VLLM_MAX_NUM_SEQS \
     --evals_path "$EVALS_PATH" \
     "${MODEL_OPTIONAL_ARGS[@]}" \
     "${TRACKING_ARGS[@]}" \

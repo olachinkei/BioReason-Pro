@@ -335,6 +335,7 @@ def make_eval_args(**overrides):
         temperature=0.1,
         top_p=0.9,
         repetition_penalty=1.0,
+        inference_batch_size=1,
         pass_at_k=1,
         num_chunks=1,
         chunk_id=0,
@@ -365,6 +366,8 @@ def make_eval_args(**overrides):
         weave_project=None,
         weave_eval_name=None,
         keep_local_eval_outputs=False,
+        vllm_gpu_memory_utilization=0.4,
+        vllm_max_num_seqs=256,
     )
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -451,6 +454,23 @@ class EvalContractTests(unittest.TestCase):
 
         self.assertIsNone(args.precomputed_embeddings_path)
 
+    def test_argument_parser_defaults_to_single_sample_batches(self):
+        parser = EVAL.setup_argument_parser()
+        args = parser.parse_args(
+            [
+                "--ckpt_dir",
+                "/tmp/mock-ckpt",
+                "--go_obo_path",
+                "/tmp/go-basic.obo",
+                "--evals_path",
+                "/tmp/evals",
+            ]
+        )
+
+        self.assertEqual(args.inference_batch_size, 1)
+        self.assertEqual(args.vllm_gpu_memory_utilization, 0.4)
+        self.assertEqual(args.vllm_max_num_seqs, 256)
+
     def test_initialize_model_treats_empty_precomputed_embeddings_path_as_none(self):
         args = make_eval_args(precomputed_embeddings_path="")
 
@@ -461,6 +481,80 @@ class EvalContractTests(unittest.TestCase):
 
         self.assertIs(result, mock_model)
         self.assertEqual(mock_model_cls.call_args.kwargs["precomputed_embeddings_path"], None)
+        self.assertEqual(mock_model_cls.call_args.kwargs["gpu_memory_utilization"], 0.4)
+        self.assertEqual(mock_model_cls.call_args.kwargs["max_num_seqs"], 256)
+
+    def test_process_sample_batch_uses_single_generate_call_for_multiple_samples(self):
+        class FakeTensor:
+            def __init__(self, batch_size):
+                self.shape = (batch_size, 3)
+
+            def to(self, *_args, **_kwargs):
+                return self
+
+        class FakeTokenizer:
+            def apply_chat_template(self, conversation, tokenize=False, add_generation_prompt=True, enable_thinking=True):
+                self.last_conversation = conversation
+                return f"prompt:{conversation[-1]['content']}"
+
+        class FakeProcessor:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, **kwargs):
+                self.calls.append(kwargs)
+                batch_size = len(kwargs["text"])
+                return {
+                    "input_ids": FakeTensor(batch_size),
+                    "attention_mask": FakeTensor(batch_size),
+                }
+
+        class FakeModel:
+            def __init__(self):
+                self.text_tokenizer = FakeTokenizer()
+                self.processor = FakeProcessor()
+                self.max_length_text = 128
+                self.max_length_protein = 64
+                self.generate_calls = []
+
+            def generate(self, **kwargs):
+                self.generate_calls.append(kwargs)
+                batch_size = kwargs["input_ids"].shape[0]
+                return [f"response-{idx}" for idx in range(batch_size)]
+
+        model = FakeModel()
+        args = make_eval_args()
+        samples = [
+            {
+                "protein_id": "P1",
+                "go_aspect": "molecular_function",
+                "sequence": "MSTN",
+                "prompt": [
+                    {"role": "system", "content": "system"},
+                    {"role": "user", "content": "user-1"},
+                    {"role": "assistant", "content": [{"text": "GO:0001111"}]},
+                ],
+            },
+            {
+                "protein_id": "P2",
+                "go_aspect": "biological_process",
+                "sequence": "AAAA",
+                "prompt": [
+                    {"role": "system", "content": "system"},
+                    {"role": "user", "content": "user-2"},
+                    {"role": "assistant", "content": [{"text": "GO:0002222"}]},
+                ],
+            },
+        ]
+
+        result_rows = EVAL.process_sample_batch(model, samples, args)
+
+        self.assertEqual(len(model.processor.calls), 1)
+        self.assertEqual(model.processor.calls[0]["text"], ["prompt:user-1", "prompt:user-2"])
+        self.assertEqual(len(model.generate_calls), 1)
+        self.assertEqual(model.generate_calls[0]["protein_sequences"], ["MSTN", "AAAA"])
+        self.assertEqual(model.generate_calls[0]["batch_idx_map"], [0, 1])
+        self.assertEqual([row["generated_response"] for row in result_rows], ["response-0", "response-1"])
 
     def test_select_eval_dataset_supports_validation_and_test(self):
         train_ds = FakeDataset([{"protein_id": "train"}])

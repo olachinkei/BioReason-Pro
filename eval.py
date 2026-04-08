@@ -25,7 +25,7 @@ from pathlib import Path
 import shutil
 import time
 from collections import OrderedDict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 import torch
 from tqdm import tqdm
 import traceback
@@ -170,6 +170,8 @@ def initialize_model(args) -> ProteinLLMModel:
         go_num_heads=args.go_num_heads,
         go_num_reduced_embeddings=args.go_num_reduced_embeddings,
         go_embedding_dim=args.go_embedding_dim,
+        gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+        max_num_seqs=args.vllm_max_num_seqs,
         text_model_finetune=False,
         protein_model_finetune=False,
         go_model_finetune=False,
@@ -1225,6 +1227,12 @@ def process_single_sample(
     model: ProteinLLMModel, sample: Dict[str, Any], protein_id: str, go_aspect: str, go_bp: str, go_mf: str, go_cc: str, go_bp_leaf: str, go_mf_leaf: str, go_cc_leaf: str, args
 ) -> Dict[str, Any]:
     """Process a single sample and return the result."""
+    batch_results = process_sample_batch(model, [sample], args)
+    return batch_results[0] if batch_results else None
+
+
+def build_generation_prompt(model: ProteinLLMModel, sample: Dict[str, Any], protein_id: str, args) -> Optional[str]:
+    """Build the user-facing generation prompt for one evaluation sample."""
     conversation_data = sample.get("prompt")
     if conversation_data is None:
         print(f"No prompt data for protein {protein_id}, skipping...")
@@ -1246,16 +1254,65 @@ def process_single_sample(
         add_generation_prompt=True,
         enable_thinking=args.enable_thinking,  # Avoid empty thinking injection
     )
+    return final_prompt_string
 
-    sequence = sample.get("sequence")
-    if sequence is None:
-        print(f"No sequence data for protein {protein_id}, skipping...")
-        return None
+
+def process_sample_batch(model: ProteinLLMModel, samples: List[Dict[str, Any]], args) -> List[Optional[Dict[str, Any]]]:
+    """Process a batch of samples in one vLLM generation call when possible."""
+    results: List[Optional[Dict[str, Any]]] = [None] * len(samples)
+    prepared_samples: List[Dict[str, Any]] = []
+    batch_prompts: List[str] = []
+    batch_sequences: List[str] = []
+    batch_go_aspects: List[str] = []
+
+    for sample_idx, sample in enumerate(samples):
+        protein_id = sample.get("protein_id")
+        go_aspect = sample.get("go_aspect", "all")
+        go_bp = sample.get("go_bp", "")
+        go_mf = sample.get("go_mf", "")
+        go_cc = sample.get("go_cc", "")
+        go_bp_leaf = sample.get("go_bp_leaf", "")
+        go_mf_leaf = sample.get("go_mf_leaf", "")
+        go_cc_leaf = sample.get("go_cc_leaf", "")
+
+        final_prompt_string = build_generation_prompt(model, sample, protein_id, args)
+        if final_prompt_string is None:
+            continue
+
+        sequence = sample.get("sequence")
+        if sequence is None:
+            print(f"No sequence data for protein {protein_id}, skipping...")
+            continue
+
+        valid_batch_idx = len(batch_prompts)
+        batch_prompts.append(final_prompt_string)
+        batch_sequences.append(sequence)
+        batch_go_aspects.append(go_aspect)
+        prepared_samples.append(
+            {
+                "sample_idx": sample_idx,
+                "valid_batch_idx": valid_batch_idx,
+                "protein_id": protein_id,
+                "go_aspect": go_aspect,
+                "go_bp": go_bp,
+                "go_mf": go_mf,
+                "go_cc": go_cc,
+                "go_bp_leaf": go_bp_leaf,
+                "go_mf_leaf": go_mf_leaf,
+                "go_cc_leaf": go_cc_leaf,
+                "sequence": sequence,
+                "input_prompt": final_prompt_string,
+                "sample": sample,
+            }
+        )
+
+    if not prepared_samples:
+        return results
 
     processed_inputs = model.processor(
-        text=[final_prompt_string],
-        batch_protein_sequences=[[sequence]],
-        batch_go_aspects=[go_aspect],
+        text=batch_prompts,
+        batch_protein_sequences=[[sequence] for sequence in batch_sequences],
+        batch_go_aspects=batch_go_aspects,
         max_length_text=model.max_length_text,
         max_length_protein=model.max_length_protein,
         return_tensors="pt",
@@ -1270,9 +1327,9 @@ def process_single_sample(
         generated_outputs = model.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            protein_sequences=[sequence],
-            batch_idx_map=[0],
-            go_aspects=[go_aspect],
+            protein_sequences=batch_sequences,
+            batch_idx_map=list(range(len(batch_sequences))),
+            go_aspects=batch_go_aspects,
             structure_coords=structure_coords,
             # Pass generation parameters from args
             temperature=args.temperature,
@@ -1282,26 +1339,39 @@ def process_single_sample(
             stop=STOP_TOKENS,
         )
 
-    response_text = generated_outputs[0] if generated_outputs else "Error: Empty response"
+    if len(generated_outputs) != len(prepared_samples):
+        raise ValueError(
+            f"Batch generation output count mismatch: expected {len(prepared_samples)}, got {len(generated_outputs)}"
+        )
 
-    result_record = {
-        "protein_id": protein_id,
-        "go_aspect": go_aspect,
-        "ground_truth": _get_ground_truth(sample),
-        "generated_response": response_text,
-        "success": True,
-        "protein_sequence": sequence,
-        "input_prompt": final_prompt_string,
-        "sequence_length": len(sequence) if sequence else 0,
-        "go_bp": go_bp,
-        "go_mf": go_mf,
-        "go_cc": go_cc,
-        "go_bp_leaf": go_bp_leaf,
-        "go_mf_leaf": go_mf_leaf,
-        "go_cc_leaf": go_cc_leaf,
-    }
+    for prepared in prepared_samples:
+        response_text = generated_outputs[prepared["valid_batch_idx"]] or "Error: Empty response"
+        sample = prepared["sample"]
+        results[prepared["sample_idx"]] = {
+            "protein_id": prepared["protein_id"],
+            "go_aspect": prepared["go_aspect"],
+            "ground_truth": _get_ground_truth(sample),
+            "generated_response": response_text,
+            "success": True,
+            "protein_sequence": prepared["sequence"],
+            "input_prompt": prepared["input_prompt"],
+            "sequence_length": len(prepared["sequence"]) if prepared["sequence"] else 0,
+            "go_bp": prepared["go_bp"],
+            "go_mf": prepared["go_mf"],
+            "go_cc": prepared["go_cc"],
+            "go_bp_leaf": prepared["go_bp_leaf"],
+            "go_mf_leaf": prepared["go_mf_leaf"],
+            "go_cc_leaf": prepared["go_cc_leaf"],
+        }
 
-    return result_record
+    return results
+
+
+def iter_sample_batches(samples: List[Dict[str, Any]], batch_size: int) -> Iterable[List[Dict[str, Any]]]:
+    """Yield evaluation samples in fixed-size batches."""
+    effective_batch_size = max(1, int(batch_size or 1))
+    for start_idx in range(0, len(samples), effective_batch_size):
+        yield samples[start_idx:start_idx + effective_batch_size]
 
 
 def print_final_statistics(newly_processed: int, total_time: float, evals_path: str) -> None:
@@ -1338,93 +1408,151 @@ def run_local_inference(args):
 
         # Main inference loop - only process unprocessed samples
         print(f"\nStarting inference loop with pass@{args.pass_at_k}...")
+        print(f"Using inference batch size: {args.inference_batch_size}")
         t_start = time.time()
         successfully_processed = 0
+        progress = tqdm(total=len(unprocessed_samples), desc="Processing Samples", unit="sample")
+        try:
+            for sample_batch in iter_sample_batches(unprocessed_samples, args.inference_batch_size):
+                batch_success_flags = [False] * len(sample_batch)
 
-        for sample in tqdm(unprocessed_samples, desc="Processing Samples", total=len(unprocessed_samples), unit="sample"):
-            protein_id = sample.get("protein_id")
-            go_aspect = sample.get("go_aspect", "all")
-            go_bp = sample.get("go_bp", "")
-            go_mf = sample.get("go_mf", "")
-            go_cc = sample.get("go_cc", "")
-            go_bp_leaf = sample.get("go_bp_leaf", "")
-            go_mf_leaf = sample.get("go_mf_leaf", "")
-            go_cc_leaf = sample.get("go_cc_leaf", "")
+                for k_idx in range(args.pass_at_k):
+                    batch_results: Optional[List[Optional[Dict[str, Any]]]] = None
 
-            # Generate k samples for pass@k
-            sample_has_success = False
-            for k_idx in range(args.pass_at_k):
-                try:
-                    result_record = process_single_sample(model, sample, protein_id, go_aspect, go_bp, go_mf, go_cc, go_bp_leaf, go_mf_leaf, go_cc_leaf, args)
-                    if result_record is not None:
-                        save_result(result_record, protein_id, go_aspect, args.evals_path, k_idx=k_idx)
-                        maybe_trace_eval_sample(
-                            tracking_state,
-                            args=args,
-                            sample=sample,
-                            protein_id=protein_id,
-                            go_aspect=go_aspect,
-                            attempt_idx=k_idx,
-                            result_record=result_record,
-                        )
-                        if not sample_has_success:
-                            successfully_processed += 1
-                            sample_has_success = True
+                    if len(sample_batch) > 1:
+                        try:
+                            batch_results = process_sample_batch(model, sample_batch, args)
+                        except torch.cuda.OutOfMemoryError:
+                            print(
+                                f"CUDA Out of Memory on batch size {len(sample_batch)}, "
+                                "falling back to single-sample mode for this batch."
+                            )
+                            torch.cuda.empty_cache()
+                        except Exception as e:
+                            print(
+                                f"Batch inference failed for {len(sample_batch)} samples at k={k_idx}: {e}. "
+                                "Falling back to single-sample mode for this batch."
+                            )
+                            traceback.print_exc()
 
-                except torch.cuda.OutOfMemoryError:
-                    print(f"CUDA Out of Memory on sample ID: {protein_id}, k={k_idx}. Skipping this k iteration.")
-                    log_error(
-                        args.evals_path,
-                        "oom",
-                        protein_id,
-                        go_aspect,
-                        go_bp,
-                        go_mf,
-                        go_cc,
-                        go_bp_leaf,
-                        go_mf_leaf,
-                        go_cc_leaf,
-                    )
-                    maybe_trace_eval_sample(
-                        tracking_state,
-                        args=args,
-                        sample=sample,
-                        protein_id=protein_id,
-                        go_aspect=go_aspect,
-                        attempt_idx=k_idx,
-                        error_type="oom",
-                        error_message="CUDA Out of Memory",
-                    )
-                    torch.cuda.empty_cache()
-                    continue
+                    if batch_results is not None:
+                        for sample_idx, (sample, result_record) in enumerate(zip(sample_batch, batch_results)):
+                            protein_id = sample.get("protein_id")
+                            go_aspect = sample.get("go_aspect", "all")
+                            if result_record is None:
+                                continue
+                            save_result(result_record, protein_id, go_aspect, args.evals_path, k_idx=k_idx)
+                            maybe_trace_eval_sample(
+                                tracking_state,
+                                args=args,
+                                sample=sample,
+                                protein_id=protein_id,
+                                go_aspect=go_aspect,
+                                attempt_idx=k_idx,
+                                result_record=result_record,
+                            )
+                            if not batch_success_flags[sample_idx]:
+                                successfully_processed += 1
+                                batch_success_flags[sample_idx] = True
+                        continue
 
-                except Exception as e:
-                    print(f"Unexpected error on sample ID {protein_id}, k={k_idx}: {e}")
-                    log_error(
-                        args.evals_path,
-                        "other",
-                        protein_id,
-                        go_aspect,
-                        go_bp,
-                        go_mf,
-                        go_cc,
-                        go_bp_leaf,
-                        go_mf_leaf,
-                        go_cc_leaf,
-                        str(e),
-                    )
-                    maybe_trace_eval_sample(
-                        tracking_state,
-                        args=args,
-                        sample=sample,
-                        protein_id=protein_id,
-                        go_aspect=go_aspect,
-                        attempt_idx=k_idx,
-                        error_type="exception",
-                        error_message=str(e),
-                    )
-                    traceback.print_exc()
-                    continue
+                    for sample_idx, sample in enumerate(sample_batch):
+                        protein_id = sample.get("protein_id")
+                        go_aspect = sample.get("go_aspect", "all")
+                        go_bp = sample.get("go_bp", "")
+                        go_mf = sample.get("go_mf", "")
+                        go_cc = sample.get("go_cc", "")
+                        go_bp_leaf = sample.get("go_bp_leaf", "")
+                        go_mf_leaf = sample.get("go_mf_leaf", "")
+                        go_cc_leaf = sample.get("go_cc_leaf", "")
+
+                        try:
+                            result_record = process_single_sample(
+                                model,
+                                sample,
+                                protein_id,
+                                go_aspect,
+                                go_bp,
+                                go_mf,
+                                go_cc,
+                                go_bp_leaf,
+                                go_mf_leaf,
+                                go_cc_leaf,
+                                args,
+                            )
+                            if result_record is not None:
+                                save_result(result_record, protein_id, go_aspect, args.evals_path, k_idx=k_idx)
+                                maybe_trace_eval_sample(
+                                    tracking_state,
+                                    args=args,
+                                    sample=sample,
+                                    protein_id=protein_id,
+                                    go_aspect=go_aspect,
+                                    attempt_idx=k_idx,
+                                    result_record=result_record,
+                                )
+                                if not batch_success_flags[sample_idx]:
+                                    successfully_processed += 1
+                                    batch_success_flags[sample_idx] = True
+
+                        except torch.cuda.OutOfMemoryError:
+                            print(f"CUDA Out of Memory on sample ID: {protein_id}, k={k_idx}. Skipping this k iteration.")
+                            log_error(
+                                args.evals_path,
+                                "oom",
+                                protein_id,
+                                go_aspect,
+                                go_bp,
+                                go_mf,
+                                go_cc,
+                                go_bp_leaf,
+                                go_mf_leaf,
+                                go_cc_leaf,
+                            )
+                            maybe_trace_eval_sample(
+                                tracking_state,
+                                args=args,
+                                sample=sample,
+                                protein_id=protein_id,
+                                go_aspect=go_aspect,
+                                attempt_idx=k_idx,
+                                error_type="oom",
+                                error_message="CUDA Out of Memory",
+                            )
+                            torch.cuda.empty_cache()
+                            continue
+
+                        except Exception as e:
+                            print(f"Unexpected error on sample ID {protein_id}, k={k_idx}: {e}")
+                            log_error(
+                                args.evals_path,
+                                "other",
+                                protein_id,
+                                go_aspect,
+                                go_bp,
+                                go_mf,
+                                go_cc,
+                                go_bp_leaf,
+                                go_mf_leaf,
+                                go_cc_leaf,
+                                str(e),
+                            )
+                            maybe_trace_eval_sample(
+                                tracking_state,
+                                args=args,
+                                sample=sample,
+                                protein_id=protein_id,
+                                go_aspect=go_aspect,
+                                attempt_idx=k_idx,
+                                error_type="exception",
+                                error_message=str(e),
+                            )
+                            traceback.print_exc()
+                            continue
+
+                progress.update(len(sample_batch))
+        finally:
+            progress.close()
 
         # Print final statistics
         t_end = time.time()
@@ -1618,6 +1746,12 @@ def setup_argument_parser() -> argparse.ArgumentParser:
     eval_group.add_argument("--top_p", type=float, default=0.9)
     eval_group.add_argument("--repetition_penalty", type=float, default=1.0)
     eval_group.add_argument(
+        "--inference_batch_size",
+        type=int,
+        default=1,
+        help="Number of samples to group into one vLLM generation call. Falls back to single-sample mode on batch failure.",
+    )
+    eval_group.add_argument(
         "--pass_at_k", 
         type=int, 
         default=1, 
@@ -1687,6 +1821,20 @@ def setup_argument_parser() -> argparse.ArgumentParser:
     )
     tracking_group.add_argument("--weave_project", type=str, default=None)
     tracking_group.add_argument("--weave_eval_name", type=str, default=None)
+
+    runtime_group = parser.add_argument_group("Inference Runtime Configuration")
+    runtime_group.add_argument(
+        "--vllm_gpu_memory_utilization",
+        type=float,
+        default=0.4,
+        help="Fraction of GPU memory that vLLM can reserve for KV cache and runtime state.",
+    )
+    runtime_group.add_argument(
+        "--vllm_max_num_seqs",
+        type=int,
+        default=256,
+        help="Maximum number of concurrent sequences the underlying vLLM engine may schedule.",
+    )
 
     return parser
 
