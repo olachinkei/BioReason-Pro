@@ -587,12 +587,35 @@ def build_eval_summary_row(args, run_summary: Dict[str, Any], metrics_summary: D
         "fmax_bp": metrics_summary.get("fmax_bp"),
         "fmax_cc": metrics_summary.get("fmax_cc"),
         "overall_mean_fmax": metrics_summary.get("overall_mean_fmax"),
-        "macro_note": (
-            f"loaded={run_summary['loaded_samples']}, "
-            f"processed={run_summary['newly_processed_samples']}, "
-            f"result_files={run_summary['result_files_total']}, "
-            f"metrics_loaded={bool(metrics_summary)}"
-        ),
+        "loaded_samples": run_summary.get("loaded_samples"),
+        "newly_processed_samples": run_summary.get("newly_processed_samples"),
+        "result_files_total": run_summary.get("result_files_total"),
+        "unique_sample_keys_total": run_summary.get("unique_sample_keys_total"),
+        "successful_result_files_total": run_summary.get("successful_result_files_total"),
+    }
+
+
+def build_weave_eval_summary_payload(
+    args,
+    run_summary: Dict[str, Any],
+    metrics_summary: Dict[str, Any],
+    sample_rows: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Build the final Weave Evaluation summary payload for one eval run."""
+    summary_row = build_eval_summary_row(args, run_summary, metrics_summary)
+    return {
+        "model_name": summary_row["model_name"],
+        "split": summary_row["split"],
+        "benchmark_version": summary_row["benchmark_version"],
+        "fmax_mf": summary_row["fmax_mf"],
+        "fmax_bp": summary_row["fmax_bp"],
+        "fmax_cc": summary_row["fmax_cc"],
+        "overall_mean_fmax": summary_row["overall_mean_fmax"],
+        "sample_rows_logged": len(sample_rows),
+        "loaded_samples": summary_row["loaded_samples"],
+        "newly_processed_samples": summary_row["newly_processed_samples"],
+        "result_files_total": summary_row["result_files_total"],
+        "unique_sample_keys_total": summary_row["unique_sample_keys_total"],
     }
 
 
@@ -684,6 +707,20 @@ def build_wandb_table(rows: List[Dict[str, Any]]):
     columns = list(rows[0].keys())
     data = [[row.get(column) for column in columns] for row in rows]
     return wandb.Table(columns=columns, data=data)
+
+
+def log_payload_to_wandb_run(run, payload: Dict[str, Any]) -> None:
+    """Log a payload to the active W&B run, preferring the run object when available."""
+    if not payload:
+        return
+
+    run_log = getattr(run, "log", None)
+    if callable(run_log):
+        run_log(payload)
+        return
+
+    if wandb is not None:
+        wandb.log(payload)
 
 
 def should_log_eval_tables(args) -> bool:
@@ -926,20 +963,20 @@ def log_eval_outputs_to_wandb(
         key: value for key, value in normalize_metrics_summary(metrics_summary).items() if isinstance(value, (int, float))
     }
     if metrics_to_log:
-        wandb.log(metrics_to_log)
+        log_payload_to_wandb_run(run, metrics_to_log)
         status["wandb_logged"] = True
 
     if should_log_eval_tables(args):
         summary_row = build_eval_summary_row(args, run_summary, metrics_summary)
         summary_table = build_wandb_table([summary_row])
         if summary_table is not None:
-            wandb.log({"eval_summary": summary_table})
+            log_payload_to_wandb_run(run, {"eval_summary": summary_table})
             status["wandb_logged"] = True
             status["summary_table_logged"] = True
 
         sample_table = build_wandb_table(sample_rows)
         if sample_table is not None:
-            wandb.log({"eval_samples": sample_table})
+            log_payload_to_wandb_run(run, {"eval_samples": sample_table})
             status["wandb_logged"] = True
             status["sample_table_logged"] = True
 
@@ -1003,7 +1040,12 @@ def maybe_log_eval_to_weave(
             print(f"🧶 Using Weave cache directory: {cache_dir}")
             client = weave.init(weave_project)
 
-        weave_summary_row = build_eval_summary_row(args, run_summary, metrics_summary)
+        weave_summary_payload = build_weave_eval_summary_payload(
+            args=args,
+            run_summary=run_summary,
+            metrics_summary=metrics_summary,
+            sample_rows=sample_rows,
+        )
         eval_logger = None if tracking_state is None else tracking_state.get("weave_eval_logger")
         if eval_logger is None:
             eval_logger = weave.EvaluationLogger(
@@ -1020,14 +1062,7 @@ def maybe_log_eval_to_weave(
                 score_logger.log_score(scorer=scorer_name, score=score_value)
             score_logger.finish()
 
-        eval_logger.log_summary(
-            {
-                **weave_summary_row,
-                "sample_rows_logged": len(sample_rows),
-                "result_files_total": run_summary.get("result_files_total"),
-                "metrics_loaded": bool(metrics_summary),
-            }
-        )
+        eval_logger.log_summary(weave_summary_payload)
         if hasattr(client, "flush"):
             client.flush()
         return True

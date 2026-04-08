@@ -213,7 +213,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--seed", type=int, default=23)
-    parser.add_argument("--wandb_project", type=str, default=os.environ.get("WANDB_PROJECT", "bioreason-pro-custom"))
+    parser.add_argument("--wandb_project", type=str, default=os.environ.get("WANDB_PROJECT", "bioreasoning-pro"))
     parser.add_argument("--wandb_entity", type=str, default=None)
     parser.add_argument("--wandb_mode", type=str, default=None)
     parser.add_argument("--wandb_job_type", type=str, default="train_rl", choices=["train_rl"])

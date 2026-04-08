@@ -13,6 +13,7 @@ The fixed assumptions are as follows.
 - benchmark alias: `213.221.225.228`
 - primary dataset: `disease_temporal_hc_reasoning_v1`
 - comparison model: `bioreason-pro-rl-paper`
+- W&B project: `bioreasoning-pro`
 - source of truth: W&B Artifact ref
 - local filesystem: scratch
 
@@ -22,9 +23,9 @@ The fixed assumptions are as follows.
 |---|---|---|
 | Specification cleanup | Complete | Final spec unified in [specification.md](/Users/keisuke/Project/learning/drug_discovery/BioReason-Pro/domain/specification/busiless-rules/specification.md) |
 | Execution procedure cleanup | Complete | Current runbook is [RESEARCH_README.md](/Users/keisuke/Project/learning/drug_discovery/BioReason-Pro/RESEARCH_README.md) |
-| Temporal split artifact creation | Complete | `wandb-healthcare/bioreason-pro-custom/disease-temporal-split:production` |
-| Reasoning dataset creation | Complete | `wandb-healthcare/bioreason-pro-custom/disease-temporal-reasoning:production` |
-| Comparison model artifact finalized | Complete | `wandb-healthcare/bioreason-pro-custom/bioreason-pro-rl:production` |
+| Temporal split artifact creation | Complete | `wandb-healthcare/bioreasoning-pro/disease-temporal-split:production` |
+| Reasoning dataset creation | Complete | `wandb-healthcare/bioreasoning-pro/disease-temporal-reasoning:production` |
+| Comparison model artifact finalized | Complete | `wandb-healthcare/bioreasoning-pro/bioreason-pro-rl:production` |
 | CoreWeave execution flow cleanup | Complete | `srun`-based execution, remote env, artifact resolution, 1-sample smoke verified |
 | Comparison model validation eval | Needs re-run | Re-run on the fixed 200-protein dev split |
 | RL | Needs re-run | Re-run directly from `bioreason-pro-rl-paper` with the fixed 200-protein dev split |
@@ -84,9 +85,9 @@ Considered complete when the following are satisfied.
 ### 1.4 Current Artifacts
 
 - temporal split artifact
-  - `wandb-healthcare/bioreason-pro-custom/disease-temporal-split:production`
+  - `wandb-healthcare/bioreasoning-pro/disease-temporal-split:production`
 - reasoning dataset artifact
-  - `wandb-healthcare/bioreason-pro-custom/disease-temporal-reasoning:production`
+  - `wandb-healthcare/bioreasoning-pro/disease-temporal-reasoning:production`
 
 ## 2. GPU Access
 

@@ -299,8 +299,8 @@ class TrainingTrackingContractsTest(unittest.TestCase):
         statuses = TRACKING.maybe_use_artifact_refs(
             run,
             {
-                "temporal_split_artifact": "wandb-healthcare/bioreason-pro-custom/disease-temporal-split:production",
-                "dataset_artifact": "wandb-healthcare/bioreason-pro-custom/disease-temporal-reasoning:production",
+                "temporal_split_artifact": "wandb-healthcare/bioreasoning-pro/disease-temporal-split:production",
+                "dataset_artifact": "wandb-healthcare/bioreasoning-pro/disease-temporal-reasoning:production",
                 "base_checkpoint": "/tmp/local-checkpoint",
             },
         )
@@ -312,8 +312,8 @@ class TrainingTrackingContractsTest(unittest.TestCase):
         self.assertEqual(
             run.used_artifacts,
             [
-                ("wandb-healthcare/bioreason-pro-custom/disease-temporal-split:production", None),
-                ("wandb-healthcare/bioreason-pro-custom/disease-temporal-reasoning:production", None),
+                ("wandb-healthcare/bioreasoning-pro/disease-temporal-split:production", None),
+                ("wandb-healthcare/bioreasoning-pro/disease-temporal-reasoning:production", None),
             ],
         )
 

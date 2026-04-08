@@ -1019,6 +1019,15 @@ class EvalContractTests(unittest.TestCase):
         self.assertTrue(any("fmax_mf" in payload for payload in EVAL.wandb.logged_payloads))
         self.assertTrue(any("eval_summary" in payload for payload in EVAL.wandb.logged_payloads))
         self.assertTrue(any("eval_samples" in payload for payload in EVAL.wandb.logged_payloads))
+        summary_payload = next(payload for payload in EVAL.wandb.logged_payloads if "eval_summary" in payload)
+        summary_table = summary_payload["eval_summary"]
+        self.assertIn("fmax_mf", summary_table.columns)
+        self.assertIn("fmax_bp", summary_table.columns)
+        self.assertIn("fmax_cc", summary_table.columns)
+        self.assertIn("overall_mean_fmax", summary_table.columns)
+        table_row = dict(zip(summary_table.columns, summary_table.data[0]))
+        self.assertEqual(table_row["fmax_mf"], 0.9)
+        self.assertEqual(table_row["overall_mean_fmax"], 0.6)
 
         self.assertEqual(EVAL.weave.init_calls[0], "demo-entity/bioreason-pro")
         self.assertEqual(len(EVAL.weave.EvaluationLogger.instances), 1)
@@ -1077,6 +1086,11 @@ class EvalContractTests(unittest.TestCase):
         self.assertTrue(any("fmax_mf" in payload for payload in EVAL.wandb.logged_payloads))
         self.assertTrue(any("eval_summary" in payload for payload in EVAL.wandb.logged_payloads))
         self.assertTrue(any("eval_samples" in payload for payload in EVAL.wandb.logged_payloads))
+        summary_payload = next(payload for payload in EVAL.wandb.logged_payloads if "eval_summary" in payload)
+        summary_table = summary_payload["eval_summary"]
+        self.assertIn("overall_mean_fmax", summary_table.columns)
+        table_row = dict(zip(summary_table.columns, summary_table.data[0]))
+        self.assertEqual(table_row["fmax_bp"], 0.4)
         self.assertEqual(EVAL.wandb.last_run.artifacts, [])
         self.assertEqual(EVAL.weave.init_calls, ["demo-entity/bioreason-pro"])
         self.assertEqual(len(EVAL.weave.EvaluationLogger.instances), 1)

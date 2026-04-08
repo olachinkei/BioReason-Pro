@@ -55,7 +55,7 @@ class TrainProteinLLMTrackingContractsTest(unittest.TestCase):
         self.assertIn('WEAVE_PROJECT=${WEAVE_PROJECT:-""}', wrapper)
         self.assertIn("WEAVE_TRACE_BUDGET=${WEAVE_TRACE_BUDGET:-64}", wrapper)
         self.assertIn('EXPECTED_WANDB_ENTITY=${EXPECTED_WANDB_ENTITY:-"wandb-healthcare"}', wrapper)
-        self.assertIn('EXPECTED_WANDB_PROJECT=${EXPECTED_WANDB_PROJECT:-"bioreason-pro-custom"}', wrapper)
+        self.assertIn('EXPECTED_WANDB_PROJECT=${EXPECTED_WANDB_PROJECT:-"bioreasoning-pro"}', wrapper)
         self.assertIn('WANDB_RUN_NAME_S2="${WANDB_RUN_NAME_S2:-${WANDB_RUN_NAME:-$WANDB_RUN_NAME_S2_DEFAULT}}"', wrapper)
         self.assertIn('RUN_NAME_S2_DIR="${WANDB_RUN_NAME_S2}"', wrapper)
         self.assertIn('STAGE2_MODEL_ARTIFACT_NAME="${STAGE2_MODEL_ARTIFACT_NAME:-train-sft-output}"', wrapper)

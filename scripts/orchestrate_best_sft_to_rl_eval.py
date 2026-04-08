@@ -23,7 +23,7 @@ TERMINAL_STATES = {"finished", "failed", "crashed", "killed"}
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--wandb-entity", type=str, default="wandb-healthcare")
-    parser.add_argument("--wandb-project", type=str, default="bioreason-pro-custom")
+    parser.add_argument("--wandb-project", type=str, default="bioreasoning-pro")
     parser.add_argument("--sft-run-names", type=str, required=True)
     parser.add_argument("--poll-seconds", type=int, default=120)
     parser.add_argument("--registry-env-file", type=Path, default=DEFAULT_REGISTRY_ENV_FILE)

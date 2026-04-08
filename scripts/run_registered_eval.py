@@ -115,7 +115,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="validation",
         choices=["validation", "test"],
-        help="Evaluation split to run. Validation defaults to a 100-sample stratified subset; test defaults to the full split.",
+        help="Evaluation split to run. Validation uses the fixed 100-protein dev split; test uses the fixed 400-protein holdout split.",
     )
     parser.add_argument(
         "--output-root",
@@ -163,7 +163,7 @@ def parse_args() -> argparse.Namespace:
         "--max-samples",
         type=int,
         default=None,
-        help="Override sample count. Defaults to 100 for validation and full split for test.",
+        help="Override sample count. Defaults to the full validation split (100) and the full holdout split for test.",
     )
     parser.add_argument(
         "--sample-strategy",

@@ -21,6 +21,7 @@
 - data bundle: `main_production`
 - comparison model: `bioreason-pro-rl-paper`
 - primary dataset: `disease_temporal_hc_reasoning_v1`
+- W&B project: `bioreasoning-pro`
 
 この README でいう `temporal split artifact` は、release 差分、protein-disjoint split、label assignment を固定した benchmark artifact を指す。  
 学習や評価で直接読む dataset は、そこから派生した reasoning dataset である。
@@ -31,9 +32,9 @@
 
 | 用途 | W&B Artifact ref |
 |---|---|
-| temporal split artifact | `wandb-healthcare/bioreason-pro-custom/disease-temporal-split:production` |
-| reasoning dataset artifact | `wandb-healthcare/bioreason-pro-custom/disease-temporal-reasoning:production` |
-| comparison model artifact | `wandb-healthcare/bioreason-pro-custom/bioreason-pro-rl:production` |
+| temporal split artifact | `wandb-healthcare/bioreasoning-pro/disease-temporal-split:production` |
+| reasoning dataset artifact | `wandb-healthcare/bioreasoning-pro/disease-temporal-reasoning:production` |
+| comparison model artifact | `wandb-healthcare/bioreasoning-pro/bioreason-pro-rl:production` |
 
 local の build / download 結果は scratch であり、source-of-truth ではない。
 
@@ -64,9 +65,9 @@ Artifact ref は browser URL ではなく、`entity/project/artifact_name:alias`
 
 | env var | 用途 | 現在の ref |
 |---|---|---|
-| `BIOREASON_MAIN_TEMPORAL_SPLIT_REGISTRY_PATH` | main temporal split artifact | `wandb-healthcare/bioreason-pro-custom/disease-temporal-split:production` |
-| `BIOREASON_MAIN_REASONING_DATASET_REGISTRY_PATH` | main reasoning dataset artifact | `wandb-healthcare/bioreason-pro-custom/disease-temporal-reasoning:production` |
-| `BIOREASON_RL_PAPER_MODEL_REGISTRY_PATH` | tuning 前の比較モデル | `wandb-healthcare/bioreason-pro-custom/bioreason-pro-rl:production` |
+| `BIOREASON_MAIN_TEMPORAL_SPLIT_REGISTRY_PATH` | main temporal split artifact | `wandb-healthcare/bioreasoning-pro/disease-temporal-split:production` |
+| `BIOREASON_MAIN_REASONING_DATASET_REGISTRY_PATH` | main reasoning dataset artifact | `wandb-healthcare/bioreasoning-pro/disease-temporal-reasoning:production` |
+| `BIOREASON_RL_PAPER_MODEL_REGISTRY_PATH` | tuning 前の比較モデル | `wandb-healthcare/bioreasoning-pro/bioreason-pro-rl:production` |
 
 `BIOREASON_TRAIN_RL_MODEL_REGISTRY_PATH` は、RL run の完了後に成果物として決まる。
 
@@ -146,8 +147,8 @@ W&B upload が成功したら、local 側の生成物は scratch とみなし、
 
 最低限、次の 3 つが見えていることを確認する。
 
-- `wandb-healthcare/bioreason-pro-custom/disease-temporal-split:production`
-- `wandb-healthcare/bioreason-pro-custom/disease-temporal-reasoning:production`
+- `wandb-healthcare/bioreasoning-pro/disease-temporal-split:production`
+- `wandb-healthcare/bioreasoning-pro/disease-temporal-reasoning:production`
 - `benchmark_alias=213.221.225.228`
 
 ## 2. GPU へのアクセス
@@ -225,7 +226,7 @@ export BIOREASON_DATASET_CACHE_DIR="$HOME/BioReason-Pro/data/artifacts/hf_cache"
 
 ### 2.5 比較モデルを一度 W&B Artifact に固定する
 
-`BIOREASON_RL_PAPER_MODEL_REGISTRY_PATH` が既に `wandb-healthcare/bioreason-pro-custom/bioreason-pro-rl:production` を指しているなら、この工程はスキップしてよい。  
+`BIOREASON_RL_PAPER_MODEL_REGISTRY_PATH` が既に `wandb-healthcare/bioreasoning-pro/bioreason-pro-rl:production` を指しているなら、この工程はスキップしてよい。  
 未 publish の場合だけ、一度 materialize して W&B Artifact に固定する。
 
 ```bash

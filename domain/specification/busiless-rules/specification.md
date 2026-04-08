@@ -11,6 +11,7 @@ Assumptions:
 - `dev`, `holdout`, and `reserve` are future-only partitions drawn from `225 -> 228`
 - Generated artifacts on local filesystem are treated as scratch; **the source of truth is W&B Artifact ref**
 - `dev` in this document is synonymous with the split name `validation` in code
+- The fixed W&B project name is `bioreasoning-pro` (`WANDB_PROJECT=bioreasoning-pro`)
 
 ## 1. Problem Setting
 
@@ -109,9 +110,9 @@ The following are not adopted:
 
 The source-of-truth artifacts for the current version are fixed as follows.
 
-- temporal split artifact: `wandb-healthcare/bioreason-pro-custom/disease-temporal-split:production`
-- reasoning dataset artifact: `wandb-healthcare/bioreason-pro-custom/disease-temporal-reasoning:production`
-- comparison model artifact: `wandb-healthcare/bioreason-pro-custom/bioreason-pro-rl:production`
+- temporal split artifact: `wandb-healthcare/bioreasoning-pro/disease-temporal-split:production`
+- reasoning dataset artifact: `wandb-healthcare/bioreasoning-pro/disease-temporal-reasoning:production`
+- comparison model artifact: `wandb-healthcare/bioreasoning-pro/bioreason-pro-rl:production`
 
 Local build / download results are scratch and are not the source of truth.
 
@@ -280,8 +281,7 @@ Fixed rules:
 
 The logical phase name for evaluation is fixed to `eval`.  
 The high-level entry point is `scripts/run_registered_eval.py`; the low-level entry points are `eval.py` and `scripts/sh_eval.sh`.  
-W&B runs are started with `wandb.init(..., job_type="eval")`.  
-Weave is started with `weave.init()`.
+`wandb.init(..., job_type="eval")` and `weave.init(...)` are executed **before any sample inference begins**.
 
 Split usage:
 
@@ -313,30 +313,41 @@ Each metric is saved via `wandb.log()`, with at minimum `fmax_mf`, `fmax_bp`, `f
 
 ### 7.3 Saved Artifacts and Tracking
 
-- Inference functions are traced with Weave
-- test (final reported values)
-    - Executed as a **separate run** after RL
-    - Uses the full `test` split
-    - Initialize `wandb.init(..., job_type="eval")` and `weave.init(...)` before sample processing begins
-    - Evaluation is performed using Weave's Evaluation Logger, following W&B's imperative evaluation logging pattern
-    - Runs where Weave logging fails are not treated as successful
-    - Each sample inference is traced with `@weave.op`
-    - The evaluation summary is saved as a **W&B Table with 1 evaluated target = 1 row**
-        - Required columns: `model_name`, `split`, `benchmark_version`, `fmax_mf`, `fmax_bp`, `fmax_cc`, `overall_mean_fmax`
-    - Sample-level results are saved as a **W&B Table with 1 sample = 1 row**
-    - For reasoning tasks, `reasoning_full`, `final_answer`, `intermediate_trace` are retained
-    - The final evaluation record is saved through Weave's Evaluation Logger and `ev.log_summary(...)` must include `fmax_mf`, `fmax_bp`, `fmax_cc`, `overall_mean_fmax`
-    - JSON results, summary exports, and sample exports are not version-managed as W&B Artifacts. The basic philosophy is to not hold results locally
-    - Local eval output is treated as scratch and may be cleaned up by default after successful W&B save
+Common fixed rules for both `validation` and `test`:
 
-- Development comparisons, ablations, and checkpoint comparisons use `validation`
-    - Use the full `validation` split of **200 proteins**
-    - Initialize `wandb.init(..., job_type="eval")` and `weave.init(...)` before sample processing begins
-    - Trace each sample inference with `@weave.op`
-    - Save `fmax_mf`, `fmax_bp`, `fmax_cc`, `overall_mean_fmax`
-    - Save a one-row `eval_summary` table and a one-sample-per-row `eval_samples` table to W&B
-    - Save a Weave Evaluation Logger record and include `fmax_mf`, `fmax_bp`, `fmax_cc`, `overall_mean_fmax` via `ev.log_summary(...)`
-    - Runs missing any of the above are not treated as successful
+- Each sample inference is traced with `@weave.op`
+- Evaluation is recorded with Weave's **Evaluation Logger**, following W&B's imperative evaluation logging pattern (`log_prediction`, `log_score`, `finish`, `log_summary`)
+- `wandb.init(..., job_type="eval")` and `weave.init(...)` are executed before sample processing
+- A one-row **`eval_summary` W&B Table** is saved for each eval run
+- A one-sample-per-row **`eval_samples` W&B Table** is saved for each eval run
+- For reasoning tasks, `reasoning_full`, `final_answer`, and `intermediate_trace` are retained in sample-level records
+- `ev.log_summary(...)` must include at minimum:
+  - `fmax_mf`
+  - `fmax_bp`
+  - `fmax_cc`
+  - `overall_mean_fmax`
+- The one-row `eval_summary` W&B Table must include at minimum:
+  - `model_name`
+  - `split`
+  - `benchmark_version`
+  - `fmax_mf`
+  - `fmax_bp`
+  - `fmax_cc`
+  - `overall_mean_fmax`
+- Runs missing W&B metric logging, `eval_summary`, `eval_samples`, or Weave Evaluation logging are not treated as successful
+- JSON results, summary exports, and sample exports are not version-managed as W&B Artifacts
+- Local eval output is treated as scratch and may be cleaned up after successful W&B save
+
+Split-specific rules:
+
+- `validation`
+  - Uses the full `validation` split of **200 proteins**
+  - Used for development comparisons, ablations, and checkpoint comparisons
+
+- `test`
+  - Uses the full `test` split of **400 proteins**
+  - Executed as a **separate run** after RL
+  - Provides the final reported values
 
 ## 8. Training for RL
 

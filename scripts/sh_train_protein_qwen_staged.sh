@@ -74,10 +74,10 @@ as_bool() {
 # ===================================================================================================
 # Shared Configuration
 # ===================================================================================================
-BASE_WANDB_PROJECT=${BASE_WANDB_PROJECT:-"${WANDB_PROJECT:-bioreason-pro-finetune}"}
+BASE_WANDB_PROJECT=${BASE_WANDB_PROJECT:-"${WANDB_PROJECT:-bioreasoning-pro}"}
 WANDB_ENTITY=${WANDB_ENTITY:-""}
 EXPECTED_WANDB_ENTITY=${EXPECTED_WANDB_ENTITY:-"wandb-healthcare"}
-EXPECTED_WANDB_PROJECT=${EXPECTED_WANDB_PROJECT:-"bioreason-pro-custom"}
+EXPECTED_WANDB_PROJECT=${EXPECTED_WANDB_PROJECT:-"bioreasoning-pro"}
 ALLOW_WANDB_PROJECT_MISMATCH=${ALLOW_WANDB_PROJECT_MISMATCH:-"False"}
 WEAVE_PROJECT=${WEAVE_PROJECT:-""}
 WEAVE_TRACE_BUDGET=${WEAVE_TRACE_BUDGET:-64}

@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trial-ids", type=str, default="")
     parser.add_argument("--max-launch", type=int, default=3)
     parser.add_argument("--wandb-entity", type=str, default="wandb-healthcare")
-    parser.add_argument("--wandb-project", type=str, default="bioreason-pro-custom")
+    parser.add_argument("--wandb-project", type=str, default="bioreasoning-pro")
     parser.add_argument("--train-time-limit", type=str, default="12:00:00")
     parser.add_argument("--train-partition", type=str, default="h100")
     parser.add_argument("--train-num-gpus", type=int, default=1)

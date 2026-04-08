@@ -60,7 +60,7 @@ class ResolveLoggedArtifactRefContractsTest(unittest.TestCase):
             "parse_args",
             return_value=types.SimpleNamespace(
                 wandb_entity="wandb-healthcare",
-                wandb_project="bioreason-pro-custom",
+                wandb_project="bioreasoning-pro",
                 run_name="sft-verify",
                 artifact_name="train-sft-output",
                 attempts=3,
@@ -75,7 +75,7 @@ class ResolveLoggedArtifactRefContractsTest(unittest.TestCase):
             exit_code = RESOLVER.main()
 
         self.assertEqual(exit_code, 0)
-        self.assertEqual(stdout.getvalue().strip(), "wandb-healthcare/bioreason-pro-custom/train-sft-output:v3")
+        self.assertEqual(stdout.getvalue().strip(), "wandb-healthcare/bioreasoning-pro/train-sft-output:v3")
         self.assertGreaterEqual(api_calls["runs"], 2)
 
 

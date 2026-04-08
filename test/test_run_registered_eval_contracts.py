@@ -379,7 +379,7 @@ class RunRegisteredEvalContractsTest(unittest.TestCase):
             "train-sft-output",
             "test",
             "213.221.225.228",
-            model_source_ref="wandb-healthcare/bioreason-pro-custom/train-sft-output-verify40:v0",
+            model_source_ref="wandb-healthcare/bioreasoning-pro/train-sft-output-verify40:v0",
         )
 
         self.assertEqual(names["run_name"], "eval-train-sft-output-verify40-test-213.221.225.228")
