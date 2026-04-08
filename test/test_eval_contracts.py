@@ -920,6 +920,7 @@ class EvalContractTests(unittest.TestCase):
                 wandb_project="bioreason-pro",
                 wandb_entity="demo-entity",
                 weave_project="demo-entity/bioreason-pro",
+                wandb_run_name="eval-run-test",
             )
 
             tracking_status = EVAL.log_eval_tracking(args, run_summary, result_rows)
@@ -928,6 +929,7 @@ class EvalContractTests(unittest.TestCase):
         self.assertEqual(EVAL.weave.flush_calls, 1)
         self.assertEqual(len(EVAL.weave.Evaluation.instances), 1)
         self.assertIsNotNone(EVAL.weave.Evaluation.instances[0].last_result)
+        self.assertEqual(EVAL.weave.Evaluation.instances[0].kwargs["name"], "eval-run-test")
 
     def test_log_eval_tracking_sets_default_weave_cache_dir(self):
         EVAL.wandb.init_calls.clear()
@@ -971,6 +973,7 @@ class EvalContractTests(unittest.TestCase):
                 wandb_project="bioreason-pro",
                 wandb_entity="demo-entity",
                 weave_project="demo-entity/bioreason-pro",
+                wandb_run_name="eval-run-test",
                 temporal_split_artifact="demo-entity/bioreason-pro/disease-temporal-split:production",
                 dataset_artifact="demo-entity/bioreason-pro/disease-temporal-reasoning:production",
                 model_artifact="demo-entity/bioreason-pro/bioreason-pro-rl:production",
@@ -1002,6 +1005,12 @@ class EvalContractTests(unittest.TestCase):
         self.assertEqual(EVAL.weave.init_calls[0], "demo-entity/bioreason-pro")
         self.assertEqual(len(EVAL.weave.Evaluation.instances), 1)
         self.assertEqual(len(EVAL.weave.Evaluation.instances[0].dataset), 1)
+        self.assertEqual(EVAL.weave.Evaluation.instances[0].kwargs["name"], "eval-run-test")
+        scorer_names = {call["name"] for call in EVAL.weave.op_calls}
+        self.assertIn("fmax_mf", scorer_names)
+        self.assertIn("fmax_bp", scorer_names)
+        self.assertIn("fmax_cc", scorer_names)
+        self.assertIn("overall_mean_fmax", scorer_names)
 
     def test_log_eval_tracking_logs_tables_and_weave_for_validation(self):
         EVAL.wandb.init_calls.clear()
@@ -1036,6 +1045,7 @@ class EvalContractTests(unittest.TestCase):
             wandb_project="bioreason-pro",
             wandb_entity="demo-entity",
             weave_project="demo-entity/bioreason-pro",
+            wandb_run_name="eval-run-validation",
         )
 
         tracking_status = EVAL.log_eval_tracking(
@@ -1053,6 +1063,7 @@ class EvalContractTests(unittest.TestCase):
         self.assertEqual(EVAL.wandb.last_run.artifacts, [])
         self.assertEqual(EVAL.weave.init_calls, ["demo-entity/bioreason-pro"])
         self.assertEqual(len(EVAL.weave.Evaluation.instances), 1)
+        self.assertEqual(EVAL.weave.Evaluation.instances[0].kwargs["name"], "eval-run-validation")
 
     def test_enforce_required_eval_outputs_requires_metrics_for_validation(self):
         args = make_eval_args(eval_split="validation")

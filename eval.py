@@ -914,7 +914,8 @@ def maybe_log_eval_to_weave(
     if weave is None:
         print("⚠️  Weave package is unavailable; evaluation requires `weave` to be installed.")
         return False
-    if not sample_rows:
+    metrics_summary = normalize_metrics_summary(metrics_summary)
+    if not metrics_summary:
         return False
 
     weave_project = resolve_weave_project(args)
@@ -928,37 +929,55 @@ def maybe_log_eval_to_weave(
             print(f"🧶 Using Weave cache directory: {cache_dir}")
             client = weave.init(weave_project)
 
-        @weave.op
-        def replay_prediction(
-            prediction: str,
-            reasoning_full: str = "",
-            final_answer: str = "",
-            intermediate_trace: str = "",
-        ) -> Dict[str, str]:
+        metric_keys = ["fmax_mf", "fmax_bp", "fmax_cc", "overall_mean_fmax"]
+        weave_summary_row = build_eval_summary_row(args, run_summary, metrics_summary)
+        weave_summary_row["expected_output"] = {
+            key: metrics_summary.get(key) for key in metric_keys if metrics_summary.get(key) is not None
+        }
+
+        @weave.op(name="eval_summary_metrics")
+        def replay_summary_metrics(
+            fmax_mf: Optional[float] = None,
+            fmax_bp: Optional[float] = None,
+            fmax_cc: Optional[float] = None,
+            overall_mean_fmax: Optional[float] = None,
+        ) -> Dict[str, Optional[float]]:
             return {
-                "prediction": prediction,
-                "reasoning_full": reasoning_full,
-                "final_answer": final_answer,
-                "intermediate_trace": intermediate_trace,
+                "fmax_mf": fmax_mf,
+                "fmax_bp": fmax_bp,
+                "fmax_cc": fmax_cc,
+                "overall_mean_fmax": overall_mean_fmax,
             }
 
-        @weave.op
-        def exact_match_score(expected_output: str, model_output: Dict[str, str]) -> Dict[str, Any]:
-            expected_final = extract_reasoning_fields(expected_output).get("final_answer", "")
-            predicted_final = model_output.get("final_answer", "")
-            return {
-                "exact_match": _normalize_text_for_match(expected_final) == _normalize_text_for_match(predicted_final)
-            }
+        @weave.op(name="fmax_mf")
+        def score_fmax_mf(expected_output: Dict[str, Any], model_output: Dict[str, Optional[float]]) -> float:
+            return float(model_output.get("fmax_mf") or 0.0)
+
+        @weave.op(name="fmax_bp")
+        def score_fmax_bp(expected_output: Dict[str, Any], model_output: Dict[str, Optional[float]]) -> float:
+            return float(model_output.get("fmax_bp") or 0.0)
+
+        @weave.op(name="fmax_cc")
+        def score_fmax_cc(expected_output: Dict[str, Any], model_output: Dict[str, Optional[float]]) -> float:
+            return float(model_output.get("fmax_cc") or 0.0)
+
+        @weave.op(name="overall_mean_fmax")
+        def score_overall_mean_fmax(expected_output: Dict[str, Any], model_output: Dict[str, Optional[float]]) -> float:
+            return float(model_output.get("overall_mean_fmax") or 0.0)
 
         evaluation = weave.Evaluation(
-            name=getattr(args, "weave_eval_name", None) or f"eval-{resolve_model_name(args)}-{args.eval_split}",
-            dataset=sample_rows,
-            scorers=[exact_match_score],
+            name=(
+                getattr(args, "wandb_run_name", None)
+                or getattr(args, "weave_eval_name", None)
+                or f"eval-{resolve_model_name(args)}-{args.eval_split}"
+            ),
+            dataset=[weave_summary_row],
+            scorers=[score_fmax_mf, score_fmax_bp, score_fmax_cc, score_overall_mean_fmax],
             preprocess_model_input=lambda row: {
-                "prediction": row.get("prediction", ""),
-                "reasoning_full": row.get("reasoning_full", ""),
-                "final_answer": row.get("final_answer", ""),
-                "intermediate_trace": row.get("intermediate_trace", ""),
+                "fmax_mf": row.get("fmax_mf"),
+                "fmax_bp": row.get("fmax_bp"),
+                "fmax_cc": row.get("fmax_cc"),
+                "overall_mean_fmax": row.get("overall_mean_fmax"),
             },
             metadata={
                 "job_type": "eval",
@@ -966,9 +985,10 @@ def maybe_log_eval_to_weave(
                 "eval_split": args.eval_split,
                 "result_files_total": run_summary.get("result_files_total"),
                 "metrics_loaded": bool(metrics_summary),
+                "sample_rows_logged": len(sample_rows),
             },
         )
-        evaluation_result = evaluation.evaluate(replay_prediction)
+        evaluation_result = evaluation.evaluate(replay_summary_metrics)
         if inspect.isawaitable(evaluation_result):
             try:
                 asyncio.run(evaluation_result)
