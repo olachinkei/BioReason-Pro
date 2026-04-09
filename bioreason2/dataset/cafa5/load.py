@@ -1,9 +1,11 @@
 import ast
 import os
+import re
 import traceback
 from collections import defaultdict
+from pathlib import Path
 
-from datasets import load_dataset, disable_caching
+from datasets import load_dataset, load_from_disk, disable_caching
 
 from bioreason2.dataset.cafa5.processor import (
     generate_cafa5_example,
@@ -11,6 +13,7 @@ from bioreason2.dataset.cafa5.processor import (
 )
 from bioreason2.dataset.prompts.cafa5 import (
     CAFA5_REASONING_TEMPLATE,
+    CAFA5_REASONING_TEMPLATE_PAPER_COMPACT,
     CAFA5_REASONING_TEMPLATE_WITH_CONTEXT,
     CAFA5_REASONING_TEMPLATE_WITH_CONTEXT_PPI,
     CAFA5_REASONING_TEMPLATE_WITH_CONTEXT_PPI_UNIPROT,
@@ -20,6 +23,35 @@ from bioreason2.dataset.cafa5.format import format_cafa5_for_protein_llm
 from bioreason2.dataset.utils import truncate_protein, ASPECT_ORDER, ASPECT_TO_COLUMN
 
 # disable_caching()  # Since multiple people might use the same cache directory
+
+GO_ID_PATTERN = re.compile(r"GO:\d{7}")
+GO_SPECULATION_ITEM_PATTERN = re.compile(r"GO:\d{7}(?:\s*\([^)]+\)|\s+[^,;]+)?")
+ASPECT_DISPLAY_NAMES = {
+    "MF": "Molecular Function",
+    "BP": "Biological Process",
+    "CC": "Cellular Component",
+}
+
+
+def _load_dataset_source(dataset, dataset_name=None, cache_dir=None, dataset_subset=None):
+    """Load either a Hub dataset or a local DatasetDict artifact."""
+    dataset_path = Path(os.path.expanduser(str(dataset)))
+    if dataset_path.exists():
+        if dataset_path.is_dir() and (dataset_path / "dataset_dict.json").exists():
+            return load_from_disk(str(dataset_path))
+        if dataset_name:
+            named_path = dataset_path / dataset_name
+            if named_path.is_dir() and (named_path / "dataset_dict.json").exists():
+                return load_from_disk(str(named_path))
+
+    if dataset_subset:
+        return load_dataset(
+            dataset,
+            name=dataset_name,
+            dataset_subset=dataset_subset,
+            cache_dir=cache_dir,
+        )
+    return load_dataset(dataset, name=dataset_name, cache_dir=cache_dir)
 
 
 def _count_go_term_frequencies(dataset):
@@ -163,7 +195,121 @@ def _add_uniprot_summary(example):
     return final_answer
 
 
-def _format_reasoning_prompt(example, go_gpt_predictions_column=None, interpro_in_prompt=False, ppi_in_prompt=False, include_ground_truth_in_final_answer=False, add_uniprot_summary=False, is_swissprot=False, ask_all_go_aspects=False):
+def _normalize_slot_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        value = "\n".join(str(item) for item in value if item is not None)
+    return str(value).strip()
+
+
+def _limit_multiline_slot(value, *, max_lines, none_value="None"):
+    text = _normalize_slot_text(value)
+    if not text:
+        return none_value
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return none_value
+    if len(lines) <= max_lines:
+        return "\n".join(lines)
+    clipped = lines[:max_lines]
+    clipped.append(f"... ({len(lines) - max_lines} more)")
+    return "\n".join(clipped)
+
+
+def _compact_go_speculations(value, *, max_ids_per_aspect=8):
+    text = _normalize_slot_text(value)
+    if not text:
+        return {"MF": "None", "BP": "None", "CC": "None"}
+
+    grouped_items = {"MF": [], "BP": [], "CC": []}
+    current_aspect = None
+
+    def _append_items(aspect, raw_line):
+        if aspect not in grouped_items:
+            return
+        items = GO_SPECULATION_ITEM_PATTERN.findall(raw_line)
+        if not items:
+            items = GO_ID_PATTERN.findall(raw_line)
+        for item in items:
+            normalized_item = item.strip().rstrip(",;")
+            if normalized_item and normalized_item not in grouped_items[aspect]:
+                grouped_items[aspect].append(normalized_item)
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        upper = stripped.upper()
+        if upper.startswith("MF"):
+            current_aspect = "MF"
+        elif upper.startswith("BP"):
+            current_aspect = "BP"
+        elif upper.startswith("CC"):
+            current_aspect = "CC"
+        _append_items(current_aspect, stripped)
+
+    if not any(grouped_items.values()):
+        fallback_items = []
+        for item in GO_SPECULATION_ITEM_PATTERN.findall(text):
+            normalized_item = item.strip().rstrip(",;")
+            if normalized_item and normalized_item not in fallback_items:
+                fallback_items.append(normalized_item)
+        if not fallback_items:
+            fallback_items = []
+            for go_id in GO_ID_PATTERN.findall(text):
+                if go_id not in fallback_items:
+                    fallback_items.append(go_id)
+        if not fallback_items:
+            return {"MF": "None", "BP": "None", "CC": "None"}
+        joined = ", ".join(fallback_items[: max_ids_per_aspect * 3])
+        return {"MF": joined, "BP": joined, "CC": joined}
+
+    compact = {}
+    for aspect in ("MF", "BP", "CC"):
+        aspect_items = grouped_items[aspect][:max_ids_per_aspect]
+        compact[aspect] = ", ".join(aspect_items) if aspect_items else "None"
+    return compact
+
+
+def _resolve_focus_aspect(example, ask_all_go_aspects=False):
+    if ask_all_go_aspects:
+        return ", ".join(ASPECT_DISPLAY_NAMES[aspect] for aspect in ("MF", "BP", "CC"))
+
+    go_aspect = _normalize_slot_text(example.get("go_aspect")).lower()
+    aspect_labels = {
+        "mf": ASPECT_DISPLAY_NAMES["MF"],
+        "bp": ASPECT_DISPLAY_NAMES["BP"],
+        "cc": ASPECT_DISPLAY_NAMES["CC"],
+        "all": ", ".join(ASPECT_DISPLAY_NAMES[aspect] for aspect in ("MF", "BP", "CC")),
+    }
+    if go_aspect in aspect_labels:
+        return aspect_labels[go_aspect]
+
+    present_aspects = []
+    if example.get("go_mf"):
+        present_aspects.append(ASPECT_DISPLAY_NAMES["MF"])
+    if example.get("go_bp"):
+        present_aspects.append(ASPECT_DISPLAY_NAMES["BP"])
+    if example.get("go_cc"):
+        present_aspects.append(ASPECT_DISPLAY_NAMES["CC"])
+    return ", ".join(present_aspects) if present_aspects else ", ".join(
+        ASPECT_DISPLAY_NAMES[aspect] for aspect in ("MF", "BP", "CC")
+    )
+
+
+def _format_reasoning_prompt(
+    example,
+    go_gpt_predictions_column=None,
+    interpro_in_prompt=False,
+    ppi_in_prompt=False,
+    include_ground_truth_in_final_answer=False,
+    add_uniprot_summary=False,
+    is_swissprot=False,
+    ask_all_go_aspects=False,
+    reasoning_prompt_style="verbose",
+    compact_interpro_limit=12,
+    compact_ppi_limit=10,
+    compact_go_speculation_limit=8,
+):
     """Format reasoning data into prompt structure.
     
     Args:
@@ -174,6 +320,8 @@ def _format_reasoning_prompt(example, go_gpt_predictions_column=None, interpro_i
         include_ground_truth_in_final_answer: Whether to append ground truth GO terms to final answer
         add_uniprot_summary: Whether to add UniProt summary to final answer and use UniProt template
         is_swissprot: Whether to use dynamic SwissProt template that mentions only available data
+        reasoning_prompt_style: Prompt style for reasoning data. "paper_compact" restricts
+            text context to paper-style slots and omits optional prose fields.
         
     Returns:
         Example with prompt field added
@@ -184,12 +332,12 @@ def _format_reasoning_prompt(example, go_gpt_predictions_column=None, interpro_i
     interpro_data = ""
     if interpro_in_prompt and example.get("interpro_formatted"):
         interpro_data = example["interpro_formatted"]
-    
+
     # Prepare PPI data
     ppi_data = ""
     if ppi_in_prompt and example.get("ppi_formatted"):
         ppi_data = example["ppi_formatted"]
-    
+
     # Prepare GO predictions from pre-computed column
     go_speculations = ""
     if go_gpt_predictions_column and example.get(go_gpt_predictions_column):
@@ -213,8 +361,39 @@ def _format_reasoning_prompt(example, go_gpt_predictions_column=None, interpro_i
     uniprot_summary = " Summarize in UniProt format."
     assistant_answer = _add_uniprot_summary(example) if add_uniprot_summary else (example["final_answer"] if "final_answer" in example else "")
     
+    if reasoning_prompt_style == "paper_compact":
+        compact_interpro = _limit_multiline_slot(
+            interpro_data,
+            max_lines=compact_interpro_limit,
+        )
+        compact_ppi = _limit_multiline_slot(
+            ppi_data,
+            max_lines=compact_ppi_limit,
+        )
+        compact_go_speculations = _compact_go_speculations(
+            go_speculations,
+            max_ids_per_aspect=compact_go_speculation_limit,
+        )
+        focus_aspect = _resolve_focus_aspect(
+            example,
+            ask_all_go_aspects=ask_all_go_aspects,
+        )
+        prompt_dict = {
+            "system": CAFA5_REASONING_TEMPLATE_PAPER_COMPACT["system_prompt"],
+            "user": CAFA5_REASONING_TEMPLATE_PAPER_COMPACT["user_prompt"].format(
+                organism=organism,
+                interpro_data=compact_interpro,
+                ppi_data=compact_ppi,
+                go_mf_speculations=compact_go_speculations["MF"],
+                go_bp_speculations=compact_go_speculations["BP"],
+                go_cc_speculations=compact_go_speculations["CC"],
+                focus_aspect=focus_aspect,
+            ),
+            "assistant_reasoning": example["reasoning"] if "reasoning" in example else "",
+            "assistant_answer": example["final_answer"] if "final_answer" in example else "",
+        }
     # Handle SwissProt template with dynamic system prompt
-    if is_swissprot:
+    elif is_swissprot:
         # Build GO terms text based on available data
         go_terms_parts = []
         if example.get("go_mf"):
@@ -248,7 +427,7 @@ def _format_reasoning_prompt(example, go_gpt_predictions_column=None, interpro_i
         }
     
     # Choose template based on available context
-    if ppi_in_prompt and (interpro_data or go_speculations):
+    elif ppi_in_prompt and (interpro_data or go_speculations):
         # Use PPI context template when PPI is requested and we have some context
         if add_uniprot_summary:
             prompt_dict = {
@@ -424,6 +603,10 @@ def _process_dataset_split(
     add_uniprot_summary=False,
     is_swissprot=False,
     ask_all_go_aspects=False,
+    reasoning_prompt_style="verbose",
+    compact_interpro_limit=12,
+    compact_ppi_limit=10,
+    compact_go_speculation_limit=8,
 ):
     """Process a single dataset split with all transformations."""
     # For testing, limit to 50 datapoints
@@ -444,6 +627,14 @@ def _process_dataset_split(
             lambda x: {"protein_function": None, **x},
             num_proc=num_proc,
             desc="Removing protein function summaries",
+        )
+
+    if reasoning_dataset_name and reasoning_prompt_style == "paper_compact":
+        print(
+            "Using paper-compact reasoning prompts with slot caps: "
+            f"interpro={compact_interpro_limit}, "
+            f"ppi={compact_ppi_limit}, "
+            f"go_speculations_per_aspect={compact_go_speculation_limit}"
         )
 
     # Format for Protein-LLM
@@ -477,6 +668,10 @@ def _process_dataset_split(
                     "add_uniprot_summary": add_uniprot_summary,
                     "is_swissprot": is_swissprot,
                     "ask_all_go_aspects": ask_all_go_aspects,
+                    "reasoning_prompt_style": reasoning_prompt_style,
+                    "compact_interpro_limit": compact_interpro_limit,
+                    "compact_ppi_limit": compact_ppi_limit,
+                    "compact_go_speculation_limit": compact_go_speculation_limit,
                 },
             )
         else:
@@ -561,6 +756,10 @@ def load_cafa5_dataset(
     add_uniprot_summary: bool = False,
     is_swissprot: bool = False,
     ask_all_go_aspects: bool = False,
+    reasoning_prompt_style: str = "verbose",
+    compact_interpro_limit: int = 12,
+    compact_ppi_limit: int = 20,
+    compact_go_speculation_limit: int = 8,
 ):
     """
     Load CAFA5 dataset, format it into the Protein-LLM format, and split into train/val sets.
@@ -605,6 +804,11 @@ def load_cafa5_dataset(
         ask_all_go_aspects: When using reasoning data, if True, always asks for all 3 GO aspects
                            (Molecular Function, Biological Process, Cellular Component) regardless
                            of what ground truth data is available (default=False). Useful for evaluation.
+        reasoning_prompt_style: Prompt style for reasoning data. "paper_compact" restricts
+                               text context to paper-style slots for RL continuation tuning.
+        compact_interpro_limit: Maximum number of InterPro lines kept in paper-compact prompts.
+        compact_ppi_limit: Maximum number of PPI lines kept in paper-compact prompts.
+        compact_go_speculation_limit: Maximum GO IDs kept per aspect in paper-compact prompts.
 
     Returns:
         Tuple of (train_dataset, val_dataset, test_dataset) where test_dataset is the original test split
@@ -627,7 +831,11 @@ def load_cafa5_dataset(
 
             print(f"Using reasoning dataset '{reasoning_dataset_name}' as primary dataset...")
             try:
-                datasets = load_dataset(dataset, name=reasoning_dataset_name, cache_dir=cache_dir)
+                datasets = _load_dataset_source(
+                    dataset,
+                    dataset_name=reasoning_dataset_name,
+                    cache_dir=cache_dir,
+                )
                 # Report on available splits
                 available_splits = list(datasets.keys())
                 total_examples = sum(len(datasets[split]) for split in available_splits)
@@ -637,15 +845,12 @@ def load_cafa5_dataset(
                 raise e
         else:
             # Load regular dataset
-            if dataset_subset:
-                datasets = load_dataset(
-                    dataset,
-                    name=dataset_name,
-                    dataset_subset=dataset_subset,
-                    cache_dir=cache_dir,
-                )
-            else:
-                datasets = load_dataset(dataset, name=dataset_name, cache_dir=cache_dir)
+            datasets = _load_dataset_source(
+                dataset,
+                dataset_name=dataset_name,
+                cache_dir=cache_dir,
+                dataset_subset=dataset_subset,
+            )
 
         # Check if this is a pre-split dataset (has validation split)
         if "validation" in datasets or "test" in datasets:
@@ -667,22 +872,37 @@ def load_cafa5_dataset(
         interpro_metadata = None
         if interpro_dataset_name is not None:
             print(f"Loading InterPro metadata with name='{interpro_dataset_name}'...")
-            ds_interpro = load_dataset(
-                dataset, name=interpro_dataset_name, cache_dir=cache_dir
-            )
-            interpro_metadata = ds_interpro["metadata"].to_pandas()
-
-            # Validate interpro_metadata
-            required_columns = ["interpro_id", "entry_name", "type"]
-            missing_columns = [
-                col for col in required_columns if col not in interpro_metadata.columns
-            ]
-            if missing_columns:
-                raise ValueError(
-                    f"interpro_metadata is missing required columns: {missing_columns}"
+            try:
+                ds_interpro = _load_dataset_source(
+                    dataset,
+                    dataset_name=interpro_dataset_name,
+                    cache_dir=cache_dir,
                 )
+                metadata_split = None
+                if isinstance(ds_interpro, dict):
+                    metadata_split = ds_interpro.get("metadata") or ds_interpro.get(interpro_dataset_name)
+                else:
+                    metadata_split = ds_interpro
 
-            print(f"Loaded InterPro metadata with {len(interpro_metadata)} entries")
+                if metadata_split is None:
+                    raise KeyError("metadata split is not available")
+
+                interpro_metadata = metadata_split.to_pandas()
+
+                # Validate interpro_metadata
+                required_columns = ["interpro_id", "entry_name", "type"]
+                missing_columns = [
+                    col for col in required_columns if col not in interpro_metadata.columns
+                ]
+                if missing_columns:
+                    raise ValueError(
+                        f"interpro_metadata is missing required columns: {missing_columns}"
+                    )
+
+                print(f"Loaded InterPro metadata with {len(interpro_metadata)} entries")
+            except Exception as exc:
+                print(f"InterPro metadata unavailable; continuing without it: {exc}")
+                interpro_metadata = None
         else:
             print("No InterPro metadata requested, proceeding with GO terms only")
 
@@ -774,6 +994,10 @@ def load_cafa5_dataset(
                         add_uniprot_summary=add_uniprot_summary,
                         is_swissprot=is_swissprot,
                         ask_all_go_aspects=ask_all_go_aspects,
+                        reasoning_prompt_style=reasoning_prompt_style,
+                        compact_interpro_limit=compact_interpro_limit,
+                        compact_ppi_limit=compact_ppi_limit,
+                        compact_go_speculation_limit=compact_go_speculation_limit,
                     )
                 return None
 
@@ -820,6 +1044,14 @@ def load_cafa5_dataset(
                     desc="Removing protein function summaries",
                 )
 
+            if reasoning_dataset_name and reasoning_prompt_style == "paper_compact":
+                print(
+                    "Using paper-compact reasoning prompts with slot caps: "
+                    f"interpro={compact_interpro_limit}, "
+                    f"ppi={compact_ppi_limit}, "
+                    f"go_speculations_per_aspect={compact_go_speculation_limit}"
+                )
+
             # Format for Protein-LLM
             if split_go_aspects:
                 # Single-pass generation and flattening of split GO aspect examples
@@ -852,6 +1084,10 @@ def load_cafa5_dataset(
                             "add_uniprot_summary": add_uniprot_summary,
                             "is_swissprot": is_swissprot,
                             "ask_all_go_aspects": ask_all_go_aspects,
+                            "reasoning_prompt_style": reasoning_prompt_style,
+                            "compact_interpro_limit": compact_interpro_limit,
+                            "compact_ppi_limit": compact_ppi_limit,
+                            "compact_go_speculation_limit": compact_go_speculation_limit,
                         },
                     )
                 else:

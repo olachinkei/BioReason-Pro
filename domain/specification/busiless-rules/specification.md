@@ -394,7 +394,7 @@ Operationally, this means the RL implementation should follow the following pape
 
 - Sequence-level importance sampling correction, not token-level correction
 - Advantage defined as `(reward - group_mean_reward) / (global_batch_std + eps_std)`
-- Reward extracted from the **structured final answer only**, not from intermediate reasoning text
+- Reward extracted from the generated **reasoning trace via GO-term regex matching**, i.e. regex over the model's generated trace rather than a final-answer-only block, matching the Appendix description of the paper
 - GO predictions propagated through `is_a` and `part_of` before scoring
 - Reward aligned to **IA-weighted F1 / Fmax_w** with an explicit IA file; paper-faithful RL should fail closed rather than silently falling back
 - Asymmetric Clip-Higher behavior with `epsilon_low=7e-4` and `epsilon_high=9e-4`
@@ -420,6 +420,14 @@ Operational adaptation for the current CoreWeave continuation-tuning setup:
 - When running the current single-node continuation setup, prefer preserving the paper's `B/G=8` unique proteins per step by keeping `num_generations=24` and setting `train_batch_size=8`, then reduce `max_steps` and/or `max_new_tokens` before reducing group diversity
 - Any deviation from the paper reference, especially `num_generations`, `max_new_tokens`, `train_batch_size`, `max_steps`, and IA availability, must be explicit in W&B config
 - `reward_weights` and all RL-control parameters (`loss_type`, clip epsilons, reward scaling mode, IS cap, scheduler settings, KL beta, and final-answer-only reward mode) must remain visible in W&B config for each RL run
-- Since RL reward is computed from `GO_SUMMARY`, stopping criteria should terminate as soon as the structured GO summary block is complete rather than waiting on optional prose
+- Even though the paper describes reward extraction from the reasoning trace, the output format should still terminate as soon as the structured `GO_SUMMARY` block is complete rather than waiting on optional prose such as `FUNCTION_SUMMARY`
+- The paper's prompt-length reference `512` applies to the **text context only**; protein residue embeddings and GO graph embeddings are separate multimodal inputs and should not be counted against that text budget
+- RL text prompts should therefore stay close to the paper's compact slot structure rather than carrying full free-form metadata dumps
+- The preferred RL text slots are: `organism`, `interpro_annotations`, `ppi_partners`, `go_mf_speculations`, `go_bp_speculations`, `go_cc_speculations`, and `focus_aspect`
+- `go_*_speculations` should be rendered per aspect as `GO:XXXXXXX (term name)` strings, matching Table S19, rather than GO IDs alone
+- `ppi_partners` should stay close to the paper's data pipeline convention of top-10 high-confidence STRING partners, not an open-ended dump
+- In practical terms, `prompt_len` inflation into the thousands is a bug signal for the paper-faithful path: it usually means information that should stay in multimodal embeddings, or optional prose fields, leaked into the tokenizer-visible text prompt
+- The paper-faithful RL prompt path should therefore exclude long prose fields such as UniProt summaries, function summaries, localization text, and other metadata dumps unless an explicit ablation is being run
+- Optional fields such as UniProt prose summaries, extended function descriptions, or other long metadata should be excluded from the paper-faithful RL prompt path unless they are being tested as an explicit ablation
 - The first comparison between `SFT -> RL` and `paper RL -> continuation RL` should keep the objective, reward extraction, sampling controls, and memory controls identical so that the initialization checkpoint is the only changed variable
 - If `paper RL -> continuation RL` shows collapsed within-group reward variance or low rollout diversity, follow-up tuning may shorten `max_steps` and/or strengthen the KL anchor, but that should be recorded as a separate ablation rather than the first A/B comparison

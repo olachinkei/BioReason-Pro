@@ -45,7 +45,6 @@ GO_NAMESPACE_TO_ASPECT = {
 }
 TERMINAL_SUMMARY_MARKERS = (
     GO_SUMMARY_END,
-    FUNCTION_SUMMARY_END,
     "</answer>",
     "<|im_end|>",
     "<|endoftext|>",
@@ -84,7 +83,8 @@ DEFAULT_GO_OBO_PATH = str((Path(__file__).resolve().parent / "bioreason2" / "dat
 REWARD_CONTEXT: Dict[str, Any] = {
     "go_obo_path": DEFAULT_GO_OBO_PATH if os.path.exists(DEFAULT_GO_OBO_PATH) else "",
     "ia_file_path": "",
-    "reward_final_answer_only": True,
+    "reward_final_answer_only": False,
+    "reward_prediction_source": "reasoning_trace",
 }
 
 
@@ -228,10 +228,25 @@ def extract_reward_prediction_text(text: Any) -> str:
     raw = normalize_text(text).strip()
     if not raw:
         return ""
-    if not resolve_reward_context().get("reward_final_answer_only", True):
+    reward_context = resolve_reward_context()
+    prediction_source = normalize_text(reward_context.get("reward_prediction_source")).strip().lower()
+    if not prediction_source:
+        prediction_source = "structured_go_summary" if reward_context.get("reward_final_answer_only", False) else "reasoning_trace"
+
+    if prediction_source == "reasoning_trace":
+        # The paper describes regex extraction from the generated reasoning trace.
+        # In our formatting variants that means the whole generated completion,
+        # not only the text inside <think> tags.
+        return raw
+    if prediction_source == "final_answer":
+        sections = extract_reasoning_and_answer(raw)
+        final_answer = sections.get("final_answer", "").strip()
+        if final_answer:
+            return final_answer
         if "</think>" in raw:
             return raw.split("</think>", 1)[1].strip()
         return raw
+
     structured_final_answer = extract_structured_final_answer(raw)
     if not structured_final_answer:
         return ""
@@ -287,7 +302,11 @@ def configure_reward_context(args: argparse.Namespace) -> None:
         DEFAULT_GO_OBO_PATH if os.path.exists(DEFAULT_GO_OBO_PATH) else ""
     )
     REWARD_CONTEXT["ia_file_path"] = normalize_text(getattr(args, "ia_file_path", None)).strip()
-    REWARD_CONTEXT["reward_final_answer_only"] = bool(getattr(args, "reward_final_answer_only", True))
+    REWARD_CONTEXT["reward_final_answer_only"] = bool(getattr(args, "reward_final_answer_only", False))
+    REWARD_CONTEXT["reward_prediction_source"] = (
+        normalize_text(getattr(args, "reward_prediction_source", None)).strip().lower()
+        or ("structured_go_summary" if REWARD_CONTEXT["reward_final_answer_only"] else "reasoning_trace")
+    )
     inspect_completion_text.cache_clear()
 
 
@@ -462,6 +481,8 @@ def inspect_completion_text(raw_completion: str) -> Dict[str, Any]:
     sections = extract_reasoning_and_answer(raw_completion)
     final_answer = sections["final_answer"].strip()
     reward_prediction_text = extract_reward_prediction_text(raw_completion)
+    reward_context = resolve_reward_context()
+    reward_prediction_source = normalize_text(reward_context.get("reward_prediction_source")).strip().lower()
     go_summary = extract_tagged_block(final_answer, GO_SUMMARY_START, GO_SUMMARY_END)
     function_summary = extract_tagged_block(final_answer, FUNCTION_SUMMARY_START, FUNCTION_SUMMARY_END)
     go_summary_aspects = extract_go_aspect_map(go_summary)
@@ -474,7 +495,11 @@ def inspect_completion_text(raw_completion: str) -> Dict[str, Any]:
 
     prediction_source = "none"
     if has_meaningful_text(reward_prediction_text):
-        if go_summary:
+        if reward_prediction_source == "reasoning_trace":
+            prediction_source = "reasoning_trace"
+        elif reward_prediction_source == "final_answer":
+            prediction_source = "final_answer"
+        elif go_summary:
             prediction_source = "structured_final_answer"
         elif has_answer_tag:
             prediction_source = "answer_tag"
@@ -495,7 +520,9 @@ def inspect_completion_text(raw_completion: str) -> Dict[str, Any]:
         "reward_prediction_aspect_labels": list(reward_prediction_aspects.keys()),
         "has_go_summary": bool(go_summary),
         "has_function_summary": bool(function_summary),
-        "has_complete_summary_schema": bool(go_summary and function_summary and has_meaningful_text(function_summary)),
+        # We keep GO_SUMMARY schema checks even when reward is extracted from the
+        # reasoning trace, because the paper still expects a structured GO output.
+        "has_complete_summary_schema": bool(go_summary and go_summary_aspects),
         "has_closed_reasoning": has_closed_reasoning,
         "has_answer_tag": has_answer_tag,
         "final_answer_clean": final_answer_clean,
@@ -857,7 +884,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--interpro_dataset_name", type=str, default="interpro_metadata")
     parser.add_argument("--go_gpt_predictions_column", type=str, default="go_pred")
     parser.add_argument("--include_ground_truth_in_final_answer", type=str, default="false")
-    parser.add_argument("--add_uniprot_summary", type=str, default="true")
+    parser.add_argument("--add_uniprot_summary", type=str, default="false")
     parser.add_argument("--is_swissprot", type=str, default="false")
     parser.add_argument("--include_go_defs", type=str, default="false")
     parser.add_argument("--interpro_in_prompt", type=str, default="true")
@@ -865,8 +892,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--predict_interpro", type=str, default="false")
     parser.add_argument("--include_protein_function_summary", type=str, default="true")
     parser.add_argument("--split_go_aspects", type=str, default="false")
+    parser.add_argument(
+        "--reasoning_prompt_style",
+        type=str,
+        default="paper_compact",
+        choices=["verbose", "paper_compact"],
+    )
+    parser.add_argument("--compact_interpro_limit", type=int, default=12)
+    parser.add_argument("--compact_ppi_limit", type=int, default=10)
+    parser.add_argument("--compact_go_speculation_limit", type=int, default=8)
 
-    parser.add_argument("--max_length_text", type=int, default=10000)
+    parser.add_argument("--max_length_text", type=int, default=512)
     parser.add_argument("--max_length_protein", type=int, default=2000)
     parser.add_argument("--protein_embedding_layer", type=int, default=37)
     parser.add_argument("--go_hidden_dim", type=int, default=512)
@@ -947,7 +983,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--advantage_epsilon_std", type=float, default=1e-6)
     parser.add_argument("--importance_sampling_level", type=str, default="sequence", choices=["sequence"])
     parser.add_argument("--importance_sampling_cap", type=float, default=2.0)
-    parser.add_argument("--reward_final_answer_only", type=str, default="true")
+    parser.add_argument("--reward_final_answer_only", type=str, default="false")
+    parser.add_argument(
+        "--reward_prediction_source",
+        type=str,
+        default="reasoning_trace",
+        choices=["reasoning_trace", "final_answer", "structured_go_summary"],
+    )
     parser.add_argument("--kl_beta", type=float, default=1e-4)
     parser.add_argument(
         "--reward_funcs",
@@ -1238,6 +1280,10 @@ def load_rl_datasets(args: argparse.Namespace) -> Tuple[Any, Any, Any]:
         include_ground_truth_in_final_answer=args.include_ground_truth_in_final_answer,
         add_uniprot_summary=args.add_uniprot_summary,
         is_swissprot=args.is_swissprot,
+        reasoning_prompt_style=args.reasoning_prompt_style,
+        compact_interpro_limit=args.compact_interpro_limit,
+        compact_ppi_limit=args.compact_ppi_limit,
+        compact_go_speculation_limit=args.compact_go_speculation_limit,
         return_as_chat_template=True,
     )
     train_dataset = limit_dataset(train_dataset, args.max_train_samples)

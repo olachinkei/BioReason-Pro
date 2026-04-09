@@ -126,7 +126,19 @@ ALLOW_PAPER_RL_ABLATION=${ALLOW_PAPER_RL_ABLATION:-"false"}
 RESUME_FROM_RAW_CHECKPOINT=${RESUME_FROM_RAW_CHECKPOINT:-""}
 
 PROTEIN_MODEL_NAME=${PROTEIN_MODEL_NAME:-"esm3_sm_open_v1"}
-MAX_LENGTH_TEXT=${MAX_LENGTH_TEXT:-10000}
+ADD_UNIPROT_SUMMARY=${ADD_UNIPROT_SUMMARY:-"False"}
+IS_SWISSPROT=${IS_SWISSPROT:-"False"}
+INCLUDE_GO_DEFS=${INCLUDE_GO_DEFS:-"False"}
+INTERPRO_IN_PROMPT=${INTERPRO_IN_PROMPT:-"True"}
+PPI_IN_PROMPT=${PPI_IN_PROMPT:-"True"}
+PREDICT_INTERPRO=${PREDICT_INTERPRO:-"False"}
+INCLUDE_PROTEIN_FUNCTION_SUMMARY=${INCLUDE_PROTEIN_FUNCTION_SUMMARY:-"False"}
+SPLIT_GO_ASPECTS=${SPLIT_GO_ASPECTS:-"False"}
+REASONING_PROMPT_STYLE=${REASONING_PROMPT_STYLE:-"paper_compact"}
+COMPACT_INTERPRO_LIMIT=${COMPACT_INTERPRO_LIMIT:-12}
+COMPACT_PPI_LIMIT=${COMPACT_PPI_LIMIT:-10}
+COMPACT_GO_SPECULATION_LIMIT=${COMPACT_GO_SPECULATION_LIMIT:-8}
+MAX_LENGTH_TEXT=${MAX_LENGTH_TEXT:-512}
 MAX_LENGTH_PROTEIN=${MAX_LENGTH_PROTEIN:-2000}
 PROTEIN_EMBEDDING_LAYER=${PROTEIN_EMBEDDING_LAYER:-37}
 GO_HIDDEN_DIM=${GO_HIDDEN_DIM:-512}
@@ -204,7 +216,8 @@ REWARD_SCALING=${REWARD_SCALING:-"batch"}
 ADVANTAGE_EPSILON_STD=${ADVANTAGE_EPSILON_STD:-1e-6}
 IMPORTANCE_SAMPLING_LEVEL=${IMPORTANCE_SAMPLING_LEVEL:-"sequence"}
 IMPORTANCE_SAMPLING_CAP=${IMPORTANCE_SAMPLING_CAP:-2.0}
-REWARD_FINAL_ANSWER_ONLY=${REWARD_FINAL_ANSWER_ONLY:-"True"}
+REWARD_FINAL_ANSWER_ONLY=${REWARD_FINAL_ANSWER_ONLY:-"False"}
+REWARD_PREDICTION_SOURCE=${REWARD_PREDICTION_SOURCE:-"reasoning_trace"}
 KL_BETA=${KL_BETA:-1e-4}
 REWARD_FUNCS=${REWARD_FUNCS:-"ia_weighted_f1"}
 REWARD_WEIGHTS=${REWARD_WEIGHTS:-"1.0"}
@@ -222,14 +235,14 @@ OPTIONAL_GO_EMBEDDINGS_ARG=()
 PYTHON_BIN=${PYTHON_BIN:-""}
 
 if [ -z "$PYTHON_BIN" ]; then
-  if command -v python >/dev/null 2>&1; then
-    PYTHON_BIN=$(command -v python)
-  elif command -v python3 >/dev/null 2>&1; then
-    PYTHON_BIN=$(command -v python3)
-  elif [ -x "$(pwd)/.venv-gpu/bin/python" ]; then
+  if [ -x "$(pwd)/.venv-gpu/bin/python" ]; then
     PYTHON_BIN="$(pwd)/.venv-gpu/bin/python"
   elif [ -x "$(pwd)/.venv/bin/python" ]; then
     PYTHON_BIN="$(pwd)/.venv/bin/python"
+  elif command -v python >/dev/null 2>&1; then
+    PYTHON_BIN=$(command -v python)
+  elif command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN=$(command -v python3)
   else
     echo "Error: no Python executable found for RL wrapper"
     exit 1
@@ -509,14 +522,18 @@ stdbuf -oL -eL "${TRAIN_COMMAND[@]}" "$PYTHON_BIN" train_protein_grpo.py \
   --interpro_dataset_name "$INTERPRO_DATASET_NAME" \
   --go_gpt_predictions_column go_pred \
   --include_ground_truth_in_final_answer False \
-  --add_uniprot_summary True \
-  --is_swissprot False \
-  --include_go_defs False \
-  --interpro_in_prompt True \
-  --ppi_in_prompt True \
-  --predict_interpro False \
-  --include_protein_function_summary True \
-  --split_go_aspects False \
+  --add_uniprot_summary "$ADD_UNIPROT_SUMMARY" \
+  --is_swissprot "$IS_SWISSPROT" \
+  --include_go_defs "$INCLUDE_GO_DEFS" \
+  --interpro_in_prompt "$INTERPRO_IN_PROMPT" \
+  --ppi_in_prompt "$PPI_IN_PROMPT" \
+  --predict_interpro "$PREDICT_INTERPRO" \
+  --include_protein_function_summary "$INCLUDE_PROTEIN_FUNCTION_SUMMARY" \
+  --split_go_aspects "$SPLIT_GO_ASPECTS" \
+  --reasoning_prompt_style "$REASONING_PROMPT_STYLE" \
+  --compact_interpro_limit "$COMPACT_INTERPRO_LIMIT" \
+  --compact_ppi_limit "$COMPACT_PPI_LIMIT" \
+  --compact_go_speculation_limit "$COMPACT_GO_SPECULATION_LIMIT" \
   --max_length_text "$MAX_LENGTH_TEXT" \
   --max_length_protein "$MAX_LENGTH_PROTEIN" \
   --protein_embedding_layer "$PROTEIN_EMBEDDING_LAYER" \
@@ -588,6 +605,7 @@ stdbuf -oL -eL "${TRAIN_COMMAND[@]}" "$PYTHON_BIN" train_protein_grpo.py \
   --importance_sampling_level "$IMPORTANCE_SAMPLING_LEVEL" \
   --importance_sampling_cap "$IMPORTANCE_SAMPLING_CAP" \
   --reward_final_answer_only "$REWARD_FINAL_ANSWER_ONLY" \
+  --reward_prediction_source "$REWARD_PREDICTION_SOURCE" \
   --kl_beta "$KL_BETA" \
   --reward_funcs "$REWARD_FUNCS" \
   --reward_weights "$REWARD_WEIGHTS" \

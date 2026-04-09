@@ -69,10 +69,18 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertIn('CLIP_EPSILON_HIGH=${CLIP_EPSILON_HIGH:-9e-4}', wrapper_text)
         self.assertIn('REWARD_SCALING=${REWARD_SCALING:-"batch"}', wrapper_text)
         self.assertIn('IMPORTANCE_SAMPLING_CAP=${IMPORTANCE_SAMPLING_CAP:-2.0}', wrapper_text)
+        self.assertIn('REWARD_FINAL_ANSWER_ONLY=${REWARD_FINAL_ANSWER_ONLY:-"False"}', wrapper_text)
+        self.assertIn('REWARD_PREDICTION_SOURCE=${REWARD_PREDICTION_SOURCE:-"reasoning_trace"}', wrapper_text)
         self.assertIn('REWARD_FUNCS=${REWARD_FUNCS:-"ia_weighted_f1"}', wrapper_text)
         self.assertIn('REWARD_WEIGHTS=${REWARD_WEIGHTS:-"1.0"}', wrapper_text)
         self.assertIn('PYTHON_BIN=${PYTHON_BIN:-""}', wrapper_text)
-        self.assertIn('elif [ -x "$(pwd)/.venv-gpu/bin/python" ]; then', wrapper_text)
+        self.assertIn('if [ -x "$(pwd)/.venv-gpu/bin/python" ]; then', wrapper_text)
+        self.assertIn('ADD_UNIPROT_SUMMARY=${ADD_UNIPROT_SUMMARY:-"False"}', wrapper_text)
+        self.assertIn('INCLUDE_PROTEIN_FUNCTION_SUMMARY=${INCLUDE_PROTEIN_FUNCTION_SUMMARY:-"False"}', wrapper_text)
+        self.assertIn('REASONING_PROMPT_STYLE=${REASONING_PROMPT_STYLE:-"paper_compact"}', wrapper_text)
+        self.assertIn('COMPACT_INTERPRO_LIMIT=${COMPACT_INTERPRO_LIMIT:-12}', wrapper_text)
+        self.assertIn('COMPACT_PPI_LIMIT=${COMPACT_PPI_LIMIT:-10}', wrapper_text)
+        self.assertIn('COMPACT_GO_SPECULATION_LIMIT=${COMPACT_GO_SPECULATION_LIMIT:-8}', wrapper_text)
         self.assertIn('MIN_NEW_TOKENS=${MIN_NEW_TOKENS:-1}', wrapper_text)
         self.assertIn('MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-512}', wrapper_text)
         self.assertIn('ROLLOUT_LOGPROB_MICROBATCH_SIZE=${ROLLOUT_LOGPROB_MICROBATCH_SIZE:-4}', wrapper_text)
@@ -113,6 +121,12 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertIn('--clip_epsilon_high "$CLIP_EPSILON_HIGH"', wrapper_text)
         self.assertIn('--reward_scaling "$REWARD_SCALING"', wrapper_text)
         self.assertIn('--importance_sampling_cap "$IMPORTANCE_SAMPLING_CAP"', wrapper_text)
+        self.assertIn('--reward_prediction_source "$REWARD_PREDICTION_SOURCE"', wrapper_text)
+        self.assertIn('--include_protein_function_summary "$INCLUDE_PROTEIN_FUNCTION_SUMMARY"', wrapper_text)
+        self.assertIn('--reasoning_prompt_style "$REASONING_PROMPT_STYLE"', wrapper_text)
+        self.assertIn('--compact_interpro_limit "$COMPACT_INTERPRO_LIMIT"', wrapper_text)
+        self.assertIn('--compact_ppi_limit "$COMPACT_PPI_LIMIT"', wrapper_text)
+        self.assertIn('--compact_go_speculation_limit "$COMPACT_GO_SPECULATION_LIMIT"', wrapper_text)
         self.assertIn('stdbuf -oL -eL "${TRAIN_COMMAND[@]}" "$PYTHON_BIN" train_protein_grpo.py', wrapper_text)
 
     def test_extract_go_ids_preserves_order_and_deduplicates(self):
@@ -137,11 +151,11 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
             ["GO:0007165", "GO:0005515", "GO:0005737", "GO:0009987"],
         )
 
-    def test_go_overlap_reward_uses_post_think_segment_when_available(self):
+    def test_go_overlap_reward_uses_reasoning_trace_when_configured(self):
         completion = "<think>Reasoning mentions GO:0007165.</think><answer>GO:0005515</answer>"
         sample_meta = {"go_bp": "GO:0007165"}
 
-        self.assertEqual(GRPO.go_overlap_reward(completion, sample_meta), 0.0)
+        self.assertGreater(GRPO.go_overlap_reward(completion, sample_meta), 0.0)
 
     def test_strict_format_reward_rejects_structural_tag_noise(self):
         completion = "<think>reasoning</think></tool_call>"
@@ -154,6 +168,14 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
             "<think>reasoning</think>"
             "<|GO_SUMMARY_START|>\nBP: GO:0007165\n<|GO_SUMMARY_END|>\n\n"
             "<|FUNCTION_SUMMARY_START|>\nKinase-linked signaling regulator.\n<|FUNCTION_SUMMARY_END|>"
+        )
+
+        self.assertEqual(GRPO.summary_schema_reward(completion, {"go_aspect": "bp"}), 1.0)
+
+    def test_summary_schema_reward_accepts_go_summary_without_function_summary(self):
+        completion = (
+            "<think>reasoning</think>"
+            "<|GO_SUMMARY_START|>\nBP: GO:0007165\n<|GO_SUMMARY_END|>"
         )
 
         self.assertEqual(GRPO.summary_schema_reward(completion, {"go_aspect": "bp"}), 1.0)
@@ -172,10 +194,10 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
 
         self.assertEqual(GRPO.go_presence_reward(completion, {"go_bp": "GO:0007165"}), 1.0)
 
-    def test_go_presence_reward_penalizes_unstructured_answer_tag_go_ids(self):
+    def test_go_presence_reward_accepts_unstructured_answer_tag_go_ids_in_trace_mode(self):
         completion = "<think>reasoning</think><answer>GO:0007165</answer>"
 
-        self.assertLess(GRPO.go_presence_reward(completion, {"go_bp": "GO:0007165"}), 0.0)
+        self.assertGreater(GRPO.go_presence_reward(completion, {"go_bp": "GO:0007165"}), 0.0)
 
     def test_go_aspect_coverage_reward_tracks_requested_aspects(self):
         completion = (
@@ -192,14 +214,14 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
             2.0 / 3.0,
         )
 
-    def test_inspect_completion_requires_structured_final_answer_for_reward_go_ids(self):
+    def test_inspect_completion_uses_reasoning_trace_go_ids_by_default(self):
         completion = "<think>reasoning</think>GO:0007165</tool_call>"
         meta = GRPO.inspect_completion(completion)
 
-        self.assertEqual(meta["predicted_go_ids"], [])
-        self.assertEqual(meta["prediction_source"], "none")
+        self.assertEqual(meta["predicted_go_ids"], ["GO:0007165"])
+        self.assertEqual(meta["prediction_source"], "reasoning_trace")
 
-    def test_inspect_completion_ignores_speculative_go_ids_outside_go_summary(self):
+    def test_inspect_completion_in_reasoning_trace_mode_keeps_trace_go_ids(self):
         completion = (
             "<think>Reasoning mentions GO:0001111 speculatively.</think>"
             "<answer>\n"
@@ -210,21 +232,22 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         )
         meta = GRPO.inspect_completion(completion)
 
-        self.assertEqual(meta["predicted_go_ids"], ["GO:0007165"])
-        self.assertEqual(meta["prediction_source"], "structured_final_answer")
+        self.assertIn("GO:0001111", meta["predicted_go_ids"])
+        self.assertEqual(meta["prediction_source"], "reasoning_trace")
 
-    def test_go_overlap_reward_requires_structured_final_answer_go_ids(self):
+    def test_go_overlap_reward_uses_reasoning_trace_go_ids(self):
         completion = "<think>reasoning</think><answer>GO:0007165</answer>"
 
-        self.assertEqual(GRPO.go_overlap_reward(completion, {"go_bp": "GO:0007165"}), 0.0)
+        self.assertGreater(GRPO.go_overlap_reward(completion, {"go_bp": "GO:0007165"}), 0.0)
 
-    def test_go_overlap_reward_requires_final_answer_anchor_when_think_never_closes(self):
+    def test_go_overlap_reward_uses_full_completion_when_think_never_closes(self):
         completion = "<think>Reasoning cites GO:0007165 and GO:0005515"
 
-        self.assertEqual(GRPO.go_overlap_reward(completion, {"go_bp": "GO:0007165"}), 0.0)
+        self.assertGreater(GRPO.go_overlap_reward(completion, {"go_bp": "GO:0007165"}), 0.0)
 
     def test_terminal_summary_markers_include_go_summary_end(self):
         self.assertIn(GRPO.GO_SUMMARY_END, GRPO.TERMINAL_SUMMARY_MARKERS)
+        self.assertNotIn(GRPO.FUNCTION_SUMMARY_END, GRPO.TERMINAL_SUMMARY_MARKERS)
 
     def test_ia_weighted_f1_reward_propagates_go_terms(self):
         completion = (
@@ -324,14 +347,21 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertEqual(args.rotating_eval_max_samples, 256)
         self.assertEqual(args.reward_funcs, "ia_weighted_f1")
         self.assertEqual(args.reward_weights, "1.0")
+        self.assertEqual(args.reward_prediction_source, "reasoning_trace")
         self.assertEqual(args.min_new_tokens, 1)
+        self.assertEqual(args.reasoning_prompt_style, "paper_compact")
+        self.assertEqual(args.compact_interpro_limit, 12)
+        self.assertEqual(args.compact_ppi_limit, 10)
+        self.assertEqual(args.compact_go_speculation_limit, 8)
+        self.assertEqual(args.max_length_text, 512)
+        self.assertFalse(args.add_uniprot_summary)
         self.assertTrue(args.bnb_4bit_use_double_quant)
         self.assertEqual(args.weave_trace_budget, 64)
         self.assertEqual(args.weave_trace_full_group_count, 4)
         self.assertEqual(args.weave_trace_full_rollouts_per_group, 24)
         self.assertTrue(args.gradient_checkpointing)
         self.assertTrue(args.disable_model_dropout)
-        self.assertTrue(args.reward_final_answer_only)
+        self.assertFalse(args.reward_final_answer_only)
         self.assertTrue(args.require_ia_file)
         self.assertFalse(args.ablation_from_paper_rl)
 

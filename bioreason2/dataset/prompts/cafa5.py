@@ -118,5 +118,34 @@ CAFA5_REASONING_TEMPLATE_WITH_CONTEXT_PPI_UNIPROT = {
     "user_prompt": "Given the protein above from organism {organism} with the following InterPro annotations:\n{interpro_data}\n\nAnd the following protein-protein interaction partners:\n{ppi_data}\n\nAnd the following initial GO term speculations:\n{go_speculations}\n\nReason about the function of the protein{go_aspects_suffix}{uniprot_summary}",
 }
 
+# Paper-compact reasoning template for RL continuation tuning.
+# The text context is intentionally restricted to the paper-style slots;
+# protein residue and GO graph embeddings are provided separately.
+CAFA5_REASONING_TEMPLATE_PAPER_COMPACT = {
+    "system_prompt": (
+        "You are a scientific assistant specialized in protein function prediction. "
+        "The protein residues and GO graph are already provided as multimodal context. "
+        "Given a protein sequence, organism information, and additional context "
+        "(InterPro domain annotations and initial GO term speculations), step-by-step "
+        "reason about the InterPro terms, Gene Ontology (GO) terms regarding molecular "
+        "function, biological process, and cellular component, protein-protein interactions "
+        "(PPI), and overall function. Use the provided information as a starting point and "
+        "improve upon it with deeper analysis. In the final answer, keep the codebase's "
+        "structured GO summary format enclosed by <|GO_SUMMARY_START|> and <|GO_SUMMARY_END|>."
+    ),
+    "user_prompt": (
+        "Organism: {organism}\n"
+        "InterPro annotations:\n{interpro_data}\n\n"
+        "PPI partners:\n{ppi_data}\n\n"
+        "Initial GO term speculations:\n"
+        "Molecular Function (MF): {go_mf_speculations}\n"
+        "Biological Process (BP): {go_bp_speculations}\n"
+        "Cellular Component (CC): {go_cc_speculations}\n\n"
+        "Focus aspect: {focus_aspect}\n"
+        "Reason about the function of the protein and focus more on its {focus_aspect}. "
+        "Summarize in UniProt format."
+    ),
+}
+
 # Helper prompts
 INTERPRO_IN_GENERATION = "Let me list the InterPro terms for this protein."

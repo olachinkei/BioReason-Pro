@@ -137,6 +137,16 @@ class TrainingTrackingContractsTest(unittest.TestCase):
             output_dir="data/artifacts/models/train_rl_output/demo",
             seed=23,
             learning_rate=3e-5,
+            max_length_text=512,
+            max_length_protein=2000,
+            reasoning_prompt_style="paper_compact",
+            compact_interpro_limit=12,
+            compact_ppi_limit=10,
+            compact_go_speculation_limit=8,
+            add_uniprot_summary=False,
+            interpro_in_prompt=True,
+            ppi_in_prompt=True,
+            include_protein_function_summary=False,
             batch_size=2,
             train_batch_size=2,
             eval_batch_size=4,
@@ -176,7 +186,8 @@ class TrainingTrackingContractsTest(unittest.TestCase):
             reward_funcs="ia_weighted_f1",
             reward_weights="1.0",
             reward_scaling="batch",
-            reward_final_answer_only=True,
+            reward_final_answer_only=False,
+            reward_prediction_source="reasoning_trace",
             ia_file_path="/tmp/IA.txt",
             require_ia_file=True,
             advantage_epsilon_std=1e-6,
@@ -207,6 +218,15 @@ class TrainingTrackingContractsTest(unittest.TestCase):
         )
 
         self.assertEqual(config["output_dir"], "data/artifacts/models/train_rl_output/demo")
+        self.assertEqual(config["max_length_text"], 512)
+        self.assertEqual(config["reasoning_prompt_style"], "paper_compact")
+        self.assertEqual(config["compact_interpro_limit"], 12)
+        self.assertEqual(config["compact_ppi_limit"], 10)
+        self.assertEqual(config["compact_go_speculation_limit"], 8)
+        self.assertFalse(config["add_uniprot_summary"])
+        self.assertTrue(config["interpro_in_prompt"])
+        self.assertTrue(config["ppi_in_prompt"])
+        self.assertFalse(config["include_protein_function_summary"])
         self.assertEqual(config["train_batch_size"], 2)
         self.assertEqual(config["eval_batch_size"], 4)
         self.assertEqual(config["max_eval_samples"], 100)
@@ -230,7 +250,8 @@ class TrainingTrackingContractsTest(unittest.TestCase):
         self.assertEqual(config["reward_funcs"], "ia_weighted_f1")
         self.assertEqual(config["reward_weights"], "1.0")
         self.assertEqual(config["reward_scaling"], "batch")
-        self.assertTrue(config["reward_final_answer_only"])
+        self.assertFalse(config["reward_final_answer_only"])
+        self.assertEqual(config["reward_prediction_source"], "reasoning_trace")
         self.assertEqual(config["ia_file_path"], "/tmp/IA.txt")
         self.assertTrue(config["require_ia_file"])
         self.assertEqual(config["importance_sampling_level"], "sequence")
