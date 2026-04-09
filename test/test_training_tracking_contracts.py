@@ -79,6 +79,11 @@ class TrainingTrackingContractsTest(unittest.TestCase):
             learning_rate=1e-4,
             batch_size=4,
             gradient_accumulation_steps=2,
+            adam_beta1=0.9,
+            adam_beta2=0.999,
+            adam_epsilon=1e-8,
+            lr_scheduler_type="cosine",
+            warmup_ratio=0.03,
             max_epochs=10,
             validation_subset_size=100,
             validation_subset_strategy="stratified_aspect_profile",
@@ -131,11 +136,16 @@ class TrainingTrackingContractsTest(unittest.TestCase):
             checkpoint_dir=None,
             output_dir="data/artifacts/models/train_rl_output/demo",
             seed=23,
-            learning_rate=5e-6,
-            batch_size=1,
-            train_batch_size=1,
+            learning_rate=3e-5,
+            batch_size=2,
+            train_batch_size=2,
             eval_batch_size=4,
             gradient_accumulation_steps=1,
+            adam_beta1=0.9,
+            adam_beta2=0.999,
+            adam_epsilon=1e-8,
+            lr_scheduler_type="cosine",
+            warmup_ratio=0.03,
             max_epochs=1,
             validation_subset_size=None,
             validation_subset_strategy=None,
@@ -148,18 +158,39 @@ class TrainingTrackingContractsTest(unittest.TestCase):
             rotating_eval_max_samples=256,
             rotating_eval_sample_strategy="stratified_aspect_profile",
             rotating_eval_seed_stride=9973,
-            num_generations=8,
+            loss_type="dr_grpo",
+            steps_per_generation=2,
+            num_iterations=1,
+            num_generations=24,
             max_new_tokens=512,
+            rollout_logprob_microbatch_size=4,
             temperature=1.0,
             top_p=0.95,
             top_k=20,
+            min_p=0.0,
+            repetition_penalty=1.0,
             eval_do_sample=False,
             eval_temperature=0.1,
             eval_top_p=0.9,
             eval_top_k=20,
-            reward_funcs="strict_format,summary_schema,go_presence,go_aspect_coverage,go_overlap,structural_noise",
-            reward_weights="0.25,0.75,1.5,0.5,2.5,1.0",
-            kl_beta=0.02,
+            reward_funcs="ia_weighted_f1",
+            reward_weights="1.0",
+            reward_scaling="batch",
+            reward_final_answer_only=True,
+            ia_file_path="/tmp/IA.txt",
+            require_ia_file=True,
+            advantage_epsilon_std=1e-6,
+            importance_sampling_level="sequence",
+            importance_sampling_cap=2.0,
+            clip_epsilon_low=7e-4,
+            clip_epsilon_high=9e-4,
+            kl_beta=1e-4,
+            gradient_checkpointing=True,
+            disable_model_dropout=True,
+            weave_project="wandb-healthcare/bioreasoning-pro",
+            weave_trace_budget=64,
+            weave_trace_full_group_count=4,
+            weave_trace_full_rollouts_per_group=24,
             job_time_limit="12:00:00",
             training_stage=None,
             cafa5_dataset_name="disease_temporal_hc_reasoning_v1",
@@ -176,24 +207,39 @@ class TrainingTrackingContractsTest(unittest.TestCase):
         )
 
         self.assertEqual(config["output_dir"], "data/artifacts/models/train_rl_output/demo")
-        self.assertEqual(config["train_batch_size"], 1)
+        self.assertEqual(config["train_batch_size"], 2)
         self.assertEqual(config["eval_batch_size"], 4)
         self.assertEqual(config["max_eval_samples"], 100)
         self.assertEqual(config["eval_sample_strategy"], "stratified_aspect_profile")
         self.assertEqual(config["max_eval_batches"], 0)
-        self.assertEqual(config["num_generations"], 8)
+        self.assertEqual(config["loss_type"], "dr_grpo")
+        self.assertEqual(config["steps_per_generation"], 2)
+        self.assertEqual(config["num_iterations"], 1)
+        self.assertEqual(config["num_generations"], 24)
         self.assertEqual(config["max_new_tokens"], 512)
+        self.assertEqual(config["rollout_logprob_microbatch_size"], 4)
         self.assertEqual(config["temperature"], 1.0)
+        self.assertEqual(config["top_p"], 0.95)
         self.assertEqual(config["top_k"], 20)
+        self.assertEqual(config["min_p"], 0.0)
+        self.assertEqual(config["repetition_penalty"], 1.0)
         self.assertFalse(config["eval_do_sample"])
         self.assertEqual(config["eval_temperature"], 0.1)
         self.assertEqual(config["eval_top_p"], 0.9)
         self.assertEqual(config["eval_top_k"], 20)
-        self.assertEqual(
-            config["reward_funcs"],
-            "strict_format,summary_schema,go_presence,go_aspect_coverage,go_overlap,structural_noise",
-        )
-        self.assertEqual(config["reward_weights"], "0.25,0.75,1.5,0.5,2.5,1.0")
+        self.assertEqual(config["reward_funcs"], "ia_weighted_f1")
+        self.assertEqual(config["reward_weights"], "1.0")
+        self.assertEqual(config["reward_scaling"], "batch")
+        self.assertTrue(config["reward_final_answer_only"])
+        self.assertEqual(config["ia_file_path"], "/tmp/IA.txt")
+        self.assertTrue(config["require_ia_file"])
+        self.assertEqual(config["importance_sampling_level"], "sequence")
+        self.assertEqual(config["importance_sampling_cap"], 2.0)
+        self.assertEqual(config["clip_epsilon_low"], 7e-4)
+        self.assertEqual(config["clip_epsilon_high"], 9e-4)
+        self.assertEqual(config["kl_beta"], 1e-4)
+        self.assertEqual(config["weave_trace_full_group_count"], 4)
+        self.assertEqual(config["weave_trace_full_rollouts_per_group"], 24)
         self.assertEqual(config["rotating_eval_every_n_steps"], 100)
         self.assertEqual(metadata["checkpoint_dir"], "data/artifacts/models/train_rl_output/demo")
 

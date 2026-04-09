@@ -99,6 +99,8 @@ CACHE_DIR=${CACHE_DIR:-"data/artifacts/cache"}
 STRUCTURE_DIR=${STRUCTURE_DIR:-"${BIOREASON_STRUCTURE_DIR:-data/structures}"}
 GO_EMBEDDINGS_PATH=${GO_EMBEDDINGS_PATH:-"${BIOREASON_GO_EMBEDDINGS_PATH:-}"}
 GO_OBO_PATH=${GO_OBO_PATH:-"${BIOREASON_GO_OBO_PATH:-bioreason2/dataset/go-basic.obo}"}
+IA_FILE_PATH=${IA_FILE_PATH:-"${BIOREASON_IA_FILE_PATH:-}"}
+REQUIRE_IA_FILE=${REQUIRE_IA_FILE:-"true"}
 
 CAFA5_DATASET=${CAFA5_DATASET:-""}
 REASONING_DATASET_NAME=${REASONING_DATASET_NAME:-"disease_temporal_hc_reasoning_v1"}
@@ -118,6 +120,7 @@ TEST_END_RELEASE=${TEST_END_RELEASE:-228}
 JOB_TIME_LIMIT=${JOB_TIME_LIMIT:-"12:00:00"}
 
 PRIMARY_BASE_CHECKPOINT=${BASE_CHECKPOINT:-"${BIOREASON_TRAIN_SFT_MODEL_REGISTRY_PATH:-}"}
+BASE_CHECKPOINT_LOCAL_DIR=${BASE_CHECKPOINT_LOCAL_DIR:-""}
 PAPER_RL_CHECKPOINT=${PAPER_RL_CHECKPOINT:-"${BIOREASON_RL_PAPER_MODEL_REGISTRY_PATH:-}"}
 ALLOW_PAPER_RL_ABLATION=${ALLOW_PAPER_RL_ABLATION:-"false"}
 RESUME_FROM_RAW_CHECKPOINT=${RESUME_FROM_RAW_CHECKPOINT:-""}
@@ -140,21 +143,29 @@ USE_QLORA=${USE_QLORA:-"True"}
 BNB_4BIT_COMPUTE_DTYPE=${BNB_4BIT_COMPUTE_DTYPE:-"bfloat16"}
 BNB_4BIT_QUANT_TYPE=${BNB_4BIT_QUANT_TYPE:-"nf4"}
 BNB_4BIT_USE_DOUBLE_QUANT=${BNB_4BIT_USE_DOUBLE_QUANT:-"True"}
-LORA_RANK=${LORA_RANK:-32}
-LORA_ALPHA=${LORA_ALPHA:-64}
+LORA_RANK=${LORA_RANK:-16}
+LORA_ALPHA=${LORA_ALPHA:-32}
 LORA_DROPOUT=${LORA_DROPOUT:-0.05}
+GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-"True"}
+DISABLE_MODEL_DROPOUT=${DISABLE_MODEL_DROPOUT:-"True"}
 SFT_CONVERSION_LORA_RANK=${SFT_CONVERSION_LORA_RANK:-128}
 SFT_CONVERSION_LORA_ALPHA=${SFT_CONVERSION_LORA_ALPHA:-256}
 SFT_CONVERSION_LORA_DROPOUT=${SFT_CONVERSION_LORA_DROPOUT:-0.05}
 
-LEARNING_RATE=${LEARNING_RATE:-5e-6}
+SEED=${SEED:-42}
+LEARNING_RATE=${LEARNING_RATE:-3e-5}
 WEIGHT_DECAY=${WEIGHT_DECAY:-0.0}
-TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-1}
+TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-8}
 EVAL_BATCH_SIZE=${EVAL_BATCH_SIZE:-4}
 NUM_WORKERS=${NUM_WORKERS:-0}
-MAX_STEPS=${MAX_STEPS:-200}
+MAX_STEPS=${MAX_STEPS:-300}
 MAX_EPOCHS=${MAX_EPOCHS:-1}
 GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
+ADAM_BETA1=${ADAM_BETA1:-0.9}
+ADAM_BETA2=${ADAM_BETA2:-0.999}
+ADAM_EPSILON=${ADAM_EPSILON:-1e-8}
+LR_SCHEDULER_TYPE=${LR_SCHEDULER_TYPE:-"cosine"}
+WARMUP_RATIO=${WARMUP_RATIO:-0.03}
 MAX_TRAIN_SAMPLES=${MAX_TRAIN_SAMPLES:--1}
 MAX_EVAL_SAMPLES=${MAX_EVAL_SAMPLES:-128}
 EVAL_SAMPLE_STRATEGY=${EVAL_SAMPLE_STRATEGY:-"stratified_aspect_profile"}
@@ -167,21 +178,36 @@ ROTATING_EVAL_SAMPLE_STRATEGY=${ROTATING_EVAL_SAMPLE_STRATEGY:-"stratified_aspec
 ROTATING_EVAL_SEED_STRIDE=${ROTATING_EVAL_SEED_STRIDE:-9973}
 MAX_GRAD_NORM=${MAX_GRAD_NORM:-1.0}
 WEAVE_TRACE_BUDGET=${WEAVE_TRACE_BUDGET:-128}
+WEAVE_TRACE_FULL_GROUP_COUNT=${WEAVE_TRACE_FULL_GROUP_COUNT:-4}
+WEAVE_TRACE_FULL_ROLLOUTS_PER_GROUP=${WEAVE_TRACE_FULL_ROLLOUTS_PER_GROUP:-24}
 
-NUM_GENERATIONS=${NUM_GENERATIONS:-8}
+LOSS_TYPE=${LOSS_TYPE:-"dr_grpo"}
+STEPS_PER_GENERATION=${STEPS_PER_GENERATION:-2}
+NUM_ITERATIONS=${NUM_ITERATIONS:-1}
+NUM_GENERATIONS=${NUM_GENERATIONS:-24}
 MIN_NEW_TOKENS=${MIN_NEW_TOKENS:-1}
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-512}
+ROLLOUT_LOGPROB_MICROBATCH_SIZE=${ROLLOUT_LOGPROB_MICROBATCH_SIZE:-4}
 TEMPERATURE=${TEMPERATURE:-1.0}
 TOP_P=${TOP_P:-0.95}
 TOP_K=${TOP_K:-20}
+MIN_P=${MIN_P:-0}
+REPETITION_PENALTY=${REPETITION_PENALTY:-1.0}
 DO_SAMPLE=${DO_SAMPLE:-"True"}
 EVAL_DO_SAMPLE=${EVAL_DO_SAMPLE:-"False"}
 EVAL_TEMPERATURE=${EVAL_TEMPERATURE:-0.1}
 EVAL_TOP_P=${EVAL_TOP_P:-0.9}
 EVAL_TOP_K=${EVAL_TOP_K:-20}
-KL_BETA=${KL_BETA:-0.02}
-REWARD_FUNCS=${REWARD_FUNCS:-"strict_format,summary_schema,go_presence,go_aspect_coverage,go_overlap,structural_noise"}
-REWARD_WEIGHTS=${REWARD_WEIGHTS:-"0.25,0.75,1.5,0.5,2.5,1.0"}
+CLIP_EPSILON_LOW=${CLIP_EPSILON_LOW:-7e-4}
+CLIP_EPSILON_HIGH=${CLIP_EPSILON_HIGH:-9e-4}
+REWARD_SCALING=${REWARD_SCALING:-"batch"}
+ADVANTAGE_EPSILON_STD=${ADVANTAGE_EPSILON_STD:-1e-6}
+IMPORTANCE_SAMPLING_LEVEL=${IMPORTANCE_SAMPLING_LEVEL:-"sequence"}
+IMPORTANCE_SAMPLING_CAP=${IMPORTANCE_SAMPLING_CAP:-2.0}
+REWARD_FINAL_ANSWER_ONLY=${REWARD_FINAL_ANSWER_ONLY:-"True"}
+KL_BETA=${KL_BETA:-1e-4}
+REWARD_FUNCS=${REWARD_FUNCS:-"ia_weighted_f1"}
+REWARD_WEIGHTS=${REWARD_WEIGHTS:-"1.0"}
 
 if [ "${CHECKPOINT_ARTIFACT_NAME+x}" = "x" ]; then
   CHECKPOINT_ARTIFACT_NAME="${CHECKPOINT_ARTIFACT_NAME}"
@@ -193,6 +219,23 @@ CHECKPOINT_ARTIFACT_ALIASES=${CHECKPOINT_ARTIFACT_ALIASES:-"latest,213.221.225.2
 PREP_COMMAND=()
 TRAIN_COMMAND=()
 OPTIONAL_GO_EMBEDDINGS_ARG=()
+PYTHON_BIN=${PYTHON_BIN:-""}
+
+if [ -z "$PYTHON_BIN" ]; then
+  if command -v python >/dev/null 2>&1; then
+    PYTHON_BIN=$(command -v python)
+  elif command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN=$(command -v python3)
+  elif [ -x "$(pwd)/.venv-gpu/bin/python" ]; then
+    PYTHON_BIN="$(pwd)/.venv-gpu/bin/python"
+  elif [ -x "$(pwd)/.venv/bin/python" ]; then
+    PYTHON_BIN="$(pwd)/.venv/bin/python"
+  else
+    echo "Error: no Python executable found for RL wrapper"
+    exit 1
+  fi
+fi
+
 if as_bool "$TRAIN_USE_SRUN"; then
   PREP_COMMAND+=(
     srun
@@ -226,7 +269,7 @@ resolve_artifact_dir() {
   local registry_path="$1"
   local local_dir="$2"
 
-  python "$MODEL_SOURCE_RESOLVER" \
+  "$PYTHON_BIN" "$MODEL_SOURCE_RESOLVER" \
     --wandb-registry-path "$registry_path" \
     --local-dir "$local_dir"
 }
@@ -235,21 +278,87 @@ resolve_hf_model_dir() {
   local registry_path="$1"
   local local_dir="$2"
 
-  python "$MODEL_SOURCE_RESOLVER" \
+  "$PYTHON_BIN" "$MODEL_SOURCE_RESOLVER" \
     --wandb-registry-path "$registry_path" \
     --local-dir "$local_dir" \
     --required-path config.json
+}
+
+resolve_existing_dir() {
+  local candidate="$1"
+  if [ -z "$candidate" ]; then
+    return 1
+  fi
+  if [ -d "$candidate" ]; then
+    (
+      cd "$candidate"
+      pwd
+    )
+    return 0
+  fi
+  if [ -d "$(pwd)/$candidate" ]; then
+    (
+      cd "$(pwd)/$candidate"
+      pwd
+    )
+    return 0
+  fi
+  return 1
+}
+
+is_valid_hf_model_dir() {
+  local model_dir="$1"
+  local config_path="$model_dir/config.json"
+
+  [ -f "$config_path" ] || return 1
+
+  "$PYTHON_BIN" - "$config_path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+config_path = Path(sys.argv[1])
+try:
+    payload = json.loads(config_path.read_text())
+except Exception:
+    sys.exit(1)
+
+if not isinstance(payload, dict):
+    sys.exit(1)
+
+if payload.get("model_type"):
+    sys.exit(0)
+
+architectures = payload.get("architectures")
+if isinstance(architectures, list) and architectures:
+    sys.exit(0)
+
+sys.exit(1)
+PY
 }
 
 PAPER_RL_MODEL_RESOLVED=""
 BASE_CHECKPOINT_REF=""
 RESOLVED_BASE_MODEL_DIR=""
 ABLATION_FROM_PAPER_RL="False"
+RESOLVED_BASE_CHECKPOINT_LOCAL_DIR=""
 
-if [ -n "$PRIMARY_BASE_CHECKPOINT" ]; then
+if [ -n "$BASE_CHECKPOINT_LOCAL_DIR" ]; then
+  if ! RESOLVED_BASE_CHECKPOINT_LOCAL_DIR=$(resolve_existing_dir "$BASE_CHECKPOINT_LOCAL_DIR"); then
+    echo "Error: BASE_CHECKPOINT_LOCAL_DIR does not exist: $BASE_CHECKPOINT_LOCAL_DIR"
+    exit 1
+  fi
+  if ! is_valid_hf_model_dir "$RESOLVED_BASE_CHECKPOINT_LOCAL_DIR"; then
+    echo "Error: BASE_CHECKPOINT_LOCAL_DIR is not a valid HF model directory: $RESOLVED_BASE_CHECKPOINT_LOCAL_DIR"
+    exit 1
+  fi
+  RESOLVED_BASE_MODEL_DIR="$RESOLVED_BASE_CHECKPOINT_LOCAL_DIR"
+  BASE_CHECKPOINT_REF="$RESOLVED_BASE_CHECKPOINT_LOCAL_DIR"
+  echo "--- Using local HF RL init model dir at $RESOLVED_BASE_MODEL_DIR"
+elif [ -n "$PRIMARY_BASE_CHECKPOINT" ]; then
   echo "--- Resolving canonical RL init checkpoint from train-sft-output artifact"
   RESOLVED_TRAIN_SFT_DIR=$(resolve_artifact_dir "$PRIMARY_BASE_CHECKPOINT" "$TRAIN_SFT_SOURCE_DIR")
-  if [ -f "$RESOLVED_TRAIN_SFT_DIR/config.json" ]; then
+  if is_valid_hf_model_dir "$RESOLVED_TRAIN_SFT_DIR"; then
     RESOLVED_BASE_MODEL_DIR="$RESOLVED_TRAIN_SFT_DIR"
     BASE_CHECKPOINT_REF="$PRIMARY_BASE_CHECKPOINT"
     echo "--- Using HF-ready train-sft-output artifact at $RESOLVED_BASE_MODEL_DIR"
@@ -275,16 +384,16 @@ if [ -n "$PRIMARY_BASE_CHECKPOINT" ]; then
     echo "--- Resolving comparison model needed for SFT checkpoint conversion"
     PAPER_RL_MODEL_RESOLVED=$(resolve_hf_model_dir "$PAPER_RL_CHECKPOINT" "$PAPER_RL_MODEL_DIR")
 
-    if [ -f "$TRAIN_SFT_HF_DIR/config.json" ]; then
+    if is_valid_hf_model_dir "$TRAIN_SFT_HF_DIR"; then
       echo "--- Reusing converted HF train-sft-output at $TRAIN_SFT_HF_DIR"
     else
       if [ -e "$TRAIN_SFT_HF_DIR" ]; then
-        echo "Error: $TRAIN_SFT_HF_DIR exists but does not look like a complete HF model directory"
-        exit 1
+        echo "--- Removing invalid converted HF train-sft-output at $TRAIN_SFT_HF_DIR"
+        rm -rf "$TRAIN_SFT_HF_DIR"
       fi
 
       echo "--- Converting train-sft-output checkpoint to HF format"
-      "${PREP_COMMAND[@]}" python "$SFT_TO_HF_CONVERTER" \
+      "${PREP_COMMAND[@]}" "$PYTHON_BIN" "$SFT_TO_HF_CONVERTER" \
         --checkpoint_path "$SFT_CKPT_PATH" \
         --save_dir "$TRAIN_SFT_HF_DIR" \
         --text_model_name "$PAPER_RL_MODEL_RESOLVED" \
@@ -326,14 +435,14 @@ else
   exit 1
 fi
 
-if [ ! -f "$RESOLVED_BASE_MODEL_DIR/config.json" ]; then
-  echo "Error: RL init model directory is missing config.json: $RESOLVED_BASE_MODEL_DIR"
+if ! is_valid_hf_model_dir "$RESOLVED_BASE_MODEL_DIR"; then
+  echo "Error: RL init model directory is not a valid HF model directory: $RESOLVED_BASE_MODEL_DIR"
   exit 1
 fi
 
 if [ -z "$CAFA5_DATASET" ]; then
   echo "--- Resolving reasoning dataset source for RL from W&B Artifact"
-  CAFA5_DATASET=$(python "$DATA_BUNDLE_RESOLVER" \
+  CAFA5_DATASET=$("$PYTHON_BIN" "$DATA_BUNDLE_RESOLVER" \
     --data-manifest-path "$DATA_MANIFEST_PATH" \
     --data-bundle "$DATA_BUNDLE" \
     --asset-key reasoning_dataset \
@@ -363,8 +472,9 @@ if [ -n "$RESUME_FROM_RAW_CHECKPOINT" ]; then
   RESUME_ARGS=(--resume_from_raw_checkpoint "$RESUME_FROM_RAW_CHECKPOINT")
 fi
 
-stdbuf -oL -eL "${TRAIN_COMMAND[@]}" python train_protein_grpo.py \
+stdbuf -oL -eL "${TRAIN_COMMAND[@]}" "$PYTHON_BIN" train_protein_grpo.py \
   --run_name "$WANDB_RUN_NAME" \
+  --seed "$SEED" \
   --wandb_project "$BASE_WANDB_PROJECT" \
   --wandb_entity "$WANDB_ENTITY" \
   --wandb_mode "$WANDB_MODE" \
@@ -388,6 +498,8 @@ stdbuf -oL -eL "${TRAIN_COMMAND[@]}" python train_protein_grpo.py \
   --protein_model_name "$PROTEIN_MODEL_NAME" \
   --cache_dir "$CACHE_DIR" \
   --go_obo_path "$GO_OBO_PATH" \
+  --ia_file_path "$IA_FILE_PATH" \
+  --require_ia_file "$REQUIRE_IA_FILE" \
   --structure_dir "$STRUCTURE_DIR" \
   --dataset_cache_dir "$DATASET_CACHE_DIR" \
   --dataset_type cafa5 \
@@ -424,6 +536,8 @@ stdbuf -oL -eL "${TRAIN_COMMAND[@]}" python train_protein_grpo.py \
   --lora_rank "$LORA_RANK" \
   --lora_alpha "$LORA_ALPHA" \
   --lora_dropout "$LORA_DROPOUT" \
+  --gradient_checkpointing "$GRADIENT_CHECKPOINTING" \
+  --disable_model_dropout "$DISABLE_MODEL_DROPOUT" \
   --learning_rate "$LEARNING_RATE" \
   --weight_decay "$WEIGHT_DECAY" \
   --train_batch_size "$TRAIN_BATCH_SIZE" \
@@ -432,6 +546,11 @@ stdbuf -oL -eL "${TRAIN_COMMAND[@]}" python train_protein_grpo.py \
   --max_steps "$MAX_STEPS" \
   --max_epochs "$MAX_EPOCHS" \
   --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS" \
+  --adam_beta1 "$ADAM_BETA1" \
+  --adam_beta2 "$ADAM_BETA2" \
+  --adam_epsilon "$ADAM_EPSILON" \
+  --lr_scheduler_type "$LR_SCHEDULER_TYPE" \
+  --warmup_ratio "$WARMUP_RATIO" \
   --max_train_samples "$MAX_TRAIN_SAMPLES" \
   --max_eval_samples "$MAX_EVAL_SAMPLES" \
   --eval_sample_strategy "$EVAL_SAMPLE_STRATEGY" \
@@ -443,17 +562,32 @@ stdbuf -oL -eL "${TRAIN_COMMAND[@]}" python train_protein_grpo.py \
   --rotating_eval_sample_strategy "$ROTATING_EVAL_SAMPLE_STRATEGY" \
   --rotating_eval_seed_stride "$ROTATING_EVAL_SEED_STRIDE" \
   --max_grad_norm "$MAX_GRAD_NORM" \
+  --weave_trace_full_group_count "$WEAVE_TRACE_FULL_GROUP_COUNT" \
+  --weave_trace_full_rollouts_per_group "$WEAVE_TRACE_FULL_ROLLOUTS_PER_GROUP" \
+  --loss_type "$LOSS_TYPE" \
+  --steps_per_generation "$STEPS_PER_GENERATION" \
+  --num_iterations "$NUM_ITERATIONS" \
   --num_generations "$NUM_GENERATIONS" \
   --min_new_tokens "$MIN_NEW_TOKENS" \
   --max_new_tokens "$MAX_NEW_TOKENS" \
+  --rollout_logprob_microbatch_size "$ROLLOUT_LOGPROB_MICROBATCH_SIZE" \
   --temperature "$TEMPERATURE" \
   --top_p "$TOP_P" \
   --top_k "$TOP_K" \
+  --min_p "$MIN_P" \
+  --repetition_penalty "$REPETITION_PENALTY" \
   --do_sample "$DO_SAMPLE" \
   --eval_do_sample "$EVAL_DO_SAMPLE" \
   --eval_temperature "$EVAL_TEMPERATURE" \
   --eval_top_p "$EVAL_TOP_P" \
   --eval_top_k "$EVAL_TOP_K" \
+  --clip_epsilon_low "$CLIP_EPSILON_LOW" \
+  --clip_epsilon_high "$CLIP_EPSILON_HIGH" \
+  --reward_scaling "$REWARD_SCALING" \
+  --advantage_epsilon_std "$ADVANTAGE_EPSILON_STD" \
+  --importance_sampling_level "$IMPORTANCE_SAMPLING_LEVEL" \
+  --importance_sampling_cap "$IMPORTANCE_SAMPLING_CAP" \
+  --reward_final_answer_only "$REWARD_FINAL_ANSWER_ONLY" \
   --kl_beta "$KL_BETA" \
   --reward_funcs "$REWARD_FUNCS" \
   --reward_weights "$REWARD_WEIGHTS" \

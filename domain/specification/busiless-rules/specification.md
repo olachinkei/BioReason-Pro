@@ -386,3 +386,40 @@ Fixed rules:
 - Time limit at submission is `12:00:00`
 - Operations assume checkpoint / resume
 - Local output directory is treated as scratch; the source of truth is W&B Artifact ref
+
+## Note. BioReason-Pro RL Reference
+
+The reference algorithm for BioReason-Pro RL is **DR-GRPO** rather than plain GRPO.  
+Operationally, this means the RL implementation should follow the following paper-level principles:
+
+- Sequence-level importance sampling correction, not token-level correction
+- Advantage defined as `(reward - group_mean_reward) / (global_batch_std + eps_std)`
+- Reward extracted from the **structured final answer only**, not from intermediate reasoning text
+- GO predictions propagated through `is_a` and `part_of` before scoring
+- Reward aligned to **IA-weighted F1 / Fmax_w** with an explicit IA file; paper-faithful RL should fail closed rather than silently falling back
+- Asymmetric Clip-Higher behavior with `epsilon_low=7e-4` and `epsilon_high=9e-4`
+- Small KL anchor (`beta=1e-4`) and Dr. GRPO style length-bias mitigation via fixed-length normalization
+
+Paper reference values retained as the canonical comparison point:
+
+- group size `G=24`
+- steps per generation `=2`
+- inner optimization iterations `=1`
+- LoRA `rank=16`, `alpha=32`, `dropout=0.05`
+- AdamW `lr=3e-5`, `beta1=0.9`, `beta2=0.999`, `eps=1e-8`, `weight_decay=0`
+- scheduler `cosine`, `warmup_ratio=0.03`
+- sampling `temperature=1.0`, `top_k=20`, `top_p=0.95`, `min_p=0`, `repetition_penalty=1.0`
+- prompt length reference `512`
+- completion length reference `10,000`
+- RL steps reference `1,200`
+- seed `42`
+
+Operational adaptation for the current CoreWeave continuation-tuning setup:
+
+- The paper values above are the reference, but exact runtime values may be reduced for single-job continuation tuning under the fixed `12:00:00` wall-time limit
+- When running the current single-node continuation setup, prefer preserving the paper's `B/G=8` unique proteins per step by keeping `num_generations=24` and setting `train_batch_size=8`, then reduce `max_steps` and/or `max_new_tokens` before reducing group diversity
+- Any deviation from the paper reference, especially `num_generations`, `max_new_tokens`, `train_batch_size`, `max_steps`, and IA availability, must be explicit in W&B config
+- `reward_weights` and all RL-control parameters (`loss_type`, clip epsilons, reward scaling mode, IS cap, scheduler settings, KL beta, and final-answer-only reward mode) must remain visible in W&B config for each RL run
+- Since RL reward is computed from `GO_SUMMARY`, stopping criteria should terminate as soon as the structured GO summary block is complete rather than waiting on optional prose
+- The first comparison between `SFT -> RL` and `paper RL -> continuation RL` should keep the objective, reward extraction, sampling controls, and memory controls identical so that the initialization checkpoint is the only changed variable
+- If `paper RL -> continuation RL` shows collapsed within-group reward variance or low rollout diversity, follow-up tuning may shorten `max_steps` and/or strengthen the KL anchor, but that should be recorded as a separate ablation rather than the first A/B comparison

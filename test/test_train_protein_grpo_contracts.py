@@ -41,44 +41,79 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertIn("source_env_file_without_overrides()", wrapper_text)
         self.assertIn('source_env_file_without_overrides "$REGISTRY_ENV_FILE"', wrapper_text)
         self.assertIn('BASE_WANDB_PROJECT=${BASE_WANDB_PROJECT:-"${WANDB_PROJECT:-bioreasoning-pro}"}', wrapper_text)
+        self.assertIn('BASE_CHECKPOINT_LOCAL_DIR=${BASE_CHECKPOINT_LOCAL_DIR:-""}', wrapper_text)
         self.assertIn('SFT_CONVERSION_LORA_RANK=${SFT_CONVERSION_LORA_RANK:-128}', wrapper_text)
         self.assertIn('SFT_CONVERSION_LORA_ALPHA=${SFT_CONVERSION_LORA_ALPHA:-256}', wrapper_text)
         self.assertIn('SFT_CONVERSION_LORA_DROPOUT=${SFT_CONVERSION_LORA_DROPOUT:-0.05}', wrapper_text)
         self.assertIn('CAFA5_DATASET=${CAFA5_DATASET:-""}', wrapper_text)
         self.assertIn('WEAVE_TRACE_BUDGET=${WEAVE_TRACE_BUDGET:-128}', wrapper_text)
         self.assertIn('EVAL_BATCH_SIZE=${EVAL_BATCH_SIZE:-4}', wrapper_text)
+        self.assertIn('TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-8}', wrapper_text)
         self.assertIn('MAX_EVAL_SAMPLES=${MAX_EVAL_SAMPLES:-128}', wrapper_text)
         self.assertIn('MAX_EVAL_BATCHES=${MAX_EVAL_BATCHES:-0}', wrapper_text)
         self.assertIn('ROTATING_EVAL_EVERY_N_STEPS=${ROTATING_EVAL_EVERY_N_STEPS:-100}', wrapper_text)
         self.assertIn('ROTATING_EVAL_MAX_SAMPLES=${ROTATING_EVAL_MAX_SAMPLES:-256}', wrapper_text)
         self.assertIn('ROTATING_EVAL_SAMPLE_STRATEGY=${ROTATING_EVAL_SAMPLE_STRATEGY:-"stratified_aspect_profile"}', wrapper_text)
         self.assertIn('ROTATING_EVAL_SEED_STRIDE=${ROTATING_EVAL_SEED_STRIDE:-9973}', wrapper_text)
-        self.assertIn('NUM_GENERATIONS=${NUM_GENERATIONS:-8}', wrapper_text)
+        self.assertIn('SEED=${SEED:-42}', wrapper_text)
+        self.assertIn('LOSS_TYPE=${LOSS_TYPE:-"dr_grpo"}', wrapper_text)
+        self.assertIn('STEPS_PER_GENERATION=${STEPS_PER_GENERATION:-2}', wrapper_text)
+        self.assertIn('NUM_ITERATIONS=${NUM_ITERATIONS:-1}', wrapper_text)
+        self.assertIn('NUM_GENERATIONS=${NUM_GENERATIONS:-24}', wrapper_text)
         self.assertIn('EVAL_DO_SAMPLE=${EVAL_DO_SAMPLE:-"False"}', wrapper_text)
         self.assertIn('EVAL_TEMPERATURE=${EVAL_TEMPERATURE:-0.1}', wrapper_text)
         self.assertIn('EVAL_TOP_P=${EVAL_TOP_P:-0.9}', wrapper_text)
         self.assertIn('EVAL_TOP_K=${EVAL_TOP_K:-20}', wrapper_text)
-        self.assertIn(
-            'REWARD_FUNCS=${REWARD_FUNCS:-"strict_format,summary_schema,go_presence,go_aspect_coverage,go_overlap,structural_noise"}',
-            wrapper_text,
-        )
-        self.assertIn('REWARD_WEIGHTS=${REWARD_WEIGHTS:-"0.25,0.75,1.5,0.5,2.5,1.0"}', wrapper_text)
+        self.assertIn('REPETITION_PENALTY=${REPETITION_PENALTY:-1.0}', wrapper_text)
+        self.assertIn('CLIP_EPSILON_LOW=${CLIP_EPSILON_LOW:-7e-4}', wrapper_text)
+        self.assertIn('CLIP_EPSILON_HIGH=${CLIP_EPSILON_HIGH:-9e-4}', wrapper_text)
+        self.assertIn('REWARD_SCALING=${REWARD_SCALING:-"batch"}', wrapper_text)
+        self.assertIn('IMPORTANCE_SAMPLING_CAP=${IMPORTANCE_SAMPLING_CAP:-2.0}', wrapper_text)
+        self.assertIn('REWARD_FUNCS=${REWARD_FUNCS:-"ia_weighted_f1"}', wrapper_text)
+        self.assertIn('REWARD_WEIGHTS=${REWARD_WEIGHTS:-"1.0"}', wrapper_text)
+        self.assertIn('PYTHON_BIN=${PYTHON_BIN:-""}', wrapper_text)
+        self.assertIn('elif [ -x "$(pwd)/.venv-gpu/bin/python" ]; then', wrapper_text)
         self.assertIn('MIN_NEW_TOKENS=${MIN_NEW_TOKENS:-1}', wrapper_text)
         self.assertIn('MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-512}', wrapper_text)
+        self.assertIn('ROLLOUT_LOGPROB_MICROBATCH_SIZE=${ROLLOUT_LOGPROB_MICROBATCH_SIZE:-4}', wrapper_text)
         self.assertIn('TEMPERATURE=${TEMPERATURE:-1.0}', wrapper_text)
+        self.assertIn('TOP_P=${TOP_P:-0.95}', wrapper_text)
         self.assertIn('TOP_K=${TOP_K:-20}', wrapper_text)
         self.assertIn('if [ "${CHECKPOINT_ARTIFACT_NAME+x}" = "x" ]; then', wrapper_text)
         self.assertIn('RL_RUN_FAMILY="rl-sft"', wrapper_text)
         self.assertIn('RL_RUN_FAMILY="rl-paper"', wrapper_text)
         self.assertIn('WANDB_RUN_NAME=${WANDB_RUN_NAME:-"${RL_RUN_FAMILY}-${TIMESTAMP}"}', wrapper_text)
         self.assertIn('--asset-key reasoning_dataset', wrapper_text)
+        self.assertIn('resolve_existing_dir()', wrapper_text)
+        self.assertIn('is_valid_hf_model_dir()', wrapper_text)
+        self.assertIn('"$PYTHON_BIN" "$MODEL_SOURCE_RESOLVER"', wrapper_text)
+        self.assertIn('"$PYTHON_BIN" - "$config_path"', wrapper_text)
         self.assertIn('find "$RESOLVED_TRAIN_SFT_DIR" -maxdepth 2 -type f -name "*best*.ckpt"', wrapper_text)
         self.assertIn('SFT_CKPT_PATH="$RESOLVED_TRAIN_SFT_DIR/last.ckpt"', wrapper_text)
+        self.assertIn('Error: BASE_CHECKPOINT_LOCAL_DIR is not a valid HF model directory', wrapper_text)
+        self.assertIn('--- Removing invalid converted HF train-sft-output at $TRAIN_SFT_HF_DIR', wrapper_text)
+        self.assertIn('Error: RL init model directory is not a valid HF model directory', wrapper_text)
         self.assertIn('--lora_rank "$SFT_CONVERSION_LORA_RANK"', wrapper_text)
         self.assertIn('--lora_alpha "$SFT_CONVERSION_LORA_ALPHA"', wrapper_text)
         self.assertIn('--lora_dropout "$SFT_CONVERSION_LORA_DROPOUT"', wrapper_text)
+        self.assertIn('--seed "$SEED"', wrapper_text)
+        self.assertIn('--ia_file_path "$IA_FILE_PATH"', wrapper_text)
+        self.assertIn('--require_ia_file "$REQUIRE_IA_FILE"', wrapper_text)
         self.assertIn('--weave_trace_budget "$WEAVE_TRACE_BUDGET"', wrapper_text)
+        self.assertIn('--weave_trace_full_group_count "$WEAVE_TRACE_FULL_GROUP_COUNT"', wrapper_text)
+        self.assertIn('--weave_trace_full_rollouts_per_group "$WEAVE_TRACE_FULL_ROLLOUTS_PER_GROUP"', wrapper_text)
+        self.assertIn('--loss_type "$LOSS_TYPE"', wrapper_text)
+        self.assertIn('--steps_per_generation "$STEPS_PER_GENERATION"', wrapper_text)
+        self.assertIn('--num_iterations "$NUM_ITERATIONS"', wrapper_text)
         self.assertIn('--min_new_tokens "$MIN_NEW_TOKENS"', wrapper_text)
+        self.assertIn('--rollout_logprob_microbatch_size "$ROLLOUT_LOGPROB_MICROBATCH_SIZE"', wrapper_text)
+        self.assertIn('--min_p "$MIN_P"', wrapper_text)
+        self.assertIn('--repetition_penalty "$REPETITION_PENALTY"', wrapper_text)
+        self.assertIn('--clip_epsilon_low "$CLIP_EPSILON_LOW"', wrapper_text)
+        self.assertIn('--clip_epsilon_high "$CLIP_EPSILON_HIGH"', wrapper_text)
+        self.assertIn('--reward_scaling "$REWARD_SCALING"', wrapper_text)
+        self.assertIn('--importance_sampling_cap "$IMPORTANCE_SAMPLING_CAP"', wrapper_text)
+        self.assertIn('stdbuf -oL -eL "${TRAIN_COMMAND[@]}" "$PYTHON_BIN" train_protein_grpo.py', wrapper_text)
 
     def test_extract_go_ids_preserves_order_and_deduplicates(self):
         text = "GO:0008150 and GO:0003674 and GO:0008150 again"
@@ -102,7 +137,7 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
             ["GO:0007165", "GO:0005515", "GO:0005737", "GO:0009987"],
         )
 
-    def test_go_overlap_reward_ignores_reasoning_only_go_terms(self):
+    def test_go_overlap_reward_uses_post_think_segment_when_available(self):
         completion = "<think>Reasoning mentions GO:0007165.</think><answer>GO:0005515</answer>"
         sample_meta = {"go_bp": "GO:0007165"}
 
@@ -137,6 +172,11 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
 
         self.assertEqual(GRPO.go_presence_reward(completion, {"go_bp": "GO:0007165"}), 1.0)
 
+    def test_go_presence_reward_penalizes_unstructured_answer_tag_go_ids(self):
+        completion = "<think>reasoning</think><answer>GO:0007165</answer>"
+
+        self.assertLess(GRPO.go_presence_reward(completion, {"go_bp": "GO:0007165"}), 0.0)
+
     def test_go_aspect_coverage_reward_tracks_requested_aspects(self):
         completion = (
             "<think>reasoning</think>"
@@ -152,18 +192,86 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
             2.0 / 3.0,
         )
 
-    def test_inspect_completion_accepts_go_ids_even_with_structural_noise(self):
+    def test_inspect_completion_requires_structured_final_answer_for_reward_go_ids(self):
         completion = "<think>reasoning</think>GO:0007165</tool_call>"
         meta = GRPO.inspect_completion(completion)
 
+        self.assertEqual(meta["predicted_go_ids"], [])
+        self.assertEqual(meta["prediction_source"], "none")
+
+    def test_inspect_completion_ignores_speculative_go_ids_outside_go_summary(self):
+        completion = (
+            "<think>Reasoning mentions GO:0001111 speculatively.</think>"
+            "<answer>\n"
+            "Speculative note GO:0001111 should not count.\n"
+            "<|GO_SUMMARY_START|>\nBP: GO:0007165\n<|GO_SUMMARY_END|>\n\n"
+            "<|FUNCTION_SUMMARY_START|>\nSignal adaptor.\n<|FUNCTION_SUMMARY_END|>\n"
+            "</answer>"
+        )
+        meta = GRPO.inspect_completion(completion)
+
         self.assertEqual(meta["predicted_go_ids"], ["GO:0007165"])
-        self.assertEqual(meta["prediction_source"], "final_answer")
+        self.assertEqual(meta["prediction_source"], "structured_final_answer")
+
+    def test_go_overlap_reward_requires_structured_final_answer_go_ids(self):
+        completion = "<think>reasoning</think><answer>GO:0007165</answer>"
+
+        self.assertEqual(GRPO.go_overlap_reward(completion, {"go_bp": "GO:0007165"}), 0.0)
+
+    def test_go_overlap_reward_requires_final_answer_anchor_when_think_never_closes(self):
+        completion = "<think>Reasoning cites GO:0007165 and GO:0005515"
+
+        self.assertEqual(GRPO.go_overlap_reward(completion, {"go_bp": "GO:0007165"}), 0.0)
+
+    def test_terminal_summary_markers_include_go_summary_end(self):
+        self.assertIn(GRPO.GO_SUMMARY_END, GRPO.TERMINAL_SUMMARY_MARKERS)
+
+    def test_ia_weighted_f1_reward_propagates_go_terms(self):
+        completion = (
+            "<think>reasoning</think>"
+            "<|GO_SUMMARY_START|>\nBP: GO:0009966\n<|GO_SUMMARY_END|>\n\n"
+            "<|FUNCTION_SUMMARY_START|>\nSignal response regulator.\n<|FUNCTION_SUMMARY_END|>"
+        )
+
+        self.assertGreater(
+            GRPO.ia_weighted_f1_reward(completion, {"go_bp": "GO:0009967"}),
+            0.0,
+        )
+
+    def test_compute_batch_relative_advantages_uses_global_std(self):
+        grouped_advantages, global_std = GRPO.compute_batch_relative_advantages(
+            [[1.0, 1.0, 3.0], [0.0, 0.0, 2.0]],
+            epsilon_std=1e-6,
+            reward_scaling="batch",
+        )
+
+        self.assertGreater(global_std, 0.0)
+        self.assertEqual(len(grouped_advantages), 2)
+        self.assertAlmostEqual(sum(grouped_advantages[0]) + sum(grouped_advantages[1]), 0.0, places=5)
+
+    def test_truncation_penalty_reward_penalizes_long_non_terminal_output(self):
+        completion = "<think>reasoning</think>" + " word" * 330
+
+        self.assertLess(GRPO.truncation_penalty_reward(completion, {}), 0.0)
+
+    def test_truncation_penalty_reward_rewards_terminal_summary(self):
+        completion = (
+            "<think>reasoning</think>"
+            "<|GO_SUMMARY_START|>\nBP: GO:0007165\n<|GO_SUMMARY_END|>\n"
+            "<|FUNCTION_SUMMARY_START|>\nSignal adaptor.\n<|FUNCTION_SUMMARY_END|>"
+        )
+
+        self.assertGreater(GRPO.truncation_penalty_reward(completion, {}), 0.0)
 
     def test_standardize_group_rewards_returns_zeroes_for_constant_group(self):
         self.assertEqual(GRPO.standardize_group_rewards([0.5, 0.5, 0.5]), [0.0, 0.0, 0.0])
 
     def test_compute_group_rewards_combines_named_components(self):
-        completion = "<think>reasoning</think><answer>GO:0007165</answer>"
+        completion = (
+            "<think>reasoning</think>"
+            "<|GO_SUMMARY_START|>\nBP: GO:0007165\n<|GO_SUMMARY_END|>\n\n"
+            "<|FUNCTION_SUMMARY_START|>\nSignal adaptor.\n<|FUNCTION_SUMMARY_END|>"
+        )
         sample_meta = {"go_bp": "GO:0007165"}
 
         totals, components = GRPO.compute_group_rewards(
@@ -190,29 +298,48 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertEqual(args.reasoning_dataset_config, "disease_temporal_hc_reasoning_v1")
         self.assertEqual(args.checkpoint_artifact_name, "train-rl-output")
         self.assertEqual(args.output_dir, "data/artifacts/models/train_rl_output")
+        self.assertEqual(args.train_batch_size, 8)
         self.assertEqual(args.eval_batch_size, 4)
         self.assertEqual(args.max_eval_samples, 128)
         self.assertEqual(args.eval_sample_strategy, "stratified_aspect_profile")
         self.assertEqual(args.max_eval_batches, 0)
-        self.assertEqual(args.num_generations, 8)
+        self.assertEqual(args.loss_type, "dr_grpo")
+        self.assertEqual(args.steps_per_generation, 2)
+        self.assertEqual(args.num_iterations, 1)
+        self.assertEqual(args.num_generations, 24)
         self.assertEqual(args.max_new_tokens, 512)
+        self.assertEqual(args.rollout_logprob_microbatch_size, 4)
         self.assertEqual(args.temperature, 1.0)
+        self.assertEqual(args.top_p, 0.95)
         self.assertEqual(args.top_k, 20)
+        self.assertEqual(args.repetition_penalty, 1.0)
+        self.assertEqual(args.clip_epsilon_low, 7e-4)
+        self.assertEqual(args.clip_epsilon_high, 9e-4)
+        self.assertEqual(args.importance_sampling_cap, 2.0)
         self.assertFalse(args.eval_do_sample)
         self.assertEqual(args.eval_temperature, 0.1)
         self.assertEqual(args.eval_top_p, 0.9)
         self.assertEqual(args.eval_top_k, 20)
         self.assertEqual(args.rotating_eval_every_n_steps, 100)
         self.assertEqual(args.rotating_eval_max_samples, 256)
-        self.assertEqual(
-            args.reward_funcs,
-            "strict_format,summary_schema,go_presence,go_aspect_coverage,go_overlap,structural_noise",
-        )
-        self.assertEqual(args.reward_weights, "0.25,0.75,1.5,0.5,2.5,1.0")
+        self.assertEqual(args.reward_funcs, "ia_weighted_f1")
+        self.assertEqual(args.reward_weights, "1.0")
         self.assertEqual(args.min_new_tokens, 1)
         self.assertTrue(args.bnb_4bit_use_double_quant)
         self.assertEqual(args.weave_trace_budget, 64)
+        self.assertEqual(args.weave_trace_full_group_count, 4)
+        self.assertEqual(args.weave_trace_full_rollouts_per_group, 24)
+        self.assertTrue(args.gradient_checkpointing)
+        self.assertTrue(args.disable_model_dropout)
+        self.assertTrue(args.reward_final_answer_only)
+        self.assertTrue(args.require_ia_file)
         self.assertFalse(args.ablation_from_paper_rl)
+
+    def test_require_training_ia_file_raises_when_missing(self):
+        args = mock.Mock(ia_file_path="", require_ia_file=True)
+
+        with self.assertRaises(FileNotFoundError):
+            GRPO.require_training_ia_file(args, ["ia_weighted_f1"])
 
     def test_extract_completion_ids_handles_prompt_inclusive_output(self):
         if torch is None:
@@ -248,6 +375,29 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertEqual(len(completion_ids_list), 2)
         self.assertTrue(torch.equal(completion_ids_list[0], torch.tensor([31, 32])))
         self.assertTrue(torch.equal(completion_ids_list[1], torch.tensor([41, 42])))
+
+    def test_slice_rollout_group_reindexes_batch_idx_map_for_microbatches(self):
+        if torch is None:
+            self.skipTest("torch is not available in the contract test environment")
+
+        rollout_group = {
+            "combined_input_ids": torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]]),
+            "combined_attention_mask": torch.ones((4, 3), dtype=torch.long),
+            "completion_attention": torch.tensor([[1, 1], [1, 0], [1, 1], [0, 0]], dtype=torch.long),
+            "prompt_token_len": 1,
+            "protein_sequences": ["A", "B", "A", "B", "A", "B", "A", "B"],
+            "batch_idx_map": [0, 0, 1, 1, 2, 2, 3, 3],
+            "structure_coords": torch.arange(4, dtype=torch.float32).unsqueeze(-1),
+            "go_aspects": ["bp", "bp", "mf", "mf"],
+        }
+
+        sliced = GRPO.slice_rollout_group(rollout_group, 1, 3)
+
+        self.assertEqual(tuple(sliced["combined_input_ids"].shape), (2, 3))
+        self.assertEqual(sliced["protein_sequences"], ["A", "B", "A", "B"])
+        self.assertEqual(sliced["batch_idx_map"], [0, 0, 1, 1])
+        self.assertEqual(sliced["go_aspects"], ["bp", "mf"])
+        self.assertTrue(torch.equal(sliced["structure_coords"], torch.tensor([[1.0], [2.0]])))
 
     def test_evaluate_policy_uses_batched_generation_for_eval_batches(self):
         if torch is None:
@@ -298,12 +448,14 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
             temperature=1.0,
             top_p=0.95,
             top_k=20,
+            repetition_penalty=1.0,
             eval_do_sample=False,
             eval_temperature=0.1,
             eval_top_p=0.9,
             eval_top_k=20,
             min_new_tokens=1,
             max_new_tokens=32,
+            min_p=0.0,
         )
         model = FakeModel()
         metrics = GRPO.evaluate_policy(
@@ -325,6 +477,7 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertEqual(model.generate_calls[0]["temperature"], 0.1)
         self.assertEqual(model.generate_calls[0]["top_p"], 0.9)
         self.assertEqual(model.generate_calls[0]["top_k"], 20)
+        self.assertEqual(model.generate_calls[0]["repetition_penalty"], 1.0)
         self.assertEqual(metrics["eval_completion_length"], 1.0)
         self.assertEqual(metrics["eval_data_step_num_datums"], 2.0)
         self.assertEqual(model.eval_calls, 1)
@@ -354,10 +507,16 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertIn('"reward_std_dev"', source)
         self.assertIn('"loss_train"', source)
         self.assertIn('"loss_kl_div"', source)
+        self.assertIn('"loss_policy_ratio_mean"', source)
+        self.assertIn('"loss_policy_ratio_max"', source)
         self.assertIn('"loss_learning_rate"', source)
         self.assertIn('"loss_grad_norm"', source)
         self.assertIn('"eval_reward"', source)
         self.assertIn('"train_skipped_update"', source)
+        self.assertIn('diagnostic/{reward_name}', source)
+        self.assertIn("compute_batch_relative_advantages(", source)
+        self.assertIn("compute_old_policy_sequence_log_probs(", source)
+        self.assertIn("slice_rollout_group(", source)
         self.assertIn('protein_model_dir = export_dir / "protein_model"', source)
         self.assertIn('torch.save(model.protein_model.state_dict(), protein_model_dir / "pytorch_model.bin")', source)
         self.assertNotIn('"loss_train": 0.0', source)

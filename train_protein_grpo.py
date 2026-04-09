@@ -31,13 +31,61 @@ except ImportError:  # pragma: no cover - optional dependency at runtime
 GO_ID_PATTERN = re.compile(r"GO:\d{7}")
 THINK_TAG_PATTERN = re.compile(r"<think>\s*(.*?)\s*</think>", re.DOTALL)
 ANSWER_TAG_PATTERN = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.DOTALL)
-STRUCTURAL_TAG_PATTERN = re.compile(r"</?(?:think|answer|tool_call)>")
+STRUCTURAL_TAG_PATTERN = re.compile(r"</?tool_call>")
 GO_ASPECT_PATTERN = re.compile(r"(?im)^\s*(MF|BP|CC)\s*:\s*(.+)$")
 GO_SUMMARY_START = "<|GO_SUMMARY_START|>"
 GO_SUMMARY_END = "<|GO_SUMMARY_END|>"
 FUNCTION_SUMMARY_START = "<|FUNCTION_SUMMARY_START|>"
 FUNCTION_SUMMARY_END = "<|FUNCTION_SUMMARY_END|>"
 GO_ASPECT_ORDER = ("MF", "BP", "CC")
+GO_NAMESPACE_TO_ASPECT = {
+    "molecular_function": "MF",
+    "biological_process": "BP",
+    "cellular_component": "CC",
+}
+TERMINAL_SUMMARY_MARKERS = (
+    GO_SUMMARY_END,
+    FUNCTION_SUMMARY_END,
+    "</answer>",
+    "<|im_end|>",
+    "<|endoftext|>",
+)
+DIAGNOSTIC_REWARD_NAMES = (
+    "strict_format",
+    "summary_schema",
+    "go_presence",
+    "go_aspect_coverage",
+    "go_overlap",
+    "truncation_penalty",
+    "structural_noise",
+)
+WANDB_BOOTSTRAP_METRICS = (
+    "loss_train",
+    "reward",
+    "reward_std_dev",
+    "loss_kl_div",
+    "loss_policy_ratio_mean",
+    "loss_policy_ratio_max",
+    "loss_learning_rate",
+    "loss_grad_norm",
+    "eval_reward",
+    "eval_completion_length",
+    "eval_loss_kl_div",
+    "eval_data_step_num_datums",
+    "data_step_num_groups_submitted",
+    "data_step_num_groups_trainable",
+    "data_step_num_trajectories",
+    "data_step_num_datums",
+    "data_step_trainer_tokens",
+    "data_step_num_update_passes",
+    "train_skipped_update",
+)
+DEFAULT_GO_OBO_PATH = str((Path(__file__).resolve().parent / "bioreason2" / "dataset" / "go-basic.obo").resolve())
+REWARD_CONTEXT: Dict[str, Any] = {
+    "go_obo_path": DEFAULT_GO_OBO_PATH if os.path.exists(DEFAULT_GO_OBO_PATH) else "",
+    "ia_file_path": "",
+    "reward_final_answer_only": True,
+}
 
 
 def normalize_text(value: Any) -> str:
@@ -143,7 +191,66 @@ def extract_reasoning_and_answer(text: Any) -> Dict[str, str]:
         if marker in final_answer:
             final_answer = final_answer.split(marker, 1)[0].strip()
 
+    structured_final_answer = extract_structured_final_answer(raw)
+    if structured_final_answer:
+        final_answer = structured_final_answer
+
     return {"reasoning": reasoning, "final_answer": final_answer}
+
+
+def extract_structured_final_answer(text: Any) -> str:
+    raw = normalize_text(text).strip()
+    if not raw:
+        return ""
+
+    answer_match = ANSWER_TAG_PATTERN.search(raw)
+    if answer_match:
+        answer_scope = answer_match.group(1).strip()
+    elif "</think>" in raw:
+        answer_scope = raw.split("</think>", 1)[1].strip()
+    else:
+        answer_scope = raw
+
+    go_summary = extract_tagged_block(answer_scope, GO_SUMMARY_START, GO_SUMMARY_END)
+    function_summary = extract_tagged_block(answer_scope, FUNCTION_SUMMARY_START, FUNCTION_SUMMARY_END)
+
+    structured_blocks: List[str] = []
+    if go_summary:
+        structured_blocks.append(f"{GO_SUMMARY_START}\n{go_summary}\n{GO_SUMMARY_END}")
+    if function_summary:
+        structured_blocks.append(f"{FUNCTION_SUMMARY_START}\n{function_summary}\n{FUNCTION_SUMMARY_END}")
+    if structured_blocks:
+        return "\n\n".join(structured_blocks).strip()
+    return ""
+
+
+def extract_reward_prediction_text(text: Any) -> str:
+    raw = normalize_text(text).strip()
+    if not raw:
+        return ""
+    if not resolve_reward_context().get("reward_final_answer_only", True):
+        if "</think>" in raw:
+            return raw.split("</think>", 1)[1].strip()
+        return raw
+    structured_final_answer = extract_structured_final_answer(raw)
+    if not structured_final_answer:
+        return ""
+    return extract_tagged_block(structured_final_answer, GO_SUMMARY_START, GO_SUMMARY_END)
+
+
+def require_training_ia_file(args: argparse.Namespace, reward_names: Sequence[str]) -> str:
+    if "ia_weighted_f1" not in reward_names:
+        return ""
+    ia_file_path = normalize_text(getattr(args, "ia_file_path", None)).strip()
+    require_ia_file = bool(getattr(args, "require_ia_file", True))
+    if ia_file_path and os.path.exists(ia_file_path):
+        return ia_file_path
+    if require_ia_file:
+        raise FileNotFoundError(
+            "IA-weighted RL reward requires a valid --ia_file_path. "
+            f"Resolved path: {ia_file_path or '<empty>'}"
+        )
+    return ""
 
 
 def count_structural_noise_tokens(text: Any) -> int:
@@ -152,6 +259,15 @@ def count_structural_noise_tokens(text: Any) -> int:
 
 def has_meaningful_text(text: Any) -> bool:
     return bool(re.search(r"[A-Za-z0-9]", normalize_text(text)))
+
+
+def count_words(text: Any) -> int:
+    return len(normalize_text(text).split())
+
+
+def has_terminal_summary_marker(text: Any) -> bool:
+    raw = normalize_text(text)
+    return any(marker in raw for marker in TERMINAL_SUMMARY_MARKERS)
 
 
 def build_requested_go_aspects(sample_meta: Mapping[str, Any]) -> List[str]:
@@ -166,44 +282,229 @@ def build_requested_go_aspects(sample_meta: Mapping[str, Any]) -> List[str]:
     return target_aspects or list(GO_ASPECT_ORDER)
 
 
+def configure_reward_context(args: argparse.Namespace) -> None:
+    REWARD_CONTEXT["go_obo_path"] = normalize_text(getattr(args, "go_obo_path", None)).strip() or (
+        DEFAULT_GO_OBO_PATH if os.path.exists(DEFAULT_GO_OBO_PATH) else ""
+    )
+    REWARD_CONTEXT["ia_file_path"] = normalize_text(getattr(args, "ia_file_path", None)).strip()
+    REWARD_CONTEXT["reward_final_answer_only"] = bool(getattr(args, "reward_final_answer_only", True))
+    inspect_completion_text.cache_clear()
+
+
+def resolve_reward_context() -> Dict[str, Any]:
+    return dict(REWARD_CONTEXT)
+
+
+@lru_cache(maxsize=2)
+def load_go_term_metadata(obo_path: str) -> Dict[str, Dict[str, Any]]:
+    resolved_path = normalize_text(obo_path).strip()
+    if not resolved_path or not os.path.exists(resolved_path):
+        return {}
+
+    metadata: Dict[str, Dict[str, Any]] = {}
+    current_id = ""
+    current_namespace = ""
+    current_parents: List[str] = []
+    current_obsolete = False
+    in_term = False
+
+    def finalize_term() -> None:
+        nonlocal current_id, current_namespace, current_parents, current_obsolete
+        if current_id and not current_obsolete:
+            ordered_parents: List[str] = []
+            seen = set()
+            for parent in current_parents:
+                if parent and parent not in seen:
+                    seen.add(parent)
+                    ordered_parents.append(parent)
+            metadata[current_id] = {
+                "aspect": GO_NAMESPACE_TO_ASPECT.get(current_namespace, ""),
+                "parents": tuple(ordered_parents),
+            }
+        current_id = ""
+        current_namespace = ""
+        current_parents = []
+        current_obsolete = False
+
+    with open(resolved_path, "r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if line == "[Term]":
+                finalize_term()
+                in_term = True
+                continue
+            if line.startswith("[") and line != "[Term]":
+                finalize_term()
+                in_term = False
+                continue
+            if not in_term or not line:
+                continue
+            if line.startswith("id: "):
+                match = GO_ID_PATTERN.search(line)
+                if match:
+                    current_id = match.group(0)
+            elif line.startswith("namespace: "):
+                current_namespace = line.split(":", 1)[1].strip()
+            elif line.startswith("is_obsolete: "):
+                current_obsolete = line.split(":", 1)[1].strip().lower() == "true"
+            elif line.startswith("is_a: "):
+                match = GO_ID_PATTERN.search(line)
+                if match:
+                    current_parents.append(match.group(0))
+            elif line.startswith("relationship: part_of "):
+                match = GO_ID_PATTERN.search(line)
+                if match:
+                    current_parents.append(match.group(0))
+    finalize_term()
+    return metadata
+
+
+@lru_cache(maxsize=131072)
+def get_go_ancestors(go_id: str, obo_path: str) -> Tuple[str, ...]:
+    metadata = load_go_term_metadata(obo_path)
+    if not go_id:
+        return tuple()
+    if go_id not in metadata:
+        return (go_id,)
+
+    ordered: List[str] = []
+    seen = set()
+
+    def visit(term_id: str) -> None:
+        if term_id in seen:
+            return
+        seen.add(term_id)
+        ordered.append(term_id)
+        for parent_id in metadata.get(term_id, {}).get("parents", ()):
+            visit(parent_id)
+
+    visit(go_id)
+    return tuple(ordered)
+
+
+def resolve_go_aspect(go_id: str, obo_path: str) -> str:
+    return normalize_text(load_go_term_metadata(obo_path).get(go_id, {}).get("aspect")).strip().upper()
+
+
+def propagate_go_ids(go_ids: Iterable[str], obo_path: str, allowed_aspects: Optional[Iterable[str]] = None) -> List[str]:
+    allowed = {normalize_text(aspect).strip().upper() for aspect in (allowed_aspects or []) if normalize_text(aspect).strip()}
+    ordered: List[str] = []
+    seen = set()
+    for go_id in go_ids:
+        for ancestor_id in get_go_ancestors(go_id, obo_path):
+            if allowed:
+                aspect = resolve_go_aspect(ancestor_id, obo_path)
+                if aspect and aspect not in allowed:
+                    continue
+            if ancestor_id not in seen:
+                seen.add(ancestor_id)
+                ordered.append(ancestor_id)
+    return ordered
+
+
+@lru_cache(maxsize=2)
+def load_ia_weights(ia_file_path: str) -> Dict[str, float]:
+    resolved_path = normalize_text(ia_file_path).strip()
+    if not resolved_path or not os.path.exists(resolved_path):
+        return {}
+
+    weights: Dict[str, float] = {}
+    with open(resolved_path, "r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = re.split(r"\s+", line)
+            if len(parts) < 2 or not GO_ID_PATTERN.fullmatch(parts[0]):
+                continue
+            try:
+                weights[parts[0]] = float(parts[1])
+            except ValueError:
+                continue
+    return weights
+
+
+def compute_weighted_go_f1(
+    predicted_go_ids: Iterable[str],
+    target_go_ids: Iterable[str],
+    *,
+    ia_weights: Optional[Mapping[str, float]] = None,
+) -> float:
+    predicted = list(predicted_go_ids)
+    target = list(target_go_ids)
+    if not predicted or not target:
+        return 0.0
+
+    weight_lookup = ia_weights or {}
+    predicted_set = set(predicted)
+    target_set = set(target)
+    intersection = predicted_set & target_set
+    if not intersection:
+        return 0.0
+
+    def _weight(go_id: str) -> float:
+        return float(weight_lookup.get(go_id, 1.0))
+
+    precision_numerator = sum(_weight(go_id) for go_id in intersection)
+    precision_denominator = sum(_weight(go_id) for go_id in predicted_set)
+    recall_denominator = sum(_weight(go_id) for go_id in target_set)
+    if precision_denominator <= 0.0 or recall_denominator <= 0.0:
+        return 0.0
+    precision = precision_numerator / precision_denominator
+    recall = precision_numerator / recall_denominator
+    if precision + recall <= 0.0:
+        return 0.0
+    return 2.0 * precision * recall / (precision + recall)
+
+
 @lru_cache(maxsize=8192)
 def inspect_completion_text(raw_completion: str) -> Dict[str, Any]:
     sections = extract_reasoning_and_answer(raw_completion)
     final_answer = sections["final_answer"].strip()
+    reward_prediction_text = extract_reward_prediction_text(raw_completion)
     go_summary = extract_tagged_block(final_answer, GO_SUMMARY_START, GO_SUMMARY_END)
     function_summary = extract_tagged_block(final_answer, FUNCTION_SUMMARY_START, FUNCTION_SUMMARY_END)
     go_summary_aspects = extract_go_aspect_map(go_summary)
     final_answer_aspects = extract_go_aspect_map(final_answer)
     structural_noise_count = count_structural_noise_tokens(final_answer)
     final_answer_clean = bool(final_answer) and structural_noise_count == 0 and has_meaningful_text(final_answer)
+    reward_prediction_aspects = extract_go_aspect_map(reward_prediction_text)
+    has_closed_reasoning = "</think>" in raw_completion
+    has_answer_tag = bool(ANSWER_TAG_PATTERN.search(raw_completion))
 
     prediction_source = "none"
-    prediction_text = ""
-    if go_summary:
-        prediction_source = "go_summary"
-        prediction_text = go_summary
-    elif has_meaningful_text(final_answer):
-        prediction_source = "final_answer"
-        prediction_text = final_answer
+    if has_meaningful_text(reward_prediction_text):
+        if go_summary:
+            prediction_source = "structured_final_answer"
+        elif has_answer_tag:
+            prediction_source = "answer_tag"
+        elif has_closed_reasoning:
+            prediction_source = "post_think"
 
     return {
         "reasoning": sections["reasoning"],
         "final_answer": final_answer,
+        "reward_prediction_text": reward_prediction_text,
         "go_summary": go_summary,
         "function_summary": function_summary,
         "go_summary_aspects": go_summary_aspects,
         "go_summary_aspect_labels": list(go_summary_aspects.keys()),
         "final_answer_aspects": final_answer_aspects,
         "final_answer_aspect_labels": list(final_answer_aspects.keys()),
+        "reward_prediction_aspects": reward_prediction_aspects,
+        "reward_prediction_aspect_labels": list(reward_prediction_aspects.keys()),
         "has_go_summary": bool(go_summary),
         "has_function_summary": bool(function_summary),
         "has_complete_summary_schema": bool(go_summary and function_summary and has_meaningful_text(function_summary)),
+        "has_closed_reasoning": has_closed_reasoning,
+        "has_answer_tag": has_answer_tag,
         "final_answer_clean": final_answer_clean,
         "final_answer_has_text": has_meaningful_text(final_answer),
         "structural_noise_count": structural_noise_count,
         "prediction_source": prediction_source,
-        "prediction_text": prediction_text,
-        "predicted_go_ids": extract_go_ids(prediction_text),
+        "prediction_text": reward_prediction_text,
+        "predicted_go_ids": extract_go_ids(reward_prediction_text),
+        "go_summary_go_ids": extract_go_ids(go_summary),
         "final_answer_go_ids": extract_go_ids(final_answer),
         "completion_go_ids": extract_go_ids(raw_completion),
     }
@@ -229,7 +530,11 @@ def build_target_go_ids(sample_meta: Mapping[str, Any]) -> List[str]:
 
 def strict_format_reward(completion: str, _: Mapping[str, Any]) -> float:
     meta = inspect_completion(completion)
-    return 1.0 if meta["reasoning"] and meta["final_answer_clean"] else 0.0
+    if meta["has_closed_reasoning"] and meta["final_answer_clean"]:
+        return 1.0
+    if meta["has_closed_reasoning"] and meta["predicted_go_ids"]:
+        return 0.5
+    return 0.0
 
 
 def reasoning_presence_reward(completion: str, _: Mapping[str, Any]) -> float:
@@ -257,12 +562,12 @@ def summary_schema_reward(completion: str, sample_meta: Mapping[str, Any]) -> fl
     requested_aspects = set(build_requested_go_aspects(sample_meta))
     predicted_aspects = set(meta["go_summary_aspect_labels"])
     matched_aspects = predicted_aspects & requested_aspects
-    if meta["has_complete_summary_schema"] and meta["predicted_go_ids"] and matched_aspects == requested_aspects:
+    if meta["has_complete_summary_schema"] and meta["go_summary_go_ids"] and matched_aspects == requested_aspects:
         return 1.0
-    if meta["has_complete_summary_schema"] and meta["predicted_go_ids"] and matched_aspects:
-        return 0.75
-    if meta["has_go_summary"] and meta["predicted_go_ids"] and matched_aspects:
+    if meta["has_complete_summary_schema"] and meta["go_summary_go_ids"] and matched_aspects:
         return 0.5
+    if meta["has_go_summary"] and meta["go_summary_go_ids"] and matched_aspects:
+        return 0.25
     return 0.0
 
 
@@ -277,11 +582,15 @@ def go_presence_reward(completion: str, sample_meta: Mapping[str, Any]) -> float
     meta = inspect_completion(completion)
     predicted_go_ids = meta["predicted_go_ids"]
     if predicted_go_ids:
-        return 1.0 if meta["has_go_summary"] else 0.5
+        if meta["has_complete_summary_schema"]:
+            return 1.0
+        if meta["has_go_summary"] or meta["has_closed_reasoning"]:
+            return 0.75
+        return 0.5
 
     if not build_target_go_ids(sample_meta):
         return 0.0
-    if meta["final_answer_has_text"] or meta["reasoning"]:
+    if meta["prediction_text"]:
         return -1.0
     return -0.5
 
@@ -292,18 +601,42 @@ def go_aspect_coverage_reward(completion: str, sample_meta: Mapping[str, Any]) -
     if not requested_aspects or not meta["predicted_go_ids"]:
         return 0.0
 
-    predicted_aspects = set(meta["go_summary_aspect_labels"])
-    if not predicted_aspects:
+    predicted_go_ids = set(meta["predicted_go_ids"])
+    covered_aspects = set()
+    for aspect, field_name in (("MF", "go_mf"), ("BP", "go_bp"), ("CC", "go_cc")):
+        if aspect not in requested_aspects:
+            continue
+        target_ids = set(extract_go_ids(sample_meta.get(field_name)))
+        if target_ids and predicted_go_ids & target_ids:
+            covered_aspects.add(aspect)
+    if not covered_aspects:
+        return 0.0
+    return len(covered_aspects) / len(requested_aspects)
+
+
+def ia_weighted_f1_reward(completion: str, sample_meta: Mapping[str, Any]) -> float:
+    meta = inspect_completion(completion)
+    predicted = set(meta["predicted_go_ids"])
+    target = set(build_target_go_ids(sample_meta))
+    if not predicted or not target:
         return 0.0
 
-    matched_aspects = predicted_aspects & requested_aspects
-    if not matched_aspects:
-        return 0.0
-    return len(matched_aspects) / len(requested_aspects)
+    reward_context = resolve_reward_context()
+    go_obo_path = normalize_text(reward_context.get("go_obo_path")).strip()
+    ia_file_path = normalize_text(reward_context.get("ia_file_path")).strip()
+    requested_aspects = set(build_requested_go_aspects(sample_meta))
+
+    if go_obo_path and os.path.exists(go_obo_path):
+        predicted = set(propagate_go_ids(predicted, go_obo_path, requested_aspects))
+        target = set(propagate_go_ids(target, go_obo_path, requested_aspects))
+
+    ia_weights = load_ia_weights(ia_file_path) if ia_file_path else {}
+    return compute_weighted_go_f1(predicted, target, ia_weights=ia_weights)
 
 
 def go_overlap_reward(completion: str, sample_meta: Mapping[str, Any]) -> float:
-    predicted = set(inspect_completion(completion)["predicted_go_ids"])
+    meta = inspect_completion(completion)
+    predicted = set(meta["predicted_go_ids"])
     target = set(build_target_go_ids(sample_meta))
     if not predicted or not target:
         return 0.0
@@ -322,8 +655,32 @@ def exact_go_set_reward(completion: str, sample_meta: Mapping[str, Any]) -> floa
     return 1.0 if predicted and predicted == target else 0.0
 
 
+def truncation_penalty_reward(completion: str, _: Mapping[str, Any]) -> float:
+    text = normalize_text(completion)
+    word_count = count_words(text)
+    predicted_go_ids = inspect_completion(completion)["predicted_go_ids"]
+    if has_terminal_summary_marker(text):
+        if word_count <= 192:
+            return 0.5
+        if word_count <= 320:
+            return 0.25
+        return 0.0
+    if predicted_go_ids:
+        if word_count <= 256:
+            return 0.25
+        if word_count >= 480:
+            return -0.25
+        return 0.0
+    if word_count >= 320:
+        return -1.0
+    if word_count >= 220:
+        return -0.5
+    return 0.0
+
+
 def build_reward_registry() -> Dict[str, Any]:
     return {
+        "ia_weighted_f1": ia_weighted_f1_reward,
         "strict_format": strict_format_reward,
         "reasoning_presence": reasoning_presence_reward,
         "concise_reasoning": concise_reasoning_reward,
@@ -334,6 +691,7 @@ def build_reward_registry() -> Dict[str, Any]:
         "structural_noise": structural_noise_reward,
         "go_overlap": go_overlap_reward,
         "exact_go_set": exact_go_set_reward,
+        "truncation_penalty": truncation_penalty_reward,
     }
 
 
@@ -361,16 +719,111 @@ def standardize_group_rewards(rewards: Sequence[float]) -> List[float]:
     return [(reward - mean) / (std + 1e-8) for reward in rewards]
 
 
+def compute_batch_relative_advantages(
+    grouped_rewards: Sequence[Sequence[float]],
+    *,
+    epsilon_std: float = 1e-6,
+    reward_scaling: str = "batch",
+) -> Tuple[List[List[float]], float]:
+    if not grouped_rewards:
+        return [], 0.0
+
+    if reward_scaling != "batch":
+        return [standardize_group_rewards(group_rewards) for group_rewards in grouped_rewards], 0.0
+
+    flat_rewards = [float(reward) for group_rewards in grouped_rewards for reward in group_rewards]
+    if not flat_rewards:
+        return [[] for _ in grouped_rewards], 0.0
+
+    flat_mean = sum(flat_rewards) / len(flat_rewards)
+    variance = sum((reward - flat_mean) ** 2 for reward in flat_rewards) / len(flat_rewards)
+    global_std = math.sqrt(max(variance, 0.0))
+    if global_std < epsilon_std:
+        return [[0.0 for _ in group_rewards] for group_rewards in grouped_rewards], global_std
+
+    normalized_groups: List[List[float]] = []
+    denominator = global_std + epsilon_std
+    for group_rewards in grouped_rewards:
+        if not group_rewards:
+            normalized_groups.append([])
+            continue
+        group_mean = sum(group_rewards) / len(group_rewards)
+        normalized_groups.append([(float(reward) - group_mean) / denominator for reward in group_rewards])
+    return normalized_groups, global_std
+
+
+def build_generation_stopping_criteria(tokenizer: Any) -> Any:
+    encode = getattr(tokenizer, "encode", None)
+    if encode is None:
+        return None
+    try:
+        from transformers import StoppingCriteria, StoppingCriteriaList
+    except ImportError:
+        return None
+
+    stop_sequences: List[List[int]] = []
+    for marker in TERMINAL_SUMMARY_MARKERS:
+        token_ids = encode(marker, add_special_tokens=False)
+        if token_ids:
+            stop_sequences.append(token_ids)
+    if not stop_sequences:
+        return None
+
+    class StopOnTokenSequences(StoppingCriteria):
+        def __init__(self, sequences: Sequence[Sequence[int]]):
+            self.sequences = [list(sequence) for sequence in sequences if sequence]
+
+        def __call__(self, input_ids: Any, scores: Any, **kwargs: Any) -> Any:
+            import torch
+
+            done = torch.zeros((input_ids.shape[0],), dtype=torch.bool, device=input_ids.device)
+            for sequence in self.sequences:
+                sequence_tensor = torch.tensor(sequence, dtype=input_ids.dtype, device=input_ids.device)
+                if input_ids.shape[1] < sequence_tensor.numel():
+                    continue
+                done |= (input_ids[:, -sequence_tensor.numel() :] == sequence_tensor).all(dim=1)
+            return done
+
+    return StoppingCriteriaList([StopOnTokenSequences(stop_sequences)])
+
+
+def build_generation_kwargs(
+    args: argparse.Namespace,
+    tokenizer: Any,
+    *,
+    for_eval: bool,
+) -> Dict[str, Any]:
+    generation_kwargs = {
+        "do_sample": args.eval_do_sample if for_eval else args.do_sample,
+        "temperature": args.eval_temperature if for_eval else args.temperature,
+        "top_p": args.eval_top_p if for_eval else args.top_p,
+        "top_k": args.eval_top_k if for_eval else args.top_k,
+        "min_new_tokens": args.min_new_tokens,
+        "max_new_tokens": args.max_new_tokens,
+        "repetition_penalty": args.repetition_penalty,
+        "pad_token_id": tokenizer.pad_token_id,
+        "eos_token_id": tokenizer.eos_token_id,
+    }
+    if getattr(args, "min_p", 0.0) > 0.0:
+        generation_kwargs["min_p"] = args.min_p
+    stopping_criteria = build_generation_stopping_criteria(tokenizer)
+    if stopping_criteria is not None:
+        generation_kwargs["stopping_criteria"] = stopping_criteria
+    return generation_kwargs
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run_name", type=str, default=None)
-    parser.add_argument("--seed", type=int, default=23)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--wandb_project", type=str, default=os.environ.get("WANDB_PROJECT", "bioreasoning-pro"))
     parser.add_argument("--wandb_entity", type=str, default=None)
     parser.add_argument("--wandb_mode", type=str, default=None)
     parser.add_argument("--wandb_job_type", type=str, default="train_rl", choices=["train_rl"])
     parser.add_argument("--weave_project", type=str, default=None)
     parser.add_argument("--weave_trace_budget", type=int, default=64)
+    parser.add_argument("--weave_trace_full_group_count", type=int, default=4)
+    parser.add_argument("--weave_trace_full_rollouts_per_group", type=int, default=24)
 
     parser.add_argument("--benchmark_version", type=str, default="213 -> 221 -> 225 -> 228")
     parser.add_argument("--temporal_split_artifact", type=str, default=None)
@@ -391,6 +844,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--protein_model_name", type=str, default="esm3_sm_open_v1")
     parser.add_argument("--cache_dir", type=str, default=os.path.expanduser("~/.cache/huggingface/hub"))
     parser.add_argument("--go_obo_path", type=str, default=None)
+    parser.add_argument("--ia_file_path", type=str, default=os.environ.get("BIOREASON_IA_FILE_PATH", ""))
+    parser.add_argument("--require_ia_file", type=str, default="true")
     parser.add_argument("--precomputed_embeddings_path", type=str, default=None)
     parser.add_argument("--structure_dir", type=str, default=None)
     parser.add_argument("--dataset_cache_dir", type=str, default=None)
@@ -428,18 +883,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bnb_4bit_compute_dtype", type=str, default="bfloat16")
     parser.add_argument("--bnb_4bit_quant_type", type=str, default="nf4")
     parser.add_argument("--bnb_4bit_use_double_quant", type=str, default="true")
-    parser.add_argument("--lora_rank", type=int, default=32)
-    parser.add_argument("--lora_alpha", type=int, default=64)
+    parser.add_argument("--lora_rank", type=int, default=16)
+    parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
+    parser.add_argument("--gradient_checkpointing", type=str, default="true")
+    parser.add_argument("--disable_model_dropout", type=str, default="true")
 
-    parser.add_argument("--learning_rate", type=float, default=5e-6)
+    parser.add_argument("--learning_rate", type=float, default=3e-5)
     parser.add_argument("--weight_decay", type=float, default=0.0)
-    parser.add_argument("--train_batch_size", type=int, default=1)
+    parser.add_argument("--train_batch_size", type=int, default=8)
     parser.add_argument("--eval_batch_size", type=int, default=4)
     parser.add_argument("--num_workers", type=int, default=0)
-    parser.add_argument("--max_steps", type=int, default=200)
+    parser.add_argument("--max_steps", type=int, default=300)
     parser.add_argument("--max_epochs", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument("--adam_beta1", type=float, default=0.9)
+    parser.add_argument("--adam_beta2", type=float, default=0.999)
+    parser.add_argument("--adam_epsilon", type=float, default=1e-8)
+    parser.add_argument("--lr_scheduler_type", type=str, default="cosine", choices=["constant", "cosine"])
+    parser.add_argument("--warmup_ratio", type=float, default=0.03)
     parser.add_argument("--max_train_samples", type=int, default=-1)
     parser.add_argument("--max_eval_samples", type=int, default=128)
     parser.add_argument(
@@ -462,28 +924,41 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rotating_eval_seed_stride", type=int, default=9973)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
 
-    parser.add_argument("--num_generations", type=int, default=8)
+    parser.add_argument("--loss_type", type=str, default="dr_grpo", choices=["dr_grpo"])
+    parser.add_argument("--steps_per_generation", type=int, default=2)
+    parser.add_argument("--num_iterations", type=int, default=1)
+    parser.add_argument("--num_generations", type=int, default=24)
     parser.add_argument("--min_new_tokens", type=int, default=1)
     parser.add_argument("--max_new_tokens", type=int, default=512)
+    parser.add_argument("--rollout_logprob_microbatch_size", type=int, default=4)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--top_k", type=int, default=20)
+    parser.add_argument("--min_p", type=float, default=0.0)
+    parser.add_argument("--repetition_penalty", type=float, default=1.0)
     parser.add_argument("--do_sample", type=str, default="true")
     parser.add_argument("--eval_do_sample", type=str, default="false")
     parser.add_argument("--eval_temperature", type=float, default=0.1)
     parser.add_argument("--eval_top_p", type=float, default=0.9)
     parser.add_argument("--eval_top_k", type=int, default=20)
-    parser.add_argument("--kl_beta", type=float, default=0.02)
+    parser.add_argument("--clip_epsilon_low", type=float, default=7e-4)
+    parser.add_argument("--clip_epsilon_high", type=float, default=9e-4)
+    parser.add_argument("--reward_scaling", type=str, default="batch", choices=["batch", "group"])
+    parser.add_argument("--advantage_epsilon_std", type=float, default=1e-6)
+    parser.add_argument("--importance_sampling_level", type=str, default="sequence", choices=["sequence"])
+    parser.add_argument("--importance_sampling_cap", type=float, default=2.0)
+    parser.add_argument("--reward_final_answer_only", type=str, default="true")
+    parser.add_argument("--kl_beta", type=float, default=1e-4)
     parser.add_argument(
         "--reward_funcs",
         type=str,
-        default="strict_format,summary_schema,go_presence,go_aspect_coverage,go_overlap,structural_noise",
+        default="ia_weighted_f1",
         help="Comma-separated reward function names.",
     )
     parser.add_argument(
         "--reward_weights",
         type=str,
-        default="0.25,0.75,1.5,0.5,2.5,1.0",
+        default="1.0",
         help="Optional comma-separated reward weights aligned with --reward_funcs.",
     )
 
@@ -514,8 +989,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "train_go_modules",
         "use_qlora",
         "bnb_4bit_use_double_quant",
+        "gradient_checkpointing",
+        "disable_model_dropout",
         "do_sample",
         "eval_do_sample",
+        "reward_final_answer_only",
+        "require_ia_file",
         "ablation_from_paper_rl",
     ]
 
@@ -605,6 +1084,34 @@ def configure_trainable_modules(model: Any, args: argparse.Namespace) -> None:
     model.text_model.train()
 
 
+def disable_model_dropout_modules(module: Any) -> None:
+    import torch
+
+    for child in module.modules():
+        if isinstance(child, torch.nn.Dropout):
+            child.p = 0.0
+
+
+def maybe_enable_gradient_checkpointing(model: Any, args: argparse.Namespace) -> None:
+    if not getattr(args, "gradient_checkpointing", False):
+        return
+
+    enable_input_require_grads = getattr(model.text_model, "enable_input_require_grads", None)
+    if callable(enable_input_require_grads):
+        enable_input_require_grads()
+
+    gradient_checkpointing_enable = getattr(model.text_model, "gradient_checkpointing_enable", None)
+    if callable(gradient_checkpointing_enable):
+        try:
+            gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        except TypeError:
+            gradient_checkpointing_enable()
+
+    config = getattr(model.text_model, "config", None)
+    if config is not None and hasattr(config, "use_cache"):
+        config.use_cache = False
+
+
 def build_quantization_config(args: argparse.Namespace) -> Optional[Any]:
     if not args.use_qlora:
         return None
@@ -661,6 +1168,9 @@ def instantiate_model(args: argparse.Namespace, trainable: bool) -> Any:
     load_auxiliary_checkpoint_components(model, args.text_model_name)
     if trainable:
         configure_trainable_modules(model, args)
+        if getattr(args, "disable_model_dropout", False):
+            disable_model_dropout_modules(model.text_model)
+        maybe_enable_gradient_checkpointing(model, args)
     else:
         for param in model.parameters():
             param.requires_grad = False
@@ -954,6 +1464,54 @@ def build_rollout_group_inputs(
     }
 
 
+def slice_rollout_group(
+    rollout_group: Mapping[str, Any],
+    start_idx: int,
+    end_idx: int,
+) -> Dict[str, Any]:
+    total_rollouts = int(rollout_group["combined_input_ids"].shape[0])
+    if start_idx < 0 or end_idx > total_rollouts or start_idx >= end_idx:
+        raise ValueError(f"Invalid rollout slice [{start_idx}, {end_idx}) for {total_rollouts} rollouts")
+
+    protein_sequences = list(rollout_group.get("protein_sequences") or [])
+    batch_idx_map = list(rollout_group.get("batch_idx_map") or [])
+    proteins_per_rollout = 0
+    if total_rollouts > 0 and protein_sequences:
+        if len(protein_sequences) % total_rollouts != 0:
+            raise ValueError("protein_sequences length must divide evenly across rollout count")
+        proteins_per_rollout = len(protein_sequences) // total_rollouts
+    elif total_rollouts > 0 and batch_idx_map:
+        if len(batch_idx_map) % total_rollouts != 0:
+            raise ValueError("batch_idx_map length must divide evenly across rollout count")
+        proteins_per_rollout = len(batch_idx_map) // total_rollouts
+
+    protein_start = start_idx * proteins_per_rollout
+    protein_end = end_idx * proteins_per_rollout
+    sliced_sequences = protein_sequences[protein_start:protein_end]
+    sliced_batch_idx_map: List[int] = []
+    if proteins_per_rollout > 0:
+        for local_idx in range(end_idx - start_idx):
+            sliced_batch_idx_map.extend([local_idx] * proteins_per_rollout)
+
+    structure_coords = rollout_group.get("structure_coords")
+    if hasattr(structure_coords, "shape") and getattr(structure_coords, "shape", None):
+        if int(structure_coords.shape[0]) == total_rollouts:
+            structure_coords = structure_coords[start_idx:end_idx]
+    elif isinstance(structure_coords, list) and len(structure_coords) == total_rollouts:
+        structure_coords = structure_coords[start_idx:end_idx]
+
+    return {
+        "combined_input_ids": rollout_group["combined_input_ids"][start_idx:end_idx],
+        "combined_attention_mask": rollout_group["combined_attention_mask"][start_idx:end_idx],
+        "completion_attention": rollout_group["completion_attention"][start_idx:end_idx],
+        "prompt_token_len": rollout_group["prompt_token_len"],
+        "protein_sequences": sliced_sequences,
+        "batch_idx_map": sliced_batch_idx_map,
+        "structure_coords": structure_coords,
+        "go_aspects": list(rollout_group["go_aspects"][start_idx:end_idx]),
+    }
+
+
 def build_combined_inputs(prompt_input_ids: Any, prompt_attention_mask: Any, completion_ids: Any) -> Tuple[Any, Any, int]:
     import torch
 
@@ -1072,45 +1630,103 @@ def compute_batched_completion_kl(
     return float(per_example_kl[valid_counts > 0].sum().item())
 
 
+def compute_rollout_policy_statistics(
+    model: Any,
+    rollout_group: Mapping[str, Any],
+    microbatch_size: int = 0,
+) -> Tuple[Any, Any, Any]:
+    import torch
+
+    def _compute(subgroup: Mapping[str, Any]) -> Tuple[Any, Any, Any]:
+        token_log_probs = compute_completion_token_log_probs(
+            model,
+            subgroup["combined_input_ids"],
+            subgroup["combined_attention_mask"],
+            subgroup["prompt_token_len"],
+            subgroup["protein_sequences"],
+            subgroup["batch_idx_map"],
+            subgroup["structure_coords"],
+            subgroup["go_aspects"],
+        )
+        token_mask = subgroup["completion_attention"].to(device=token_log_probs.device, dtype=token_log_probs.dtype)
+        sequence_log_probs = (token_log_probs * token_mask).sum(dim=1)
+        valid_counts = token_mask.sum(dim=1).clamp_min(1.0)
+        return token_log_probs, sequence_log_probs, valid_counts
+
+    total_rollouts = int(rollout_group["combined_input_ids"].shape[0])
+    if microbatch_size <= 0 or total_rollouts <= microbatch_size:
+        return _compute(rollout_group)
+
+    token_chunks: List[Any] = []
+    sequence_chunks: List[Any] = []
+    count_chunks: List[Any] = []
+    for start_idx in range(0, total_rollouts, microbatch_size):
+        subgroup = slice_rollout_group(rollout_group, start_idx, min(total_rollouts, start_idx + microbatch_size))
+        token_log_probs, sequence_log_probs, valid_counts = _compute(subgroup)
+        token_chunks.append(token_log_probs)
+        sequence_chunks.append(sequence_log_probs)
+        count_chunks.append(valid_counts)
+
+    return (
+        torch.cat(token_chunks, dim=0),
+        torch.cat(sequence_chunks, dim=0),
+        torch.cat(count_chunks, dim=0),
+    )
+
+
+def compute_old_policy_sequence_log_probs(
+    model: Any,
+    example: Mapping[str, Any],
+    completion_ids_list: Sequence[Any],
+    pad_token_id: int,
+    microbatch_size: int = 0,
+) -> List[float]:
+    import torch
+
+    rollout_group = build_rollout_group_inputs(example, completion_ids_list, pad_token_id)
+    valid_mask = rollout_group["completion_attention"].bool()
+    if not torch.any(valid_mask.any(dim=1)):
+        return [0.0 for _ in completion_ids_list]
+
+    with torch.no_grad():
+        _, sequence_log_probs, _ = compute_rollout_policy_statistics(
+            model,
+            rollout_group,
+            microbatch_size=microbatch_size,
+        )
+    return [float(value.detach().item()) for value in sequence_log_probs]
+
+
 def compute_group_policy_losses_batched(
     model: Any,
     ref_model: Any,
     example: Mapping[str, Any],
     completion_ids_list: Sequence[Any],
     advantages: Sequence[float],
+    old_sequence_log_probs: Sequence[float],
     pad_token_id: int,
-    kl_beta: float,
-) -> Tuple[List[Any], List[float], bool]:
+    args: argparse.Namespace,
+) -> Tuple[Any, Dict[str, float], bool]:
     import torch
 
     rollout_group = build_rollout_group_inputs(example, completion_ids_list, pad_token_id)
     valid_mask = rollout_group["completion_attention"].bool()
     nonempty_rollouts = valid_mask.any(dim=1)
     if not torch.any(nonempty_rollouts):
-        return [], [], False
+        return torch.tensor(0.0, device=example["input_ids"].device), {}, False
 
-    current_log_probs = compute_completion_token_log_probs(
+    current_log_probs, current_sequence_log_probs, valid_counts = compute_rollout_policy_statistics(
         model,
-        rollout_group["combined_input_ids"],
-        rollout_group["combined_attention_mask"],
-        rollout_group["prompt_token_len"],
-        rollout_group["protein_sequences"],
-        rollout_group["batch_idx_map"],
-        rollout_group["structure_coords"],
-        rollout_group["go_aspects"],
+        rollout_group,
+        microbatch_size=args.rollout_logprob_microbatch_size,
     )
 
     with torch.no_grad():
         if ref_model is not None:
-            ref_log_probs = compute_completion_token_log_probs(
+            ref_log_probs, _, _ = compute_rollout_policy_statistics(
                 ref_model,
-                rollout_group["combined_input_ids"],
-                rollout_group["combined_attention_mask"],
-                rollout_group["prompt_token_len"],
-                rollout_group["protein_sequences"],
-                rollout_group["batch_idx_map"],
-                rollout_group["structure_coords"],
-                rollout_group["go_aspects"],
+                rollout_group,
+                microbatch_size=args.rollout_logprob_microbatch_size,
             )
         else:
             ref_log_probs = torch.zeros_like(current_log_probs)
@@ -1119,22 +1735,36 @@ def compute_group_policy_losses_batched(
         device=current_log_probs.device,
         dtype=current_log_probs.dtype,
     )
-    valid_counts = token_mask.sum(dim=1).clamp_min(1.0)
     advantage_tensor = torch.tensor(
         list(advantages),
         device=current_log_probs.device,
         dtype=current_log_probs.dtype,
-    ).unsqueeze(1)
-    log_ratio = current_log_probs - current_log_probs.detach()
-    policy_term = torch.exp(log_ratio) * advantage_tensor
-    kl_term = torch.exp(ref_log_probs - current_log_probs) - (ref_log_probs - current_log_probs) - 1.0
-    per_rollout_loss = -((policy_term - kl_beta * kl_term) * token_mask).sum(dim=1) / valid_counts
-    per_rollout_kl = ((kl_term * token_mask).sum(dim=1) / valid_counts)[nonempty_rollouts]
-    return (
-        list(per_rollout_loss[nonempty_rollouts].unbind()),
-        [float(value.detach().item()) for value in per_rollout_kl],
-        True,
     )
+    old_sequence_tensor = torch.tensor(
+        list(old_sequence_log_probs),
+        device=current_log_probs.device,
+        dtype=current_log_probs.dtype,
+    )
+    log_ratio = current_sequence_log_probs - old_sequence_tensor
+    ratio = torch.exp(log_ratio)
+    if args.importance_sampling_cap > 0:
+        ratio = ratio.clamp(max=float(args.importance_sampling_cap))
+    clipped_ratio = ratio.clamp(
+        min=1.0 - float(args.clip_epsilon_low),
+        max=1.0 + float(args.clip_epsilon_high),
+    )
+    surrogate = torch.minimum(ratio * advantage_tensor, clipped_ratio * advantage_tensor)
+    kl_term = torch.exp(ref_log_probs - current_log_probs) - (ref_log_probs - current_log_probs) - 1.0
+    sequence_kl = (kl_term * token_mask).sum(dim=1) / valid_counts
+    per_rollout_loss = -(surrogate - float(args.kl_beta) * sequence_kl) / max(float(args.max_new_tokens), 1.0)
+    nonempty_losses = per_rollout_loss[nonempty_rollouts]
+    metrics = {
+        "kl_mean": float(sequence_kl[nonempty_rollouts].mean().detach().item()),
+        "ratio_mean": float(ratio[nonempty_rollouts].mean().detach().item()),
+        "ratio_max": float(ratio[nonempty_rollouts].max().detach().item()),
+        "valid_rollouts": float(nonempty_rollouts.sum().item()),
+    }
+    return nonempty_losses.mean(), metrics, True
 
 
 def compute_group_policy_losses_sequential(
@@ -1143,14 +1773,16 @@ def compute_group_policy_losses_sequential(
     example: Mapping[str, Any],
     completion_ids_list: Sequence[Any],
     advantages: Sequence[float],
-    kl_beta: float,
-) -> Tuple[List[Any], List[float], bool]:
+    old_sequence_log_probs: Sequence[float],
+    args: argparse.Namespace,
+) -> Tuple[Any, Dict[str, float], bool]:
     import torch
 
     losses: List[Any] = []
     kl_values: List[float] = []
+    ratio_values: List[float] = []
     trainable = False
-    for completion_ids, advantage in zip(completion_ids_list, advantages):
+    for completion_ids, advantage, old_sequence_log_prob in zip(completion_ids_list, advantages, old_sequence_log_probs):
         if completion_ids.numel() <= 0:
             continue
         trainable = True
@@ -1184,13 +1816,30 @@ def compute_group_policy_losses_sequential(
             else:
                 ref_log_probs = torch.zeros_like(current_log_probs)
 
-        log_ratio = current_log_probs - current_log_probs.detach()
-        policy_term = torch.exp(log_ratio) * float(advantage)
+        sequence_log_prob = current_log_probs.sum(dim=1).squeeze(0)
+        ratio = torch.exp(sequence_log_prob - float(old_sequence_log_prob))
+        if args.importance_sampling_cap > 0:
+            ratio = ratio.clamp(max=float(args.importance_sampling_cap))
+        clipped_ratio = ratio.clamp(
+            min=1.0 - float(args.clip_epsilon_low),
+            max=1.0 + float(args.clip_epsilon_high),
+        )
+        surrogate = torch.minimum(ratio * float(advantage), clipped_ratio * float(advantage))
         kl_term = torch.exp(ref_log_probs - current_log_probs) - (ref_log_probs - current_log_probs) - 1.0
-        losses.append(-(policy_term - kl_beta * kl_term).mean())
+        sequence_kl = kl_term.mean()
+        losses.append(-(surrogate - float(args.kl_beta) * sequence_kl) / max(float(args.max_new_tokens), 1.0))
         kl_values.append(float(kl_term.mean().detach().item()))
+        ratio_values.append(float(ratio.detach().item()))
 
-    return losses, kl_values, trainable
+    if not losses:
+        return torch.tensor(0.0, device=example["input_ids"].device), {}, False
+    metrics = {
+        "kl_mean": sum(kl_values) / len(kl_values),
+        "ratio_mean": sum(ratio_values) / len(ratio_values),
+        "ratio_max": max(ratio_values),
+        "valid_rollouts": float(len(losses)),
+    }
+    return torch.stack(losses).mean(), metrics, trainable
 
 
 def generate_rollouts_sequential(
@@ -1205,6 +1854,7 @@ def generate_rollouts_sequential(
 ) -> Tuple[List[Any], List[str]]:
     completion_ids_list: List[Any] = []
     completions: List[str] = []
+    generation_kwargs = build_generation_kwargs(args, tokenizer, for_eval=False)
     for rollout_idx in range(args.num_generations):
         print(
             "Generating RL rollout: "
@@ -1218,14 +1868,7 @@ def generate_rollouts_sequential(
             batch_idx_map=example["batch_idx_map"],
             structure_coords=example["structure_coords"],
             go_aspects=example["go_aspects"],
-            do_sample=args.do_sample,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            top_k=args.top_k,
-            min_new_tokens=args.min_new_tokens,
-            max_new_tokens=args.max_new_tokens,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
+            **generation_kwargs,
         )
         completion_ids = extract_completion_ids(generated_ids, example["input_ids"])
         print(
@@ -1250,6 +1893,7 @@ def generate_rollouts_for_example(
 
     prompt_len = example["input_ids"].shape[1]
     rollout_batch = expand_example_for_rollouts(example, args.num_generations)
+    generation_kwargs = build_generation_kwargs(args, tokenizer, for_eval=False)
     try:
         print(
             "Generating RL rollout batch: "
@@ -1263,14 +1907,7 @@ def generate_rollouts_for_example(
             batch_idx_map=rollout_batch["batch_idx_map"],
             structure_coords=rollout_batch["structure_coords"],
             go_aspects=rollout_batch["go_aspects"],
-            do_sample=args.do_sample,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            top_k=args.top_k,
-            min_new_tokens=args.min_new_tokens,
-            max_new_tokens=args.max_new_tokens,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
+            **generation_kwargs,
         )
         completion_ids_list = extract_completion_ids_batch(generated_ids, rollout_batch["input_ids"])
         print(
@@ -1320,6 +1957,7 @@ def evaluate_policy_example(
 ) -> Dict[str, float]:
     import torch
 
+    generation_kwargs = build_generation_kwargs(args, tokenizer, for_eval=True)
     generated_ids = model.generate(
         input_ids=example["input_ids"],
         attention_mask=example["attention_mask"],
@@ -1327,14 +1965,7 @@ def evaluate_policy_example(
         batch_idx_map=example["batch_idx_map"],
         structure_coords=example["structure_coords"],
         go_aspects=example["go_aspects"],
-        do_sample=args.eval_do_sample,
-        temperature=args.eval_temperature,
-        top_p=args.eval_top_p,
-        top_k=args.eval_top_k,
-        min_new_tokens=args.min_new_tokens,
-        max_new_tokens=args.max_new_tokens,
-        pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
+        **generation_kwargs,
     )
     completion_ids = extract_completion_ids(generated_ids, example["input_ids"])
     completion_text = decode_completion(tokenizer, completion_ids)
@@ -1414,6 +2045,7 @@ def evaluate_policy_batch(
     batch_idx_map = list(batch.get("batch_idx_map") or [])
     raw_go_aspects = list(batch.get("batch_go_aspects") or [])
     go_aspects = [raw_go_aspects[idx] if idx < len(raw_go_aspects) and raw_go_aspects[idx] is not None else "all" for idx in range(batch_size)]
+    generation_kwargs = build_generation_kwargs(args, tokenizer, for_eval=True)
 
     generated_ids = model.generate(
         input_ids=input_ids,
@@ -1422,14 +2054,7 @@ def evaluate_policy_batch(
         batch_idx_map=batch_idx_map,
         structure_coords=structure_coords,
         go_aspects=go_aspects,
-        do_sample=args.eval_do_sample,
-        temperature=args.eval_temperature,
-        top_p=args.eval_top_p,
-        top_k=args.eval_top_k,
-        min_new_tokens=args.min_new_tokens,
-        max_new_tokens=args.max_new_tokens,
-        pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
+        **generation_kwargs,
     )
     completion_ids_list = extract_completion_ids_batch(generated_ids, input_ids)
 
@@ -1493,6 +2118,20 @@ def compute_group_rewards(
     return total_scores, component_scores
 
 
+def compute_reward_diagnostics(
+    completions: Sequence[str],
+    sample_meta: Mapping[str, Any],
+) -> Dict[str, List[float]]:
+    registry = build_reward_registry()
+    diagnostics: Dict[str, List[float]] = {}
+    for reward_name in DIAGNOSTIC_REWARD_NAMES:
+        reward_fn = registry.get(reward_name)
+        if reward_fn is None:
+            continue
+        diagnostics[reward_name] = [float(reward_fn(completion, sample_meta)) for completion in completions]
+    return diagnostics
+
+
 def save_raw_checkpoint(model: Any, checkpoint_dir: Path, step: int, args: argparse.Namespace) -> Path:
     import torch
 
@@ -1510,8 +2149,17 @@ def save_raw_checkpoint(model: Any, checkpoint_dir: Path, step: int, args: argpa
         "benchmark_version": args.benchmark_version,
         "dataset_artifact": args.dataset_artifact,
         "base_checkpoint": args.base_checkpoint,
+        "loss_type": args.loss_type,
+        "steps_per_generation": args.steps_per_generation,
+        "num_iterations": args.num_iterations,
         "reward_funcs": parse_csv_items(args.reward_funcs),
         "reward_weights": parse_reward_weights(args.reward_weights, len(parse_csv_items(args.reward_funcs))),
+        "reward_scaling": args.reward_scaling,
+        "importance_sampling_level": args.importance_sampling_level,
+        "importance_sampling_cap": args.importance_sampling_cap,
+        "clip_epsilon_low": args.clip_epsilon_low,
+        "clip_epsilon_high": args.clip_epsilon_high,
+        "ia_file_path": args.ia_file_path,
         "kl_beta": args.kl_beta,
     }
     with open(step_dir / "training_metadata.json", "w", encoding="utf-8") as handle:
@@ -1569,6 +2217,44 @@ def maybe_init_wandb(args: argparse.Namespace, tracking_config: Mapping[str, Any
     return wandb.init(**init_kwargs)
 
 
+def attach_global_step(payload: Mapping[str, Any], global_step: int) -> Dict[str, Any]:
+    enriched = dict(payload)
+    enriched["global_step"] = float(global_step)
+    return enriched
+
+
+def maybe_bootstrap_wandb_history(
+    run: Any,
+    *,
+    reward_names: Sequence[str],
+) -> bool:
+    if run is None:
+        return False
+
+    define_metric = getattr(run, "define_metric", None)
+    if callable(define_metric):
+        define_metric("global_step")
+        for metric_name in WANDB_BOOTSTRAP_METRICS:
+            define_metric(metric_name, step_metric="global_step")
+        for reward_name in reward_names:
+            define_metric(f"reward_component/{reward_name}", step_metric="global_step")
+        for reward_name in DIAGNOSTIC_REWARD_NAMES:
+            define_metric(f"diagnostic/{reward_name}", step_metric="global_step")
+
+    bootstrap_payload: Dict[str, Any] = {
+        "global_step": 0.0,
+        "status/initialized": 1.0,
+    }
+    for metric_name in WANDB_BOOTSTRAP_METRICS:
+        bootstrap_payload[metric_name] = 0.0
+    for reward_name in reward_names:
+        bootstrap_payload[f"reward_component/{reward_name}"] = 0.0
+    for reward_name in DIAGNOSTIC_REWARD_NAMES:
+        bootstrap_payload[f"diagnostic/{reward_name}"] = 0.0
+    run.log(bootstrap_payload, step=0)
+    return True
+
+
 def resolve_weave_project(args: argparse.Namespace) -> str:
     explicit = normalize_text(getattr(args, "weave_project", None)).strip()
     if explicit:
@@ -1614,6 +2300,8 @@ def maybe_init_weave(args: argparse.Namespace, output_dir: Path) -> Optional[Dic
         "client": client,
         "trace_generation": trace_generation,
         "remaining_budget": max(int(getattr(args, "weave_trace_budget", 0)), 0),
+        "full_group_budget": max(int(getattr(args, "weave_trace_full_group_count", 0)), 0),
+        "full_group_rollouts": max(int(getattr(args, "weave_trace_full_rollouts_per_group", 0)), 0),
         "project": weave_project,
         "logged": 0,
     }
@@ -1648,6 +2336,7 @@ def maybe_trace_generation(
         "final_answer_go_ids": meta["final_answer_go_ids"],
         "completion_go_ids": meta["completion_go_ids"],
         "prediction_source": meta["prediction_source"],
+        "has_closed_reasoning": bool(meta["has_closed_reasoning"]),
         "go_summary_aspect_labels": meta["go_summary_aspect_labels"],
         "final_answer_aspect_labels": meta["final_answer_aspect_labels"],
         "has_go_summary": bool(meta["has_go_summary"]),
@@ -1827,7 +2516,7 @@ def maybe_run_rotating_validation_eval(
     rotating_metrics["rotating_eval_subset_seed"] = float(rotating_seed)
     rotating_metrics["rotating_eval_selected_samples"] = float(len(rotating_dataset))
     if wandb_run is not None:
-        wandb_run.log(rotating_metrics, step=global_step)
+        wandb_run.log(attach_global_step(rotating_metrics, global_step), step=global_step)
         print(f"Rotating RL validation metrics logged at global_step={global_step}.")
     return rotating_metrics
 
@@ -1848,6 +2537,7 @@ def train(args: argparse.Namespace) -> None:
     )
 
     set_seed(args.seed)
+    configure_reward_context(args)
     torch.set_float32_matmul_precision("high")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1873,6 +2563,10 @@ def train(args: argparse.Namespace) -> None:
     tokenizer = model.text_tokenizer
     reward_names = parse_csv_items(args.reward_funcs)
     reward_weights = parse_reward_weights(args.reward_weights, len(reward_names))
+    reward_context = resolve_reward_context()
+    resolved_ia_file_path = require_training_ia_file(args, reward_names)
+    if resolved_ia_file_path:
+        print(f"Using IA-weighted RL reward with IA file: {resolved_ia_file_path}")
 
     if args.resume_from_raw_checkpoint:
         checkpoint = torch.load(args.resume_from_raw_checkpoint, map_location="cpu", weights_only=False)
@@ -1883,7 +2577,22 @@ def train(args: argparse.Namespace) -> None:
         [parameter for parameter in model.parameters() if parameter.requires_grad],
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
+        betas=(args.adam_beta1, args.adam_beta2),
+        eps=args.adam_epsilon,
     )
+    total_update_passes = max(args.max_steps, 1) * max(args.steps_per_generation, 1) * max(args.num_iterations, 1)
+    optimizer_step_budget = max(math.ceil(total_update_passes / max(args.gradient_accumulation_steps, 1)), 1)
+    warmup_steps = int(optimizer_step_budget * max(args.warmup_ratio, 0.0))
+    if args.lr_scheduler_type == "cosine":
+        from transformers import get_cosine_schedule_with_warmup
+
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=optimizer_step_budget,
+        )
+    else:
+        scheduler = None
 
     ensure_weave_server_cache_dir(output_dir)
     wandb_run = maybe_init_wandb(args, tracking_config)
@@ -1906,6 +2615,10 @@ def train(args: argparse.Namespace) -> None:
                 "base_checkpoint": args.base_checkpoint,
             },
         )
+        maybe_bootstrap_wandb_history(
+            wandb_run,
+            reward_names=reward_names,
+        )
     weave_trace_state = maybe_init_weave(args, output_dir)
     if wandb_run is not None:
         sync_run_config(
@@ -1919,6 +2632,7 @@ def train(args: argparse.Namespace) -> None:
     best_val_reward = float("-inf")
     global_step = 0
     last_eval_step: Optional[int] = None
+    optimizer_substep = 0
     optimizer.zero_grad(set_to_none=True)
 
     for epoch_idx in range(args.max_epochs):
@@ -1929,14 +2643,19 @@ def train(args: argparse.Namespace) -> None:
             model.train()
             print(f"Starting RL train batch at global_step={global_step}, epoch={epoch_idx}.")
             batch_size = batch["input_ids"].shape[0]
-            sample_losses: List[Any] = []
             reward_totals: List[float] = []
-            reward_stds: List[float] = []
             reward_component_scores: Dict[str, List[float]] = {reward_name: [] for reward_name in reward_names}
+            diagnostic_component_scores: Dict[str, List[float]] = {
+                reward_name: [] for reward_name in DIAGNOSTIC_REWARD_NAMES
+            }
             completion_lengths: List[int] = []
             kl_values: List[float] = []
+            ratio_means: List[float] = []
+            ratio_maxes: List[float] = []
             trainable_group_count = 0
             pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+            grouped_rewards: List[List[float]] = []
+            rollout_records: List[Dict[str, Any]] = []
 
             for example_idx in range(batch_size):
                 example = extract_example_from_batch(batch, example_idx, device)
@@ -1950,6 +2669,13 @@ def train(args: argparse.Namespace) -> None:
                     global_step=global_step,
                     epoch_idx=epoch_idx,
                 )
+                old_sequence_log_probs = compute_old_policy_sequence_log_probs(
+                    model,
+                    example,
+                    completion_ids_list,
+                    pad_token_id,
+                    microbatch_size=args.rollout_logprob_microbatch_size,
+                )
                 model.train()
                 completion_lengths.extend(int(completion_ids.numel()) for completion_ids in completion_ids_list)
 
@@ -1959,66 +2685,58 @@ def train(args: argparse.Namespace) -> None:
                     reward_names,
                     reward_weights,
                 )
+                diagnostic_components = compute_reward_diagnostics(completions, example["sample_meta"])
+                grouped_rewards.append(total_rewards)
+                rollout_records.append(
+                    {
+                        "example": example,
+                        "completion_ids_list": completion_ids_list,
+                        "completions": completions,
+                        "total_rewards": total_rewards,
+                        "reward_components": reward_components,
+                        "diagnostic_components": diagnostic_components,
+                        "old_sequence_log_probs": old_sequence_log_probs,
+                    }
+                )
                 for reward_name, scores in reward_components.items():
                     reward_component_scores.setdefault(reward_name, []).extend(scores)
-                advantages = standardize_group_rewards(total_rewards)
+                for reward_name, scores in diagnostic_components.items():
+                    diagnostic_component_scores.setdefault(reward_name, []).extend(scores)
                 reward_totals.extend(total_rewards)
-                if len(total_rewards) > 1:
-                    reward_stds.append(float(torch.tensor(total_rewards, dtype=torch.float32).std(unbiased=False).item()))
-                else:
-                    reward_stds.append(0.0)
-
-                for generation_idx, (completion_text, total_reward, advantage) in enumerate(
-                    zip(completions, total_rewards, advantages)
-                ):
-                    if generation_idx != 0:
-                        continue
+            grouped_advantages, global_reward_std = compute_batch_relative_advantages(
+                grouped_rewards,
+                epsilon_std=args.advantage_epsilon_std,
+                reward_scaling=args.reward_scaling,
+            )
+            for record, advantages in zip(rollout_records, grouped_advantages):
+                record["advantages"] = advantages
+                if any(completion_ids.numel() > 0 for completion_ids in record["completion_ids_list"]):
+                    trainable_group_count += 1
+                if not record["completions"]:
+                    continue
+                trace_rollout_count = 1
+                if weave_trace_state and weave_trace_state.get("full_group_budget", 0) > 0:
+                    trace_rollout_count = min(
+                        len(record["completions"]),
+                        max(int(weave_trace_state.get("full_group_rollouts", 0)), 1),
+                    )
+                    weave_trace_state["full_group_budget"] -= 1
+                for rollout_idx in range(trace_rollout_count):
                     maybe_trace_generation(
                         weave_trace_state,
                         split="train",
                         global_step=global_step,
-                        sample_meta=example["sample_meta"],
-                        completion=completion_text,
-                        total_reward=total_reward,
-                        advantage=advantage,
+                        sample_meta=record["example"]["sample_meta"],
+                        completion=record["completions"][rollout_idx],
+                        total_reward=record["total_rewards"][rollout_idx] if record["total_rewards"] else 0.0,
+                        advantage=advantages[rollout_idx] if advantages else None,
                         reward_components={
-                            reward_name: reward_components[reward_name][generation_idx]
-                            for reward_name in reward_components
+                            reward_name: record["reward_components"][reward_name][rollout_idx]
+                            for reward_name in record["reward_components"]
                         },
                     )
 
-                try:
-                    rollout_losses, rollout_kls, has_trainable_rollout = compute_group_policy_losses_batched(
-                        model,
-                        ref_model,
-                        example,
-                        completion_ids_list,
-                        advantages,
-                        pad_token_id,
-                        args.kl_beta,
-                    )
-                except torch.cuda.OutOfMemoryError:
-                    print(
-                        "CUDA Out of Memory during batched RL loss computation; "
-                        "falling back to sequential rollout loss computation for this prompt."
-                    )
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    rollout_losses, rollout_kls, has_trainable_rollout = compute_group_policy_losses_sequential(
-                        model,
-                        ref_model,
-                        example,
-                        completion_ids_list,
-                        advantages,
-                        args.kl_beta,
-                    )
-
-                if has_trainable_rollout:
-                    trainable_group_count += 1
-                    sample_losses.extend(rollout_losses)
-                    kl_values.extend(rollout_kls)
-
-            if not sample_losses:
+            if trainable_group_count == 0:
                 global_step += 1
                 skipped_payload = {
                     "loss_learning_rate": optimizer.param_groups[0]["lr"],
@@ -2027,11 +2745,19 @@ def train(args: argparse.Namespace) -> None:
                     "data_step_num_trajectories": float(len(reward_totals)),
                     "data_step_num_datums": float(batch_size),
                     "data_step_trainer_tokens": float(sum(completion_lengths)),
+                    "reward": sum(reward_totals) / max(len(reward_totals), 1) if reward_totals else 0.0,
+                    "reward_std_dev": float(global_reward_std),
                     "train_skipped_update": 1.0,
                 }
+                for reward_name, scores in reward_component_scores.items():
+                    if scores:
+                        skipped_payload[f"reward_component/{reward_name}"] = sum(scores) / len(scores)
+                for reward_name, scores in diagnostic_component_scores.items():
+                    if scores:
+                        skipped_payload[f"diagnostic/{reward_name}"] = sum(scores) / len(scores)
                 if wandb_run is not None:
                     print(f"Logging RL skipped-update metrics at global_step={global_step}.")
-                    wandb_run.log(skipped_payload, step=global_step)
+                    wandb_run.log(attach_global_step(skipped_payload, global_step), step=global_step)
                     print(f"RL skipped-update metrics logged at global_step={global_step}.")
 
                 if args.eval_every_n_steps > 0 and global_step % args.eval_every_n_steps == 0:
@@ -2050,7 +2776,7 @@ def train(args: argparse.Namespace) -> None:
                         trace_split_name="validation_fixed",
                     )
                     if wandb_run is not None:
-                        wandb_run.log(val_metrics, step=global_step)
+                        wandb_run.log(attach_global_step(val_metrics, global_step), step=global_step)
                         print(f"RL validation metrics logged at global_step={global_step}.")
                     last_eval_step = global_step
                     if val_metrics["eval_reward"] > best_val_reward:
@@ -2077,27 +2803,86 @@ def train(args: argparse.Namespace) -> None:
                     break
                 continue
 
-            loss = torch.stack(sample_losses).mean() / max(args.gradient_accumulation_steps, 1)
-            loss.backward()
-
-            should_step = ((global_step + 1) % max(args.gradient_accumulation_steps, 1)) == 0
             grad_norm_value = 0.0
-            if should_step:
-                grad_norm = clip_grad_norm_(
-                    [parameter for parameter in model.parameters() if parameter.requires_grad],
-                    args.max_grad_norm,
+            optimizer.zero_grad(set_to_none=True)
+            update_losses: List[float] = []
+            total_update_passes = max(args.steps_per_generation, 1) * max(args.num_iterations, 1)
+            for update_idx in range(total_update_passes):
+                update_loss_accumulator = 0.0
+                update_trainable_groups = 0
+                for record in rollout_records:
+                    try:
+                        group_loss, group_metrics, has_trainable_rollout = compute_group_policy_losses_batched(
+                            model,
+                            ref_model,
+                            record["example"],
+                            record["completion_ids_list"],
+                            record["advantages"],
+                            record["old_sequence_log_probs"],
+                            pad_token_id,
+                            args,
+                        )
+                    except torch.cuda.OutOfMemoryError:
+                        print(
+                            "CUDA Out of Memory during batched RL loss computation; "
+                            "falling back to sequential rollout loss computation for this prompt."
+                        )
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        group_loss, group_metrics, has_trainable_rollout = compute_group_policy_losses_sequential(
+                            model,
+                            ref_model,
+                            record["example"],
+                            record["completion_ids_list"],
+                            record["advantages"],
+                            record["old_sequence_log_probs"],
+                            args,
+                        )
+
+                    if not has_trainable_rollout:
+                        continue
+
+                    scaled_group_loss = group_loss / max(float(trainable_group_count), 1.0)
+                    scaled_group_loss.backward()
+                    update_loss_accumulator += float(group_loss.detach().item())
+                    update_trainable_groups += 1
+                    if group_metrics:
+                        if "kl_mean" in group_metrics:
+                            kl_values.append(float(group_metrics["kl_mean"]))
+                        if "ratio_mean" in group_metrics:
+                            ratio_means.append(float(group_metrics["ratio_mean"]))
+                        if "ratio_max" in group_metrics:
+                            ratio_maxes.append(float(group_metrics["ratio_max"]))
+
+                if update_trainable_groups <= 0:
+                    continue
+
+                optimizer_substep += 1
+                should_step = (
+                    optimizer_substep % max(args.gradient_accumulation_steps, 1) == 0
+                    or update_idx == total_update_passes - 1
                 )
-                grad_norm_value = float(grad_norm.item()) if hasattr(grad_norm, "item") else float(grad_norm)
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+                if should_step:
+                    grad_norm = clip_grad_norm_(
+                        [parameter for parameter in model.parameters() if parameter.requires_grad],
+                        args.max_grad_norm,
+                    )
+                    grad_norm_value = float(grad_norm.item()) if hasattr(grad_norm, "item") else float(grad_norm)
+                    optimizer.step()
+                    if scheduler is not None:
+                        scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+                update_losses.append(update_loss_accumulator / update_trainable_groups)
 
             global_step += 1
 
             log_payload = {
-                "loss_train": float(loss.detach().item() * max(args.gradient_accumulation_steps, 1)),
+                "loss_train": sum(update_losses) / max(len(update_losses), 1) if update_losses else 0.0,
                 "reward": sum(reward_totals) / max(len(reward_totals), 1),
-                "reward_std_dev": sum(reward_stds) / max(len(reward_stds), 1),
+                "reward_std_dev": float(global_reward_std),
                 "loss_kl_div": sum(kl_values) / max(len(kl_values), 1) if kl_values else 0.0,
+                "loss_policy_ratio_mean": sum(ratio_means) / max(len(ratio_means), 1) if ratio_means else 0.0,
+                "loss_policy_ratio_max": max(ratio_maxes) if ratio_maxes else 0.0,
                 "loss_learning_rate": optimizer.param_groups[0]["lr"],
                 "loss_grad_norm": grad_norm_value,
                 "data_step_num_groups_submitted": float(batch_size),
@@ -2105,15 +2890,20 @@ def train(args: argparse.Namespace) -> None:
                 "data_step_num_trajectories": float(len(reward_totals)),
                 "data_step_num_datums": float(batch_size),
                 "data_step_trainer_tokens": float(sum(completion_lengths)),
+                "data_step_num_update_passes": float(total_update_passes),
                 "train_skipped_update": 0.0,
             }
             for reward_name, scores in reward_component_scores.items():
                 if not scores:
                     continue
                 log_payload[f"reward_component/{reward_name}"] = sum(scores) / len(scores)
+            for reward_name, scores in diagnostic_component_scores.items():
+                if not scores:
+                    continue
+                log_payload[f"diagnostic/{reward_name}"] = sum(scores) / len(scores)
             if wandb_run is not None:
                 print(f"Logging RL train metrics at global_step={global_step}.")
-                wandb_run.log(log_payload, step=global_step)
+                wandb_run.log(attach_global_step(log_payload, global_step), step=global_step)
                 print(f"RL train metrics logged at global_step={global_step}.")
 
             if args.eval_every_n_steps > 0 and global_step % args.eval_every_n_steps == 0:
@@ -2132,7 +2922,7 @@ def train(args: argparse.Namespace) -> None:
                     trace_split_name="validation_fixed",
                 )
                 if wandb_run is not None:
-                    wandb_run.log(val_metrics, step=global_step)
+                    wandb_run.log(attach_global_step(val_metrics, global_step), step=global_step)
                     print(f"RL validation metrics logged at global_step={global_step}.")
                 last_eval_step = global_step
                 if val_metrics["eval_reward"] > best_val_reward:
@@ -2175,7 +2965,7 @@ def train(args: argparse.Namespace) -> None:
         )
         final_val_metrics = {f"final/{key}": value for key, value in final_val_metrics.items()}
         if wandb_run is not None:
-            wandb_run.log(final_val_metrics, step=global_step)
+            wandb_run.log(attach_global_step(final_val_metrics, global_step), step=global_step)
             print(f"RL final validation metrics logged at global_step={global_step}.")
 
     final_checkpoint_dir = save_raw_checkpoint(model, raw_checkpoint_dir, global_step, args)
