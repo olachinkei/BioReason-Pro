@@ -1,3 +1,5 @@
+import copy
+
 import torch
 import torch.nn as nn
 from transformers import (
@@ -281,6 +283,7 @@ class ProteinLLMModel(nn.Module):
                     dtype=self.protein_projection[0].weight.dtype,
                 )
                 batch_protein_embeddings[i] = self.protein_projection(batch_protein_embeddings[i])
+                batch_protein_embeddings[i] = self._sanitize_embedding_tensor(batch_protein_embeddings[i])
             else:
                 # Ensure empty tensors have correct dimensions
                 batch_protein_embeddings[i] = torch.zeros(
@@ -335,6 +338,7 @@ class ProteinLLMModel(nn.Module):
                     dtype=self.go_projection[0].weight.dtype,
                 )
                 reduced_embeddings = self.go_projection(reduced_embeddings)  # (200, text_hidden_size)
+                reduced_embeddings = self._sanitize_embedding_tensor(reduced_embeddings)
 
             # Duplicate for all batch items
             for i in range(batch_size):
@@ -365,6 +369,7 @@ class ProteinLLMModel(nn.Module):
                         dtype=self.go_projection[0].weight.dtype,
                     )
                     reduced_embeddings = self.go_projection(reduced_embeddings)  # (200, text_hidden_size)
+                    reduced_embeddings = self._sanitize_embedding_tensor(reduced_embeddings)
                 batch_go_embeddings.append(reduced_embeddings)
 
         return batch_go_embeddings
@@ -384,6 +389,11 @@ class ProteinLLMModel(nn.Module):
 
         self.go_embeddings_cache[aspect] = cached_embedding
         print(f"✅ Loaded checkpoint-bundled GO embedding cache from {cache_path} for aspect '{aspect}'")
+
+    @staticmethod
+    def _sanitize_embedding_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        """Clamp NaN/Inf values before they reach text generation."""
+        return torch.nan_to_num(tensor, nan=0.0, posinf=1e4, neginf=-1e4)
 
     def build_multimodal_cache(
         self,
@@ -486,6 +496,7 @@ class ProteinLLMModel(nn.Module):
                 diff = protein_embeds_flat - embeds_2d.index_select(0, idx)
                 embeds_2d = embeds_2d.scatter_add(0, idx.unsqueeze(1).expand(-1, hidden_size), diff)
                 text_inputs_embeds = embeds_2d.view(orig_shape)
+                text_inputs_embeds = self._sanitize_embedding_tensor(text_inputs_embeds)
 
         go_embeddings = multimodal_cache.get("go_embeddings")
         if go_embeddings:
@@ -509,6 +520,7 @@ class ProteinLLMModel(nn.Module):
                 diff = go_embeds_flat - embeds_2d.index_select(0, idx)
                 embeds_2d = embeds_2d.scatter_add(0, idx.unsqueeze(1).expand(-1, hidden_size), diff)
                 text_inputs_embeds = embeds_2d.view(orig_shape)
+                text_inputs_embeds = self._sanitize_embedding_tensor(text_inputs_embeds)
 
         return text_inputs_embeds
 
@@ -534,6 +546,7 @@ class ProteinLLMModel(nn.Module):
             structure_coords=structure_coords,
             go_aspects=go_aspects,
         )
+        text_inputs_embeds = self._sanitize_embedding_tensor(text_inputs_embeds)
         return {
             "inputs_embeds": text_inputs_embeds,
             "attention_mask": attention_mask,
@@ -707,6 +720,42 @@ class ProteinLLMModel(nn.Module):
                 base_model = getattr(self.text_model, "base_model", None)
                 if base_model is not None and hasattr(base_model, "_old_generate"):
                     generate_fn = base_model._old_generate
+
+        generation_config = generation_kwargs.get("generation_config")
+        if generation_config is None:
+            base_generation_config = getattr(self.text_model, "generation_config", None)
+            if base_generation_config is not None:
+                generation_config = copy.deepcopy(base_generation_config)
+
+        if generation_config is not None:
+            # Avoid re-applying model-config defaults inside transformers.generate();
+            # we explicitly control the per-call generation settings below.
+            if hasattr(generation_config, "_from_model_config"):
+                generation_config._from_model_config = False
+            for field_name in (
+                "do_sample",
+                "temperature",
+                "top_p",
+                "top_k",
+                "min_p",
+                "min_new_tokens",
+                "max_new_tokens",
+                "repetition_penalty",
+                "pad_token_id",
+                "eos_token_id",
+            ):
+                if field_name in generation_kwargs:
+                    setattr(generation_config, field_name, generation_kwargs[field_name])
+            if not bool(getattr(generation_config, "do_sample", do_sample)):
+                base_generation_config = getattr(self.text_model, "generation_config", None)
+                for field_name in ("temperature", "top_p", "top_k"):
+                    if base_generation_config is not None and hasattr(base_generation_config, field_name):
+                        setattr(generation_config, field_name, getattr(base_generation_config, field_name))
+                if hasattr(generation_config, "min_p"):
+                    generation_config.min_p = None
+            elif getattr(generation_config, "temperature", None) is None:
+                generation_config.temperature = 1.0
+            generation_kwargs["generation_config"] = generation_config
 
         with torch.inference_mode():
             outputs = generate_fn(

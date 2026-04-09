@@ -20,7 +20,12 @@ from bioreason2.dataset.prompts.cafa5 import (
     CAFA5_REASONING_TEMPLATE_SWISSPROT,
 )
 from bioreason2.dataset.cafa5.format import format_cafa5_for_protein_llm
-from bioreason2.dataset.utils import truncate_protein, ASPECT_ORDER, ASPECT_TO_COLUMN
+from bioreason2.dataset.utils import (
+    truncate_protein,
+    ASPECT_ORDER,
+    ASPECT_SUMMARY_TOKENS,
+    ASPECT_TO_COLUMN,
+)
 
 # disable_caching()  # Since multiple people might use the same cache directory
 
@@ -296,6 +301,39 @@ def _resolve_focus_aspect(example, ask_all_go_aspects=False):
     )
 
 
+def _resolve_focus_aspect_code(example, ask_all_go_aspects=False):
+    if ask_all_go_aspects:
+        return "MF/BP/CC"
+
+    go_aspect = _normalize_slot_text(example.get("go_aspect")).lower()
+    if go_aspect in {"mf", "bp", "cc"}:
+        return go_aspect.upper()
+    if go_aspect == "all":
+        return "MF/BP/CC"
+
+    present_codes = []
+    if example.get("go_mf"):
+        present_codes.append("MF")
+    if example.get("go_bp"):
+        present_codes.append("BP")
+    if example.get("go_cc"):
+        present_codes.append("CC")
+    return "/".join(present_codes) if present_codes else "MF/BP/CC"
+
+
+def _build_paper_compact_response_format(focus_aspect_code):
+    go_summary_start = ASPECT_SUMMARY_TOKENS["start"]
+    go_summary_end = ASPECT_SUMMARY_TOKENS["end"]
+    aspect_codes = [part.strip().upper() for part in str(focus_aspect_code).split("/") if part.strip()]
+    if not aspect_codes:
+        aspect_codes = ["MF", "BP", "CC"]
+    example_lines = [go_summary_start]
+    for aspect_code in aspect_codes:
+        example_lines.append(f"{aspect_code}: GO:0000000 (term name); GO:0000001 (term name)")
+    example_lines.append(go_summary_end)
+    return "\n".join(example_lines)
+
+
 def _format_reasoning_prompt(
     example,
     go_gpt_predictions_column=None,
@@ -378,6 +416,11 @@ def _format_reasoning_prompt(
             example,
             ask_all_go_aspects=ask_all_go_aspects,
         )
+        focus_aspect_code = _resolve_focus_aspect_code(
+            example,
+            ask_all_go_aspects=ask_all_go_aspects,
+        )
+        response_format_example = _build_paper_compact_response_format(focus_aspect_code)
         prompt_dict = {
             "system": CAFA5_REASONING_TEMPLATE_PAPER_COMPACT["system_prompt"],
             "user": CAFA5_REASONING_TEMPLATE_PAPER_COMPACT["user_prompt"].format(
@@ -388,6 +431,8 @@ def _format_reasoning_prompt(
                 go_bp_speculations=compact_go_speculations["BP"],
                 go_cc_speculations=compact_go_speculations["CC"],
                 focus_aspect=focus_aspect,
+                focus_aspect_code=focus_aspect_code,
+                response_format_example=response_format_example,
             ),
             "assistant_reasoning": example["reasoning"] if "reasoning" in example else "",
             "assistant_answer": example["final_answer"] if "final_answer" in example else "",

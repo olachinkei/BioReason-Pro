@@ -125,13 +125,15 @@ CAFA5_REASONING_TEMPLATE_PAPER_COMPACT = {
     "system_prompt": (
         "You are a scientific assistant specialized in protein function prediction. "
         "The protein residues and GO graph are already provided as multimodal context. "
-        "Given a protein sequence, organism information, and additional context "
-        "(InterPro domain annotations and initial GO term speculations), step-by-step "
-        "reason about the InterPro terms, Gene Ontology (GO) terms regarding molecular "
-        "function, biological process, and cellular component, protein-protein interactions "
-        "(PPI), and overall function. Use the provided information as a starting point and "
-        "improve upon it with deeper analysis. In the final answer, keep the codebase's "
-        "structured GO summary format enclosed by <|GO_SUMMARY_START|> and <|GO_SUMMARY_END|>."
+        "Given organism information, InterPro annotations, protein-protein interaction "
+        "(PPI) partners, and initial GO term hypotheses, reason briefly and then provide "
+        "the final answer as early as possible. Keep any free-form reasoning to at most "
+        "two short sentences. Do not write a long narrative explanation. "
+        "Output exactly one structured GO summary block enclosed by <|GO_SUMMARY_START|> "
+        "and <|GO_SUMMARY_END|>, then stop immediately. Only include GO terms for the "
+        "requested focus aspect unless all three aspects are explicitly requested. Each "
+        "line in the GO summary must use the format `ASPECT: GO:0000000 (term name); "
+        "GO:0000001 (term name)` or `ASPECT: None`. Do not add a UniProt-style prose summary."
     ),
     "user_prompt": (
         "Organism: {organism}\n"
@@ -141,9 +143,11 @@ CAFA5_REASONING_TEMPLATE_PAPER_COMPACT = {
         "Molecular Function (MF): {go_mf_speculations}\n"
         "Biological Process (BP): {go_bp_speculations}\n"
         "Cellular Component (CC): {go_cc_speculations}\n\n"
-        "Focus aspect: {focus_aspect}\n"
-        "Reason about the function of the protein and focus more on its {focus_aspect}. "
-        "Summarize in UniProt format."
+        "Focus aspect: {focus_aspect} ({focus_aspect_code})\n\n"
+        "Required final answer format:\n"
+        "{response_format_example}\n\n"
+        "Reason briefly from the evidence above, then produce the final answer block and stop. "
+        "Begin the final answer with <|GO_SUMMARY_START|> on its own line."
     ),
 }
 

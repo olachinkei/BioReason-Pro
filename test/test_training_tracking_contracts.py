@@ -177,7 +177,7 @@ class TrainingTrackingContractsTest(unittest.TestCase):
             steps_per_generation=2,
             num_iterations=1,
             num_generations=24,
-            max_new_tokens=512,
+            max_new_tokens=10000,
             rollout_logprob_microbatch_size=4,
             temperature=1.0,
             top_p=0.95,
@@ -192,7 +192,7 @@ class TrainingTrackingContractsTest(unittest.TestCase):
             reward_weights="1.0",
             reward_scaling="batch",
             reward_final_answer_only=False,
-            reward_prediction_source="reasoning_trace",
+            reward_prediction_source="final_answer",
             ia_file_path="/tmp/IA.txt",
             require_ia_file=True,
             advantage_epsilon_std=1e-6,
@@ -250,7 +250,7 @@ class TrainingTrackingContractsTest(unittest.TestCase):
         self.assertEqual(config["steps_per_generation"], 2)
         self.assertEqual(config["num_iterations"], 1)
         self.assertEqual(config["num_generations"], 24)
-        self.assertEqual(config["max_new_tokens"], 512)
+        self.assertEqual(config["max_new_tokens"], 10000)
         self.assertEqual(config["rollout_logprob_microbatch_size"], 4)
         self.assertEqual(config["temperature"], 1.0)
         self.assertEqual(config["top_p"], 0.95)
@@ -265,7 +265,7 @@ class TrainingTrackingContractsTest(unittest.TestCase):
         self.assertEqual(config["reward_weights"], "1.0")
         self.assertEqual(config["reward_scaling"], "batch")
         self.assertFalse(config["reward_final_answer_only"])
-        self.assertEqual(config["reward_prediction_source"], "reasoning_trace")
+        self.assertEqual(config["reward_prediction_source"], "final_answer")
         self.assertEqual(config["ia_file_path"], "/tmp/IA.txt")
         self.assertTrue(config["require_ia_file"])
         self.assertEqual(config["importance_sampling_level"], "sequence")

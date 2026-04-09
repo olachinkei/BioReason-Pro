@@ -70,7 +70,7 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertIn('REWARD_SCALING=${REWARD_SCALING:-"batch"}', wrapper_text)
         self.assertIn('IMPORTANCE_SAMPLING_CAP=${IMPORTANCE_SAMPLING_CAP:-2.0}', wrapper_text)
         self.assertIn('REWARD_FINAL_ANSWER_ONLY=${REWARD_FINAL_ANSWER_ONLY:-"False"}', wrapper_text)
-        self.assertIn('REWARD_PREDICTION_SOURCE=${REWARD_PREDICTION_SOURCE:-"reasoning_trace"}', wrapper_text)
+        self.assertIn('REWARD_PREDICTION_SOURCE=${REWARD_PREDICTION_SOURCE:-"final_answer"}', wrapper_text)
         self.assertIn('REWARD_FUNCS=${REWARD_FUNCS:-"ia_weighted_f1"}', wrapper_text)
         self.assertIn('REWARD_WEIGHTS=${REWARD_WEIGHTS:-"1.0"}', wrapper_text)
         self.assertIn('PYTHON_BIN=${PYTHON_BIN:-""}', wrapper_text)
@@ -85,8 +85,10 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertIn('COMPACT_PPI_LIMIT=${COMPACT_PPI_LIMIT:-10}', wrapper_text)
         self.assertIn('COMPACT_GO_SPECULATION_LIMIT=${COMPACT_GO_SPECULATION_LIMIT:-8}', wrapper_text)
         self.assertIn('MIN_NEW_TOKENS=${MIN_NEW_TOKENS:-1}', wrapper_text)
-        self.assertIn('MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-512}', wrapper_text)
-        self.assertIn('ROLLOUT_LOGPROB_MICROBATCH_SIZE=${ROLLOUT_LOGPROB_MICROBATCH_SIZE:-4}', wrapper_text)
+        self.assertIn('MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-10000}', wrapper_text)
+        self.assertIn('if [ -z "${ROLLOUT_LOGPROB_MICROBATCH_SIZE+x}" ]; then', wrapper_text)
+        self.assertIn('ROLLOUT_LOGPROB_MICROBATCH_SIZE=1', wrapper_text)
+        self.assertIn('ROLLOUT_LOGPROB_MICROBATCH_SIZE=4', wrapper_text)
         self.assertIn('TEMPERATURE=${TEMPERATURE:-1.0}', wrapper_text)
         self.assertIn('TOP_P=${TOP_P:-0.95}', wrapper_text)
         self.assertIn('TOP_K=${TOP_K:-20}', wrapper_text)
@@ -161,7 +163,8 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         completion = "<think>Reasoning mentions GO:0007165.</think><answer>GO:0005515</answer>"
         sample_meta = {"go_bp": "GO:0007165"}
 
-        self.assertGreater(GRPO.go_overlap_reward(completion, sample_meta), 0.0)
+        with mock.patch.dict(GRPO.REWARD_CONTEXT, {"reward_prediction_source": "reasoning_trace"}):
+            self.assertGreater(GRPO.go_overlap_reward(completion, sample_meta), 0.0)
 
     def test_strict_format_reward_rejects_structural_tag_noise(self):
         completion = "<think>reasoning</think></tool_call>"
@@ -205,6 +208,24 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
 
         self.assertGreater(GRPO.go_presence_reward(completion, {"go_bp": "GO:0007165"}), 0.0)
 
+    def test_build_generation_kwargs_omits_sampling_controls_for_greedy_eval(self):
+        args = GRPO.parse_args(
+            [
+                "--text_model_name",
+                "hf-model",
+                "--eval_do_sample",
+                "false",
+            ]
+        )
+        tokenizer = type("Tokenizer", (), {"pad_token_id": 0, "eos_token_id": 1, "encode": lambda self, text, add_special_tokens=False: [1]})()
+
+        kwargs = GRPO.build_generation_kwargs(args, tokenizer, for_eval=True)
+
+        self.assertFalse(kwargs["do_sample"])
+        self.assertNotIn("temperature", kwargs)
+        self.assertNotIn("top_p", kwargs)
+        self.assertNotIn("top_k", kwargs)
+
     def test_go_aspect_coverage_reward_tracks_requested_aspects(self):
         completion = (
             "<think>reasoning</think>"
@@ -220,12 +241,12 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
             2.0 / 3.0,
         )
 
-    def test_inspect_completion_uses_reasoning_trace_go_ids_by_default(self):
+    def test_inspect_completion_uses_final_answer_go_ids_by_default(self):
         completion = "<think>reasoning</think>GO:0007165</tool_call>"
         meta = GRPO.inspect_completion(completion)
 
         self.assertEqual(meta["predicted_go_ids"], ["GO:0007165"])
-        self.assertEqual(meta["prediction_source"], "reasoning_trace")
+        self.assertEqual(meta["prediction_source"], "final_answer")
 
     def test_inspect_completion_in_reasoning_trace_mode_keeps_trace_go_ids(self):
         completion = (
@@ -236,7 +257,9 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
             "<|FUNCTION_SUMMARY_START|>\nSignal adaptor.\n<|FUNCTION_SUMMARY_END|>\n"
             "</answer>"
         )
-        meta = GRPO.inspect_completion(completion)
+        GRPO.inspect_completion_text.cache_clear()
+        with mock.patch.dict(GRPO.REWARD_CONTEXT, {"reward_prediction_source": "reasoning_trace"}):
+            meta = GRPO.inspect_completion(completion)
 
         self.assertIn("GO:0001111", meta["predicted_go_ids"])
         self.assertEqual(meta["prediction_source"], "reasoning_trace")
@@ -244,7 +267,8 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
     def test_go_overlap_reward_uses_reasoning_trace_go_ids(self):
         completion = "<think>reasoning</think><answer>GO:0007165</answer>"
 
-        self.assertGreater(GRPO.go_overlap_reward(completion, {"go_bp": "GO:0007165"}), 0.0)
+        with mock.patch.dict(GRPO.REWARD_CONTEXT, {"reward_prediction_source": "reasoning_trace"}):
+            self.assertGreater(GRPO.go_overlap_reward(completion, {"go_bp": "GO:0007165"}), 0.0)
 
     def test_go_overlap_reward_uses_full_completion_when_think_never_closes(self):
         completion = "<think>Reasoning cites GO:0007165 and GO:0005515"
@@ -347,7 +371,7 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertEqual(args.steps_per_generation, 2)
         self.assertEqual(args.num_iterations, 1)
         self.assertEqual(args.num_generations, 24)
-        self.assertEqual(args.max_new_tokens, 512)
+        self.assertEqual(args.max_new_tokens, 10000)
         self.assertEqual(args.rollout_logprob_microbatch_size, 4)
         self.assertEqual(args.temperature, 1.0)
         self.assertEqual(args.top_p, 0.95)
@@ -364,7 +388,7 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertEqual(args.rotating_eval_max_samples, 256)
         self.assertEqual(args.reward_funcs, "ia_weighted_f1")
         self.assertEqual(args.reward_weights, "1.0")
-        self.assertEqual(args.reward_prediction_source, "reasoning_trace")
+        self.assertEqual(args.reward_prediction_source, "final_answer")
         self.assertEqual(args.min_new_tokens, 1)
         self.assertEqual(args.reasoning_prompt_style, "paper_compact")
         self.assertEqual(args.compact_interpro_limit, 12)
@@ -422,6 +446,62 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertEqual(len(completion_ids_list), 2)
         self.assertTrue(torch.equal(completion_ids_list[0], torch.tensor([31, 32])))
         self.assertTrue(torch.equal(completion_ids_list[1], torch.tensor([41, 42])))
+
+    def test_build_rollout_observability_detects_summary_end_and_marker_index(self):
+        if torch is None:
+            self.skipTest("torch is not available in the contract test environment")
+
+        class FakeTokenizer:
+            eos_token_id = 99
+
+            def encode(self, text, add_special_tokens=False):
+                mapping = {
+                    GRPO.GO_SUMMARY_START: [7, 8],
+                }
+                return mapping.get(text, [])
+
+        completion_ids = torch.tensor([1, 7, 8, 3, 4])
+        completion_text = f"{GRPO.GO_SUMMARY_START}\nBP: GO:0007165\n{GRPO.GO_SUMMARY_END}"
+
+        observability = GRPO.build_rollout_observability(
+            FakeTokenizer(),
+            completion_ids,
+            completion_text,
+            total_reward=1.0,
+            max_new_tokens=10000,
+        )
+
+        self.assertEqual(observability["stop_reason"], "summary_end")
+        self.assertEqual(observability["first_go_summary_token_idx"], 1)
+        self.assertTrue(observability["has_go_summary_end"])
+        self.assertFalse(observability["max_new_tokens_hit"])
+        self.assertTrue(observability["reward_nonzero"])
+
+    def test_build_rollout_observability_detects_max_token_stop(self):
+        if torch is None:
+            self.skipTest("torch is not available in the contract test environment")
+
+        class FakeTokenizer:
+            eos_token_id = 99
+
+            def encode(self, text, add_special_tokens=False):
+                return []
+
+        completion_ids = torch.tensor([10, 11, 12, 13])
+
+        observability = GRPO.build_rollout_observability(
+            FakeTokenizer(),
+            completion_ids,
+            "plain reasoning without summary",
+            total_reward=0.0,
+            max_new_tokens=4,
+        )
+
+        self.assertEqual(observability["stop_reason"], "max_tokens")
+        self.assertEqual(observability["first_go_summary_token_idx"], -1)
+        self.assertFalse(observability["has_go_summary_end"])
+        self.assertTrue(observability["max_new_tokens_hit"])
+        self.assertFalse(observability["reward_nonzero"])
 
     def test_slice_rollout_group_reindexes_batch_idx_map_for_microbatches(self):
         if torch is None:
@@ -521,9 +601,9 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertEqual(len(model.generate_calls), 1)
         self.assertEqual(tuple(model.generate_calls[0]["input_ids"].shape), (2, 2))
         self.assertFalse(model.generate_calls[0]["do_sample"])
-        self.assertEqual(model.generate_calls[0]["temperature"], 0.1)
-        self.assertEqual(model.generate_calls[0]["top_p"], 0.9)
-        self.assertEqual(model.generate_calls[0]["top_k"], 20)
+        self.assertNotIn("temperature", model.generate_calls[0])
+        self.assertNotIn("top_p", model.generate_calls[0])
+        self.assertNotIn("top_k", model.generate_calls[0])
         self.assertEqual(model.generate_calls[0]["repetition_penalty"], 1.0)
         self.assertEqual(metrics["eval_completion_length"], 1.0)
         self.assertEqual(metrics["eval_data_step_num_datums"], 2.0)

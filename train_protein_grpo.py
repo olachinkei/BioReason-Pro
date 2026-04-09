@@ -20,6 +20,7 @@ import random
 import re
 import time
 import traceback
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
@@ -78,14 +79,26 @@ WANDB_BOOTSTRAP_METRICS = (
     "data_step_num_datums",
     "data_step_trainer_tokens",
     "data_step_num_update_passes",
+    "diagnostic/go_summary_end_rate",
+    "diagnostic/max_new_tokens_hit_rate",
+    "diagnostic/reward_nonzero_rate",
+    "diagnostic/filtered_rollout_rate",
+    "diagnostic/first_go_summary_token_idx_mean",
+    "diagnostic/stop_reason_summary_end_rate",
+    "diagnostic/stop_reason_eos_rate",
+    "diagnostic/stop_reason_max_tokens_rate",
+    "diagnostic/stop_reason_unknown_rate",
     "train_skipped_update",
 )
+
+_DISTRIBUTED_CONTROL_GROUP: Any = None
+_DISTRIBUTED_TIMEOUT_SECONDS = 600
 DEFAULT_GO_OBO_PATH = str((Path(__file__).resolve().parent / "bioreason2" / "dataset" / "go-basic.obo").resolve())
 REWARD_CONTEXT: Dict[str, Any] = {
     "go_obo_path": DEFAULT_GO_OBO_PATH if os.path.exists(DEFAULT_GO_OBO_PATH) else "",
     "ia_file_path": "",
     "reward_final_answer_only": False,
-    "reward_prediction_source": "reasoning_trace",
+    "reward_prediction_source": "final_answer",
 }
 
 
@@ -232,7 +245,7 @@ def extract_reward_prediction_text(text: Any) -> str:
     reward_context = resolve_reward_context()
     prediction_source = normalize_text(reward_context.get("reward_prediction_source")).strip().lower()
     if not prediction_source:
-        prediction_source = "structured_go_summary" if reward_context.get("reward_final_answer_only", False) else "reasoning_trace"
+        prediction_source = "structured_go_summary" if reward_context.get("reward_final_answer_only", False) else "final_answer"
 
     if prediction_source == "reasoning_trace":
         # The paper describes regex extraction from the generated reasoning trace.
@@ -244,9 +257,10 @@ def extract_reward_prediction_text(text: Any) -> str:
         final_answer = sections.get("final_answer", "").strip()
         if final_answer:
             return final_answer
-        if "</think>" in raw:
-            return raw.split("</think>", 1)[1].strip()
-        return raw
+        answer_match = ANSWER_TAG_PATTERN.search(raw)
+        if answer_match:
+            return answer_match.group(1).strip()
+        return ""
 
     structured_final_answer = extract_structured_final_answer(raw)
     if not structured_final_answer:
@@ -306,7 +320,7 @@ def configure_reward_context(args: argparse.Namespace) -> None:
     REWARD_CONTEXT["reward_final_answer_only"] = bool(getattr(args, "reward_final_answer_only", False))
     REWARD_CONTEXT["reward_prediction_source"] = (
         normalize_text(getattr(args, "reward_prediction_source", None)).strip().lower()
-        or ("structured_go_summary" if REWARD_CONTEXT["reward_final_answer_only"] else "reasoning_trace")
+        or ("structured_go_summary" if REWARD_CONTEXT["reward_final_answer_only"] else "final_answer")
     )
     inspect_completion_text.cache_clear()
 
@@ -839,18 +853,28 @@ def build_generation_kwargs(
     *,
     for_eval: bool,
 ) -> Dict[str, Any]:
+    do_sample = args.eval_do_sample if for_eval else args.do_sample
     generation_kwargs = {
-        "do_sample": args.eval_do_sample if for_eval else args.do_sample,
-        "temperature": args.eval_temperature if for_eval else args.temperature,
-        "top_p": args.eval_top_p if for_eval else args.top_p,
-        "top_k": args.eval_top_k if for_eval else args.top_k,
+        "do_sample": do_sample,
         "min_new_tokens": args.min_new_tokens,
         "max_new_tokens": args.max_new_tokens,
         "repetition_penalty": args.repetition_penalty,
         "pad_token_id": tokenizer.pad_token_id,
         "eos_token_id": tokenizer.eos_token_id,
+        "remove_invalid_values": True,
+        "renormalize_logits": True,
     }
-    if getattr(args, "min_p", 0.0) > 0.0:
+    if do_sample:
+        temperature = args.eval_temperature if for_eval else args.temperature
+        top_p = args.eval_top_p if for_eval else args.top_p
+        top_k = args.eval_top_k if for_eval else args.top_k
+        if temperature is not None:
+            generation_kwargs["temperature"] = temperature
+        if top_p is not None:
+            generation_kwargs["top_p"] = top_p
+        if top_k is not None:
+            generation_kwargs["top_k"] = top_k
+    if do_sample and getattr(args, "min_p", 0.0) > 0.0:
         generation_kwargs["min_p"] = args.min_p
     stopping_criteria = build_generation_stopping_criteria(tokenizer)
     if stopping_criteria is not None:
@@ -990,13 +1014,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--rotating_eval_seed_stride", type=int, default=9973)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--distributed_timeout_seconds", type=int, default=7200)
 
     parser.add_argument("--loss_type", type=str, default="dr_grpo", choices=["dr_grpo"])
     parser.add_argument("--steps_per_generation", type=int, default=2)
     parser.add_argument("--num_iterations", type=int, default=1)
     parser.add_argument("--num_generations", type=int, default=24)
     parser.add_argument("--min_new_tokens", type=int, default=1)
-    parser.add_argument("--max_new_tokens", type=int, default=512)
+    parser.add_argument("--max_new_tokens", type=int, default=10000)
+    parser.add_argument("--max_loss_completion_tokens", type=int, default=0)
     parser.add_argument("--rollout_logprob_microbatch_size", type=int, default=4)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top_p", type=float, default=0.95)
@@ -1018,7 +1044,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reward_prediction_source",
         type=str,
-        default="reasoning_trace",
+        default="final_answer",
         choices=["reasoning_trace", "final_answer", "structured_go_summary"],
     )
     parser.add_argument("--kl_beta", type=float, default=1e-4)
@@ -1143,12 +1169,16 @@ def distributed_barrier() -> None:
         return
     import torch.distributed as dist
 
-    dist.barrier()
+    if _DISTRIBUTED_CONTROL_GROUP is not None:
+        dist.barrier(group=_DISTRIBUTED_CONTROL_GROUP)
+    else:
+        dist.barrier()
 
 
 def distributed_reduce_tensor(tensor: Any, *, op: str = "sum") -> Any:
     if not is_distributed_enabled():
         return tensor
+    import torch
     import torch.distributed as dist
 
     if op == "sum":
@@ -1157,14 +1187,20 @@ def distributed_reduce_tensor(tensor: Any, *, op: str = "sum") -> Any:
         reduce_op = dist.ReduceOp.MAX
     else:
         raise ValueError(f"Unsupported distributed reduce op: {op}")
-    dist.all_reduce(tensor, op=reduce_op)
+    if _DISTRIBUTED_CONTROL_GROUP is not None:
+        reduced = tensor.detach().to(device=torch.device("cpu"), dtype=tensor.dtype)
+        dist.all_reduce(reduced, op=reduce_op, group=_DISTRIBUTED_CONTROL_GROUP)
+        tensor.copy_(reduced.to(device=tensor.device, dtype=tensor.dtype))
+    else:
+        dist.all_reduce(tensor, op=reduce_op)
     return tensor
 
 
 def distributed_sum_scalar(value: float, device: Any) -> float:
     import torch
 
-    tensor = torch.tensor(float(value), device=device, dtype=torch.float64)
+    tensor_device = torch.device("cpu") if _DISTRIBUTED_CONTROL_GROUP is not None else device
+    tensor = torch.tensor(float(value), device=tensor_device, dtype=torch.float64)
     distributed_reduce_tensor(tensor, op="sum")
     return float(tensor.item())
 
@@ -1172,13 +1208,15 @@ def distributed_sum_scalar(value: float, device: Any) -> float:
 def distributed_max_scalar(value: float, device: Any) -> float:
     import torch
 
-    tensor = torch.tensor(float(value), device=device, dtype=torch.float64)
+    tensor_device = torch.device("cpu") if _DISTRIBUTED_CONTROL_GROUP is not None else device
+    tensor = torch.tensor(float(value), device=tensor_device, dtype=torch.float64)
     distributed_reduce_tensor(tensor, op="max")
     return float(tensor.item())
 
 
-def init_distributed_runtime() -> Dict[str, Any]:
+def init_distributed_runtime(timeout_seconds: int = 600) -> Dict[str, Any]:
     import torch
+    global _DISTRIBUTED_CONTROL_GROUP, _DISTRIBUTED_TIMEOUT_SECONDS
 
     if not torch.cuda.is_available():
         raise RuntimeError("train_protein_grpo.py requires CUDA. Run it on the CoreWeave GPU cluster.")
@@ -1200,11 +1238,18 @@ def init_distributed_runtime() -> Dict[str, Any]:
         import torch.distributed as dist
 
         torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl", init_method="env://")
+        timeout = timedelta(seconds=max(int(timeout_seconds), 600))
+        dist.init_process_group(backend="nccl", init_method="env://", timeout=timeout)
+        _DISTRIBUTED_CONTROL_GROUP = dist.new_group(backend="gloo", timeout=timeout)
+        _DISTRIBUTED_TIMEOUT_SECONDS = int(timeout.total_seconds())
         runtime["backend"] = "nccl"
+        runtime["control_backend"] = "gloo"
+        runtime["timeout_seconds"] = _DISTRIBUTED_TIMEOUT_SECONDS
         runtime["device"] = torch.device("cuda", local_rank)
     else:
         torch.cuda.set_device(0)
+        runtime["control_backend"] = None
+        runtime["timeout_seconds"] = int(timeout_seconds)
         runtime["device"] = torch.device("cuda", 0)
 
     return runtime
@@ -1214,7 +1259,14 @@ def cleanup_distributed_runtime() -> None:
     if not is_distributed_enabled():
         return
     import torch.distributed as dist
+    global _DISTRIBUTED_CONTROL_GROUP
 
+    if _DISTRIBUTED_CONTROL_GROUP is not None:
+        try:
+            dist.destroy_process_group(_DISTRIBUTED_CONTROL_GROUP)
+        except Exception:
+            pass
+        _DISTRIBUTED_CONTROL_GROUP = None
     dist.destroy_process_group()
 
 
@@ -1608,6 +1660,66 @@ def decode_completion(tokenizer: Any, completion_ids: Any) -> str:
     return text
 
 
+def find_token_subsequence_index(token_ids: Sequence[int], subsequence: Sequence[int]) -> int:
+    if not token_ids or not subsequence or len(subsequence) > len(token_ids):
+        return -1
+    last_start = len(token_ids) - len(subsequence)
+    for start_idx in range(last_start + 1):
+        if list(token_ids[start_idx : start_idx + len(subsequence)]) == list(subsequence):
+            return start_idx
+    return -1
+
+
+def find_marker_token_index(tokenizer: Any, completion_ids: Any, marker: str) -> int:
+    marker_ids = tokenizer.encode(marker, add_special_tokens=False)
+    if not marker_ids:
+        return -1
+    token_list = [int(token_id) for token_id in completion_ids.detach().cpu().tolist()]
+    return find_token_subsequence_index(token_list, [int(token_id) for token_id in marker_ids])
+
+
+def infer_rollout_stop_reason(
+    tokenizer: Any,
+    completion_ids: Any,
+    completion_text: str,
+    *,
+    max_new_tokens: int,
+) -> str:
+    if GO_SUMMARY_END in completion_text:
+        return "summary_end"
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_token_id is not None and completion_ids.numel() > 0 and int(completion_ids[-1].item()) == int(eos_token_id):
+        return "eos"
+    if completion_ids.numel() >= max(int(max_new_tokens), 0):
+        return "max_tokens"
+    return "unknown"
+
+
+def build_rollout_observability(
+    tokenizer: Any,
+    completion_ids: Any,
+    completion_text: str,
+    *,
+    total_reward: Optional[float] = None,
+    max_new_tokens: int,
+) -> Dict[str, Any]:
+    stop_reason = infer_rollout_stop_reason(
+        tokenizer,
+        completion_ids,
+        completion_text,
+        max_new_tokens=max_new_tokens,
+    )
+    first_go_summary_token_idx = find_marker_token_index(tokenizer, completion_ids, GO_SUMMARY_START)
+    return {
+        "completion_token_count": int(completion_ids.numel()),
+        "stop_reason": stop_reason,
+        "max_new_tokens_hit": bool(stop_reason == "max_tokens"),
+        "has_go_summary_end": bool(GO_SUMMARY_END in completion_text),
+        "first_go_summary_token_idx": int(first_go_summary_token_idx),
+        "reward_nonzero": bool(total_reward is not None and float(total_reward) != 0.0),
+    }
+
+
 def extract_completion_ids(generated_ids: Any, prompt_input_ids: Any) -> Any:
     """Handle both prompt-inclusive and completion-only outputs from generate()."""
     import torch
@@ -1774,6 +1886,90 @@ def slice_rollout_group(
         "go_aspects": list(rollout_group["go_aspects"][start_idx:end_idx]),
         "multimodal_cache": sliced_multimodal_cache,
     }
+
+
+def index_rollout_group(
+    rollout_group: Mapping[str, Any],
+    rollout_indices: Sequence[int],
+) -> Dict[str, Any]:
+    import torch
+
+    indices = [int(idx) for idx in rollout_indices]
+    total_rollouts = int(rollout_group["combined_input_ids"].shape[0])
+    if not indices:
+        raise ValueError("rollout_indices must not be empty")
+    if min(indices) < 0 or max(indices) >= total_rollouts:
+        raise ValueError(f"Invalid rollout indices {indices} for {total_rollouts} rollouts")
+
+    protein_sequences = list(rollout_group.get("protein_sequences") or [])
+    batch_idx_map = list(rollout_group.get("batch_idx_map") or [])
+    proteins_per_rollout = 0
+    if total_rollouts > 0 and protein_sequences:
+        if len(protein_sequences) % total_rollouts != 0:
+            raise ValueError("protein_sequences length must divide evenly across rollout count")
+        proteins_per_rollout = len(protein_sequences) // total_rollouts
+    elif total_rollouts > 0 and batch_idx_map:
+        if len(batch_idx_map) % total_rollouts != 0:
+            raise ValueError("batch_idx_map length must divide evenly across rollout count")
+        proteins_per_rollout = len(batch_idx_map) // total_rollouts
+
+    indexed_sequences: List[str] = []
+    indexed_batch_idx_map: List[int] = []
+    if proteins_per_rollout > 0:
+        for local_idx, rollout_idx in enumerate(indices):
+            protein_start = rollout_idx * proteins_per_rollout
+            protein_end = protein_start + proteins_per_rollout
+            indexed_sequences.extend(protein_sequences[protein_start:protein_end])
+            indexed_batch_idx_map.extend([local_idx] * proteins_per_rollout)
+
+    structure_coords = rollout_group.get("structure_coords")
+    index_tensor = torch.tensor(indices, device=rollout_group["combined_input_ids"].device, dtype=torch.long)
+    if hasattr(structure_coords, "shape") and getattr(structure_coords, "shape", None):
+        if int(structure_coords.shape[0]) == total_rollouts:
+            structure_coords = structure_coords.index_select(0, index_tensor.to(structure_coords.device))
+    elif isinstance(structure_coords, list) and len(structure_coords) == total_rollouts:
+        structure_coords = [structure_coords[idx] for idx in indices]
+
+    multimodal_cache = rollout_group.get("multimodal_cache")
+    indexed_multimodal_cache = None
+    if isinstance(multimodal_cache, Mapping):
+        indexed_multimodal_cache = {
+            "batch_size": len(indices),
+            "protein_embeddings": None,
+            "go_embeddings": None,
+        }
+        protein_embeddings = multimodal_cache.get("protein_embeddings")
+        if isinstance(protein_embeddings, list):
+            indexed_multimodal_cache["protein_embeddings"] = [protein_embeddings[idx] for idx in indices]
+        go_embeddings = multimodal_cache.get("go_embeddings")
+        if isinstance(go_embeddings, list):
+            indexed_multimodal_cache["go_embeddings"] = [go_embeddings[idx] for idx in indices]
+
+    return {
+        "combined_input_ids": rollout_group["combined_input_ids"].index_select(0, index_tensor),
+        "combined_attention_mask": rollout_group["combined_attention_mask"].index_select(0, index_tensor),
+        "completion_attention": rollout_group["completion_attention"].index_select(0, index_tensor),
+        "prompt_token_len": rollout_group["prompt_token_len"],
+        "protein_sequences": indexed_sequences,
+        "batch_idx_map": indexed_batch_idx_map,
+        "structure_coords": structure_coords,
+        "go_aspects": [rollout_group["go_aspects"][idx] for idx in indices],
+        "multimodal_cache": indexed_multimodal_cache,
+    }
+
+
+def select_rollout_indices_for_loss(
+    completion_ids_list: Sequence[Any],
+    *,
+    max_loss_completion_tokens: int,
+) -> List[int]:
+    if max_loss_completion_tokens <= 0:
+        return list(range(len(completion_ids_list)))
+    selected_indices: List[int] = []
+    for rollout_idx, completion_ids in enumerate(completion_ids_list):
+        if int(completion_ids.numel()) <= int(max_loss_completion_tokens):
+            selected_indices.append(rollout_idx)
+    return selected_indices
 
 
 def build_combined_inputs(prompt_input_ids: Any, prompt_attention_mask: Any, completion_ids: Any) -> Tuple[Any, Any, int]:
@@ -2026,12 +2222,40 @@ def compute_group_policy_losses_batched(
 ) -> Tuple[Any, Dict[str, float], bool]:
     import torch
 
+    selected_indices = select_rollout_indices_for_loss(
+        completion_ids_list,
+        max_loss_completion_tokens=int(getattr(args, "max_loss_completion_tokens", 0)),
+    )
+    filtered_rollouts = float(len(completion_ids_list) - len(selected_indices))
+    if not selected_indices:
+        return (
+            torch.tensor(0.0, device=example["input_ids"].device),
+            {"filtered_rollouts": filtered_rollouts, "valid_rollouts": 0.0},
+            False,
+        )
+
+    if len(selected_indices) != len(completion_ids_list):
+        completion_ids_list = [completion_ids_list[idx] for idx in selected_indices]
+        advantages = [advantages[idx] for idx in selected_indices]
+        old_sequence_log_probs = [old_sequence_log_probs[idx] for idx in selected_indices]
+        if rollout_group is not None:
+            rollout_group = index_rollout_group(rollout_group, selected_indices)
+        if cached_ref_log_probs is not None:
+            cached_ref_log_probs = cached_ref_log_probs.index_select(
+                0,
+                torch.tensor(selected_indices, device=cached_ref_log_probs.device, dtype=torch.long),
+            )
+
     if rollout_group is None:
         rollout_group = build_rollout_group_inputs(example, completion_ids_list, pad_token_id)
     valid_mask = rollout_group["completion_attention"].bool()
     nonempty_rollouts = valid_mask.any(dim=1)
     if not torch.any(nonempty_rollouts):
-        return torch.tensor(0.0, device=example["input_ids"].device), {}, False
+        return (
+            torch.tensor(0.0, device=example["input_ids"].device),
+            {"filtered_rollouts": filtered_rollouts, "valid_rollouts": 0.0},
+            False,
+        )
 
     current_log_probs, current_sequence_log_probs, valid_counts = compute_rollout_policy_statistics(
         model,
@@ -2083,6 +2307,7 @@ def compute_group_policy_losses_batched(
         "ratio_mean": float(ratio[nonempty_rollouts].mean().detach().item()),
         "ratio_max": float(ratio[nonempty_rollouts].max().detach().item()),
         "valid_rollouts": float(nonempty_rollouts.sum().item()),
+        "filtered_rollouts": filtered_rollouts,
     }
     return nonempty_losses.mean(), metrics, True
 
@@ -2103,10 +2328,16 @@ def compute_group_policy_losses_sequential(
     losses: List[Any] = []
     kl_values: List[float] = []
     ratio_values: List[float] = []
+    filtered_rollouts = 0.0
     trainable = False
     for rollout_idx, (completion_ids, advantage, old_sequence_log_prob) in enumerate(
         zip(completion_ids_list, advantages, old_sequence_log_probs)
     ):
+        if int(getattr(args, "max_loss_completion_tokens", 0)) > 0 and int(completion_ids.numel()) > int(
+            getattr(args, "max_loss_completion_tokens", 0)
+        ):
+            filtered_rollouts += 1.0
+            continue
         if completion_ids.numel() <= 0:
             continue
         trainable = True
@@ -2163,12 +2394,17 @@ def compute_group_policy_losses_sequential(
         ratio_values.append(float(ratio.detach().item()))
 
     if not losses:
-        return torch.tensor(0.0, device=example["input_ids"].device), {}, False
+        return (
+            torch.tensor(0.0, device=example["input_ids"].device),
+            {"filtered_rollouts": filtered_rollouts, "valid_rollouts": 0.0},
+            False,
+        )
     metrics = {
         "kl_mean": sum(kl_values) / len(kl_values),
         "ratio_mean": sum(ratio_values) / len(ratio_values),
         "ratio_max": max(ratio_values),
         "valid_rollouts": float(len(losses)),
+        "filtered_rollouts": filtered_rollouts,
     }
     return torch.stack(losses).mean(), metrics, trainable
 
@@ -2229,6 +2465,21 @@ def generate_rollouts_for_example(
     rollout_batch = expand_example_for_rollouts(example, args.num_generations)
     rollout_multimodal_cache = expand_single_example_multimodal_cache(model, example_multimodal_cache, args.num_generations)
     generation_kwargs = build_generation_kwargs(args, tokenizer, for_eval=False)
+    if is_distributed_enabled():
+        print(
+            "Distributed RL rollout generation is using sequential mode for stability: "
+            f"global_step={global_step}, epoch={epoch_idx}, num_generations={args.num_generations}"
+        )
+        return generate_rollouts_sequential(
+            model,
+            example,
+            tokenizer,
+            args,
+            global_step=global_step,
+            epoch_idx=epoch_idx,
+            prompt_len=prompt_len,
+            example_multimodal_cache=example_multimodal_cache,
+        )
     try:
         print(
             "Generating RL rollout batch: "
@@ -2312,10 +2563,13 @@ def evaluate_policy_example(
         split=trace_split_name,
         global_step=global_step,
         sample_meta=example["sample_meta"],
+        tokenizer=tokenizer,
+        completion_ids=completion_ids,
         completion=completion_text,
         total_reward=rewards[0],
         advantage=None,
         reward_components={name: scores[0] for name, scores in reward_components.items()},
+        max_new_tokens=args.max_new_tokens,
     )
 
     kl_value = 0.0
@@ -2408,10 +2662,13 @@ def evaluate_policy_batch(
             split=trace_split_name,
             global_step=global_step,
             sample_meta=sample_meta,
+            tokenizer=tokenizer,
+            completion_ids=completion_ids,
             completion=completion_text,
             total_reward=rewards[0],
             advantage=None,
             reward_components={name: scores[0] for name, scores in reward_components.items()},
+            max_new_tokens=args.max_new_tokens,
         )
 
     pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
@@ -2652,16 +2909,26 @@ def maybe_trace_generation(
     split: str,
     global_step: int,
     sample_meta: Mapping[str, Any],
+    tokenizer: Any,
+    completion_ids: Any,
     completion: str,
     total_reward: float,
     advantage: Optional[float] = None,
     reward_components: Optional[Mapping[str, float]] = None,
+    max_new_tokens: int,
 ) -> None:
     if not trace_state or trace_state.get("remaining_budget", 0) <= 0:
         return
 
     trace_state["remaining_budget"] -= 1
     meta = inspect_completion(completion)
+    observability = build_rollout_observability(
+        tokenizer,
+        completion_ids,
+        completion,
+        total_reward=total_reward,
+        max_new_tokens=max_new_tokens,
+    )
     payload = {
         "split": split,
         "global_step": int(global_step),
@@ -2684,6 +2951,11 @@ def maybe_trace_generation(
         "final_answer_clean": bool(meta["final_answer_clean"]),
         "structural_noise_count": int(meta["structural_noise_count"]),
         "predicted_go_id_count": int(len(meta["predicted_go_ids"])),
+        "completion_token_count": int(observability["completion_token_count"]),
+        "stop_reason": observability["stop_reason"],
+        "max_new_tokens_hit": bool(observability["max_new_tokens_hit"]),
+        "has_go_summary_end": bool(observability["has_go_summary_end"]),
+        "first_go_summary_token_idx": int(observability["first_go_summary_token_idx"]),
         "requested_go_aspects": build_requested_go_aspects(sample_meta),
         "target_go_ids": build_target_go_ids(sample_meta),
         "reward_total": float(total_reward),
@@ -2897,7 +3169,7 @@ def train(args: argparse.Namespace) -> None:
         prepare_model_artifact_directory,
         sync_run_config,
     )
-    distributed = init_distributed_runtime()
+    distributed = init_distributed_runtime(args.distributed_timeout_seconds)
     device = distributed["device"]
     rank = distributed["rank"]
     world_size = distributed["world_size"]
@@ -2919,6 +3191,10 @@ def train(args: argparse.Namespace) -> None:
     tracking_config.update(batch_semantics)
     tracking_config["distributed_enabled"] = distributed["enabled"]
     tracking_config["distributed_strategy"] = "single_node_ddp" if distributed["enabled"] else "single_gpu"
+    tracking_config["distributed_timeout_seconds"] = distributed.get(
+        "timeout_seconds",
+        int(getattr(args, "distributed_timeout_seconds", 7200)),
+    )
     tracking_config["multimodal_cache_enabled"] = can_cache_multimodal_prefix(args)
     tracking_config["ref_logprob_cache_enabled"] = bool(args.kl_beta > 0)
 
@@ -3108,6 +3384,17 @@ def train(args: argparse.Namespace) -> None:
                     reward_name: [] for reward_name in DIAGNOSTIC_REWARD_NAMES
                 }
                 completion_lengths: List[int] = []
+                stop_reason_counts: Dict[str, float] = {
+                    "summary_end": 0.0,
+                    "eos": 0.0,
+                    "max_tokens": 0.0,
+                    "unknown": 0.0,
+                }
+                go_summary_end_hits = 0.0
+                max_new_tokens_hits = 0.0
+                reward_nonzero_hits = 0.0
+                filtered_rollout_hits = 0.0
+                first_go_summary_token_indices: List[float] = []
                 kl_values: List[float] = []
                 ratio_means: List[float] = []
                 ratio_maxes: List[float] = []
@@ -3189,6 +3476,29 @@ def train(args: argparse.Namespace) -> None:
                     for reward_name, scores in diagnostic_components.items():
                         diagnostic_component_scores.setdefault(reward_name, []).extend(scores)
                     reward_totals.extend(total_rewards)
+                    for completion_ids, completion_text, total_reward in zip(
+                        completion_ids_list,
+                        completions,
+                        total_rewards,
+                    ):
+                        observability = build_rollout_observability(
+                            tokenizer,
+                            completion_ids,
+                            completion_text,
+                            total_reward=total_reward,
+                            max_new_tokens=args.max_new_tokens,
+                        )
+                        stop_reason = normalize_text(observability["stop_reason"]).strip().lower() or "unknown"
+                        stop_reason_counts.setdefault(stop_reason, 0.0)
+                        stop_reason_counts[stop_reason] += 1.0
+                        if observability["has_go_summary_end"]:
+                            go_summary_end_hits += 1.0
+                        if observability["max_new_tokens_hit"]:
+                            max_new_tokens_hits += 1.0
+                        if observability["reward_nonzero"]:
+                            reward_nonzero_hits += 1.0
+                        if observability["first_go_summary_token_idx"] >= 0:
+                            first_go_summary_token_indices.append(float(observability["first_go_summary_token_idx"]))
 
                 grouped_advantages, global_reward_std = compute_batch_relative_advantages(
                     grouped_rewards,
@@ -3215,6 +3525,8 @@ def train(args: argparse.Namespace) -> None:
                             split="train",
                             global_step=global_step,
                             sample_meta=record["example"]["sample_meta"],
+                            tokenizer=tokenizer,
+                            completion_ids=record["completion_ids_list"][rollout_idx],
                             completion=record["completions"][rollout_idx],
                             total_reward=record["total_rewards"][rollout_idx] if record["total_rewards"] else 0.0,
                             advantage=advantages[rollout_idx] if advantages else None,
@@ -3222,6 +3534,7 @@ def train(args: argparse.Namespace) -> None:
                                 reward_name: record["reward_components"][reward_name][rollout_idx]
                                 for reward_name in record["reward_components"]
                             },
+                            max_new_tokens=args.max_new_tokens,
                         )
 
                 global_trainable_group_count = int(round(distributed_sum_scalar(float(local_trainable_group_count), device)))
@@ -3249,8 +3562,40 @@ def train(args: argparse.Namespace) -> None:
                         "data_step_trainer_tokens": global_tokens_rank_sum,
                         "reward": aggregate_mean_metric(sum(reward_totals), float(len(reward_totals)), device),
                         "reward_std_dev": float(global_reward_std),
+                        "diagnostic/go_summary_end_rate": aggregate_mean_metric(
+                            go_summary_end_hits,
+                            float(len(reward_totals)),
+                            device,
+                        ),
+                        "diagnostic/max_new_tokens_hit_rate": aggregate_mean_metric(
+                            max_new_tokens_hits,
+                            float(len(reward_totals)),
+                            device,
+                        ),
+                        "diagnostic/reward_nonzero_rate": aggregate_mean_metric(
+                            reward_nonzero_hits,
+                            float(len(reward_totals)),
+                            device,
+                        ),
+                        "diagnostic/filtered_rollout_rate": aggregate_mean_metric(
+                            filtered_rollout_hits,
+                            float(len(reward_totals)),
+                            device,
+                        ),
                         "train_skipped_update": 1.0,
                     }
+                    if first_go_summary_token_indices:
+                        skipped_payload["diagnostic/first_go_summary_token_idx_mean"] = aggregate_mean_metric(
+                            sum(first_go_summary_token_indices),
+                            float(len(first_go_summary_token_indices)),
+                            device,
+                        )
+                    for stop_reason, count in stop_reason_counts.items():
+                        skipped_payload[f"diagnostic/stop_reason_{stop_reason}_rate"] = aggregate_mean_metric(
+                            count,
+                            float(len(reward_totals)),
+                            device,
+                        )
                     for reward_name, scores in reward_component_scores.items():
                         if scores:
                             skipped_payload[f"reward_component/{reward_name}"] = aggregate_mean_metric(
@@ -3328,12 +3673,16 @@ def train(args: argparse.Namespace) -> None:
                                 )
 
                             if not has_trainable_rollout:
+                                if group_metrics and "filtered_rollouts" in group_metrics:
+                                    filtered_rollout_hits += float(group_metrics["filtered_rollouts"])
                                 continue
 
                             local_backward_terms.append(group_loss / max(float(global_trainable_group_count), 1.0))
                             update_loss_accumulator += float(group_loss.detach().item())
                             update_trainable_groups += 1
                             if group_metrics:
+                                if "filtered_rollouts" in group_metrics:
+                                    filtered_rollout_hits += float(group_metrics["filtered_rollouts"])
                                 if "kl_mean" in group_metrics:
                                     kl_values.append(float(group_metrics["kl_mean"]))
                                 if "ratio_mean" in group_metrics:
@@ -3368,6 +3717,26 @@ def train(args: argparse.Namespace) -> None:
                     "loss_train": (loss_train_sum / loss_train_count) if loss_train_count > 0 else 0.0,
                     "reward": aggregate_mean_metric(sum(reward_totals), float(len(reward_totals)), device),
                     "reward_std_dev": float(global_reward_std),
+                    "diagnostic/go_summary_end_rate": aggregate_mean_metric(
+                        go_summary_end_hits,
+                        float(len(reward_totals)),
+                        device,
+                    ),
+                    "diagnostic/max_new_tokens_hit_rate": aggregate_mean_metric(
+                        max_new_tokens_hits,
+                        float(len(reward_totals)),
+                        device,
+                    ),
+                    "diagnostic/reward_nonzero_rate": aggregate_mean_metric(
+                        reward_nonzero_hits,
+                        float(len(reward_totals)),
+                        device,
+                    ),
+                    "diagnostic/filtered_rollout_rate": aggregate_mean_metric(
+                        filtered_rollout_hits,
+                        float(len(reward_totals)),
+                        device,
+                    ),
                     "loss_kl_div": aggregate_mean_metric(sum(kl_values), float(len(kl_values)), device),
                     "loss_policy_ratio_mean": aggregate_mean_metric(sum(ratio_means), float(len(ratio_means)), device),
                     "loss_policy_ratio_max": distributed_max_scalar(max(ratio_maxes) if ratio_maxes else 0.0, device),
@@ -3384,6 +3753,18 @@ def train(args: argparse.Namespace) -> None:
                     "data_step_num_update_passes": float(total_update_passes),
                     "train_skipped_update": 0.0,
                 }
+                if first_go_summary_token_indices:
+                    log_payload["diagnostic/first_go_summary_token_idx_mean"] = aggregate_mean_metric(
+                        sum(first_go_summary_token_indices),
+                        float(len(first_go_summary_token_indices)),
+                        device,
+                    )
+                for stop_reason, count in stop_reason_counts.items():
+                    log_payload[f"diagnostic/stop_reason_{stop_reason}_rate"] = aggregate_mean_metric(
+                        count,
+                        float(len(reward_totals)),
+                        device,
+                    )
                 for reward_name, scores in reward_component_scores.items():
                     if not scores:
                         continue
