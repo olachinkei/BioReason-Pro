@@ -45,6 +45,20 @@ GO_NAMESPACE_TO_ASPECT = {
     "biological_process": "BP",
     "cellular_component": "CC",
 }
+CONTINUATION_MODE_PAPER_NATIVE = "paper_native"
+CONTINUATION_MODE_REPO_STRUCTURED = "repo_structured"
+CONTINUATION_MODE_CHOICES = (
+    CONTINUATION_MODE_PAPER_NATIVE,
+    CONTINUATION_MODE_REPO_STRUCTURED,
+)
+REASONING_PROMPT_STYLE_DEFAULTS = {
+    CONTINUATION_MODE_PAPER_NATIVE: "paper_native",
+    CONTINUATION_MODE_REPO_STRUCTURED: "paper_compact",
+}
+SAMPLING_CONTRACT_DEFAULTS = {
+    CONTINUATION_MODE_PAPER_NATIVE: "checkpoint_native",
+    CONTINUATION_MODE_REPO_STRUCTURED: "explicit",
+}
 TERMINAL_SUMMARY_MARKERS = (
     GO_SUMMARY_END,
     "</answer>",
@@ -98,7 +112,8 @@ REWARD_CONTEXT: Dict[str, Any] = {
     "go_obo_path": DEFAULT_GO_OBO_PATH if os.path.exists(DEFAULT_GO_OBO_PATH) else "",
     "ia_file_path": "",
     "reward_final_answer_only": False,
-    "reward_prediction_source": "final_answer",
+    "reward_prediction_source": "reasoning_trace",
+    "continuation_mode": CONTINUATION_MODE_PAPER_NATIVE,
 }
 
 
@@ -110,6 +125,34 @@ def normalize_text(value: Any) -> str:
     if isinstance(value, (list, tuple, set)):
         return ", ".join(str(item) for item in value if item not in (None, ""))
     return str(value)
+
+
+def resolve_continuation_mode_name(raw: Any) -> str:
+    normalized = normalize_text(raw).strip().lower()
+    if normalized in CONTINUATION_MODE_CHOICES:
+        return normalized
+    return CONTINUATION_MODE_PAPER_NATIVE
+
+
+def default_reasoning_prompt_style(continuation_mode: str) -> str:
+    return REASONING_PROMPT_STYLE_DEFAULTS.get(
+        resolve_continuation_mode_name(continuation_mode),
+        "paper_native",
+    )
+
+
+def default_sampling_contract(continuation_mode: str) -> str:
+    return SAMPLING_CONTRACT_DEFAULTS.get(
+        resolve_continuation_mode_name(continuation_mode),
+        "checkpoint_native",
+    )
+
+
+def default_reward_prediction_source(continuation_mode: str, reward_final_answer_only: bool) -> str:
+    resolved_mode = resolve_continuation_mode_name(continuation_mode)
+    if resolved_mode == CONTINUATION_MODE_PAPER_NATIVE:
+        return "reasoning_trace"
+    return "structured_go_summary" if reward_final_answer_only else "final_answer"
 
 
 def resolve_attn_implementation(preferred: str) -> str:
@@ -245,7 +288,10 @@ def extract_reward_prediction_text(text: Any) -> str:
     reward_context = resolve_reward_context()
     prediction_source = normalize_text(reward_context.get("reward_prediction_source")).strip().lower()
     if not prediction_source:
-        prediction_source = "structured_go_summary" if reward_context.get("reward_final_answer_only", False) else "final_answer"
+        prediction_source = default_reward_prediction_source(
+            normalize_text(reward_context.get("continuation_mode")).strip().lower(),
+            bool(reward_context.get("reward_final_answer_only", False)),
+        )
 
     if prediction_source == "reasoning_trace":
         # The paper describes regex extraction from the generated reasoning trace.
@@ -317,10 +363,14 @@ def configure_reward_context(args: argparse.Namespace) -> None:
         DEFAULT_GO_OBO_PATH if os.path.exists(DEFAULT_GO_OBO_PATH) else ""
     )
     REWARD_CONTEXT["ia_file_path"] = normalize_text(getattr(args, "ia_file_path", None)).strip()
+    REWARD_CONTEXT["continuation_mode"] = resolve_continuation_mode_name(getattr(args, "continuation_mode", None))
     REWARD_CONTEXT["reward_final_answer_only"] = bool(getattr(args, "reward_final_answer_only", False))
     REWARD_CONTEXT["reward_prediction_source"] = (
         normalize_text(getattr(args, "reward_prediction_source", None)).strip().lower()
-        or ("structured_go_summary" if REWARD_CONTEXT["reward_final_answer_only"] else "final_answer")
+        or default_reward_prediction_source(
+            REWARD_CONTEXT["continuation_mode"],
+            REWARD_CONTEXT["reward_final_answer_only"],
+        )
     )
     inspect_completion_text.cache_clear()
 
@@ -812,7 +862,9 @@ def compute_batch_relative_advantages(
     return normalized_groups, global_std
 
 
-def build_generation_stopping_criteria(tokenizer: Any) -> Any:
+def build_generation_stopping_criteria(tokenizer: Any, *, continuation_mode: str) -> Any:
+    if resolve_continuation_mode_name(continuation_mode) == CONTINUATION_MODE_PAPER_NATIVE:
+        return None
     encode = getattr(tokenizer, "encode", None)
     if encode is None:
         return None
@@ -853,18 +905,22 @@ def build_generation_kwargs(
     *,
     for_eval: bool,
 ) -> Dict[str, Any]:
+    continuation_mode = resolve_continuation_mode_name(getattr(args, "continuation_mode", None))
+    sampling_contract = normalize_text(getattr(args, "sampling_contract", None)).strip().lower() or "explicit"
+    use_checkpoint_native_sampling = (not for_eval) and sampling_contract == "checkpoint_native"
     do_sample = args.eval_do_sample if for_eval else args.do_sample
     generation_kwargs = {
-        "do_sample": do_sample,
         "min_new_tokens": args.min_new_tokens,
         "max_new_tokens": args.max_new_tokens,
-        "repetition_penalty": args.repetition_penalty,
         "pad_token_id": tokenizer.pad_token_id,
         "eos_token_id": tokenizer.eos_token_id,
         "remove_invalid_values": True,
         "renormalize_logits": True,
     }
-    if do_sample:
+    if not use_checkpoint_native_sampling:
+        generation_kwargs["do_sample"] = do_sample
+        generation_kwargs["repetition_penalty"] = args.repetition_penalty
+    if not use_checkpoint_native_sampling and do_sample:
         temperature = args.eval_temperature if for_eval else args.temperature
         top_p = args.eval_top_p if for_eval else args.top_p
         top_k = args.eval_top_k if for_eval else args.top_k
@@ -874,9 +930,12 @@ def build_generation_kwargs(
             generation_kwargs["top_p"] = top_p
         if top_k is not None:
             generation_kwargs["top_k"] = top_k
-    if do_sample and getattr(args, "min_p", 0.0) > 0.0:
+    if not use_checkpoint_native_sampling and do_sample and getattr(args, "min_p", 0.0) > 0.0:
         generation_kwargs["min_p"] = args.min_p
-    stopping_criteria = build_generation_stopping_criteria(tokenizer)
+    stopping_criteria = build_generation_stopping_criteria(
+        tokenizer,
+        continuation_mode=continuation_mode,
+    )
     if stopping_criteria is not None:
         generation_kwargs["stopping_criteria"] = stopping_criteria
     return generation_kwargs
@@ -936,10 +995,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--include_protein_function_summary", type=str, default="true")
     parser.add_argument("--split_go_aspects", type=str, default="false")
     parser.add_argument(
+        "--continuation_mode",
+        type=str,
+        default=CONTINUATION_MODE_PAPER_NATIVE,
+        choices=list(CONTINUATION_MODE_CHOICES),
+    )
+    parser.add_argument(
         "--reasoning_prompt_style",
         type=str,
-        default="paper_compact",
-        choices=["verbose", "paper_compact"],
+        default="auto",
+        choices=["auto", "verbose", "paper_native", "paper_compact"],
     )
     parser.add_argument("--compact_interpro_limit", type=int, default=12)
     parser.add_argument("--compact_ppi_limit", type=int, default=10)
@@ -1024,6 +1089,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_new_tokens", type=int, default=10000)
     parser.add_argument("--max_loss_completion_tokens", type=int, default=0)
     parser.add_argument("--rollout_logprob_microbatch_size", type=int, default=4)
+    parser.add_argument(
+        "--sampling_contract",
+        type=str,
+        default="auto",
+        choices=["auto", "explicit", "checkpoint_native"],
+    )
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--top_k", type=int, default=20)
@@ -1044,8 +1115,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reward_prediction_source",
         type=str,
-        default="final_answer",
-        choices=["reasoning_trace", "final_answer", "structured_go_summary"],
+        default="auto",
+        choices=["auto", "reasoning_trace", "final_answer", "structured_go_summary"],
     )
     parser.add_argument("--kl_beta", type=float, default=1e-4)
     parser.add_argument(
@@ -1103,6 +1174,26 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
     for field_name in bool_fields:
         setattr(args, field_name, _str2bool(getattr(args, field_name)))
+
+    args.continuation_mode = resolve_continuation_mode_name(getattr(args, "continuation_mode", None))
+
+    reasoning_prompt_style = normalize_text(getattr(args, "reasoning_prompt_style", None)).strip().lower()
+    if reasoning_prompt_style in {"", "auto"}:
+        reasoning_prompt_style = default_reasoning_prompt_style(args.continuation_mode)
+    args.reasoning_prompt_style = reasoning_prompt_style
+
+    reward_prediction_source = normalize_text(getattr(args, "reward_prediction_source", None)).strip().lower()
+    if reward_prediction_source in {"", "auto"}:
+        reward_prediction_source = default_reward_prediction_source(
+            args.continuation_mode,
+            bool(getattr(args, "reward_final_answer_only", False)),
+        )
+    args.reward_prediction_source = reward_prediction_source
+
+    sampling_contract = normalize_text(getattr(args, "sampling_contract", None)).strip().lower()
+    if sampling_contract in {"", "auto"}:
+        sampling_contract = default_sampling_contract(args.continuation_mode)
+    args.sampling_contract = sampling_contract
 
     return args
 

@@ -420,16 +420,21 @@ Operational adaptation for the current CoreWeave continuation-tuning setup:
 - When running the current single-node 8 GPU continuation setup, prefer preserving the paper's `B/G=8` unique proteins per step by keeping `num_generations=24` and setting `per_device_train_batch_size=1` so that `world_size=8` yields `global_unique_proteins_per_step=8`, then reduce `max_steps` and/or `max_new_tokens` before reducing group diversity
 - Any deviation from the paper reference, especially `num_generations`, `max_new_tokens`, `train_batch_size`, `max_steps`, and IA availability, must be explicit in W&B config
 - `reward_weights` and all RL-control parameters (`loss_type`, clip epsilons, reward scaling mode, IS cap, scheduler settings, KL beta, and final-answer-only reward mode) must remain visible in W&B config for each RL run
-- The paper states that GO term identifiers are extracted from the **final answer block** of each generated trace, so the canonical RL reward path should default to `reward_prediction_source=final_answer`; `reasoning_trace` should be treated as an explicit ablation only
-- The paper-faithful `paper_compact` prompt should be **answer-first** at the end of generation: keep reasoning brief, emit a single structured `GO_SUMMARY` block, and stop immediately after `GO_SUMMARY_END`; do not ask for a UniProt-style prose summary in the RL continuation prompt
-- In the current codebase, `final_answer` means the post-`</think>` answer region and may contain a structured `GO_SUMMARY` block; `structured_go_summary` is the stricter ablation, not the default paper-faithful path
+- Canonical RL continuation should now be treated as `continuation_mode=paper_native`
+- `paper_native` means:
+  - prompt style resolves to a freer-form paper-style reasoning prompt that keeps the compact evidence slots but does **not** require a custom `GO_SUMMARY` schema
+  - reward extraction defaults to `reward_prediction_source=reasoning_trace`
+  - rollout sampling defaults to `sampling_contract=checkpoint_native`, meaning the packaged checkpoint `generation_config` is respected unless an explicit ablation overrides it
+  - custom `GO_SUMMARY_END` stopping is disabled and generation falls back to normal EOS / model-native stopping
+- `paper_compact` / `repo_structured` remains available, but only as an explicit structured ablation that asks for a tagged `GO_SUMMARY` block and may use `final_answer` or `structured_go_summary` reward extraction
+- In the current codebase, `final_answer` means the post-`</think>` answer region; for `paper_native` this is primarily an evaluation-time extraction concept, while RL reward still uses `reasoning_trace`
 - The paper's prompt-length reference `512` applies to the **text context only**; protein residue embeddings and GO graph embeddings are separate multimodal inputs and should not be counted against that text budget
 - RL text prompts should therefore stay close to the paper's compact slot structure rather than carrying full free-form metadata dumps
 - The preferred RL text slots are: `organism`, `interpro_annotations`, `ppi_partners`, `go_mf_speculations`, `go_bp_speculations`, `go_cc_speculations`, and `focus_aspect`
 - `go_*_speculations` should be rendered per aspect as `GO:XXXXXXX (term name)` strings, matching Table S19, rather than GO IDs alone
 - `ppi_partners` should stay close to the paper's data pipeline convention of top-10 high-confidence STRING partners, not an open-ended dump
 - In practical terms, the raw **text context** should remain compact and close to the paper slots above; note that the implementation expands `<|protein_pad|>` and `<|go_graph_pad|>` into many tokenizer-visible placeholders before replacement, so trainer-side `prompt_len` is not the same quantity as the paper's `max prompt length = 512`
-- The paper-faithful RL prompt path should therefore exclude long prose fields such as UniProt summaries, function summaries, localization text, and other metadata dumps unless an explicit ablation is being run
+- The paper-faithful RL prompt path should therefore exclude long metadata dumps from the prompt body, but it may still ask for a concise UniProt-style final answer because that matches the freer-form continuation contract more closely than the custom tagged summary ablation
 - The paper-faithful RL prompt path should not explicitly request prose endings such as `Summarize in UniProt format.`; it should encourage the model to stop once the structured GO answer is complete
 - Optional fields such as UniProt prose summaries, extended function descriptions, or other long metadata should be excluded from the paper-faithful RL prompt path unless they are being tested as an explicit ablation
 - The first comparison between `SFT -> RL` and `paper RL -> continuation RL` should keep the objective, reward extraction, sampling controls, and memory controls identical so that the initialization checkpoint is the only changed variable

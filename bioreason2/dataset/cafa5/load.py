@@ -13,6 +13,7 @@ from bioreason2.dataset.cafa5.processor import (
 )
 from bioreason2.dataset.prompts.cafa5 import (
     CAFA5_REASONING_TEMPLATE,
+    CAFA5_REASONING_TEMPLATE_PAPER_NATIVE,
     CAFA5_REASONING_TEMPLATE_PAPER_COMPACT,
     CAFA5_REASONING_TEMPLATE_WITH_CONTEXT,
     CAFA5_REASONING_TEMPLATE_WITH_CONTEXT_PPI,
@@ -358,7 +359,9 @@ def _format_reasoning_prompt(
         include_ground_truth_in_final_answer: Whether to append ground truth GO terms to final answer
         add_uniprot_summary: Whether to add UniProt summary to final answer and use UniProt template
         is_swissprot: Whether to use dynamic SwissProt template that mentions only available data
-        reasoning_prompt_style: Prompt style for reasoning data. "paper_compact" restricts
+        reasoning_prompt_style: Prompt style for reasoning data. "paper_native"
+            keeps the paper-style freer-form continuation contract, while
+            "paper_compact" is a stricter structured ablation that restricts
             text context to paper-style slots and omits optional prose fields.
         
     Returns:
@@ -399,7 +402,33 @@ def _format_reasoning_prompt(
     uniprot_summary = " Summarize in UniProt format."
     assistant_answer = _add_uniprot_summary(example) if add_uniprot_summary else (example["final_answer"] if "final_answer" in example else "")
     
-    if reasoning_prompt_style == "paper_compact":
+    if reasoning_prompt_style == "paper_native":
+        compact_interpro = _limit_multiline_slot(
+            interpro_data,
+            max_lines=compact_interpro_limit,
+        )
+        compact_ppi = _limit_multiline_slot(
+            ppi_data,
+            max_lines=compact_ppi_limit,
+        )
+        compact_go_speculations = _compact_go_speculations(
+            go_speculations,
+            max_ids_per_aspect=compact_go_speculation_limit,
+        )
+        prompt_dict = {
+            "system": CAFA5_REASONING_TEMPLATE_PAPER_NATIVE["system_prompt"],
+            "user": CAFA5_REASONING_TEMPLATE_PAPER_NATIVE["user_prompt"].format(
+                organism=organism,
+                interpro_data=compact_interpro,
+                ppi_data=compact_ppi,
+                go_mf_speculations=compact_go_speculations["MF"],
+                go_bp_speculations=compact_go_speculations["BP"],
+                go_cc_speculations=compact_go_speculations["CC"],
+            ),
+            "assistant_reasoning": example["reasoning"] if "reasoning" in example else "",
+            "assistant_answer": example["final_answer"] if "final_answer" in example else "",
+        }
+    elif reasoning_prompt_style == "paper_compact":
         compact_interpro = _limit_multiline_slot(
             interpro_data,
             max_lines=compact_interpro_limit,
@@ -674,9 +703,9 @@ def _process_dataset_split(
             desc="Removing protein function summaries",
         )
 
-    if reasoning_dataset_name and reasoning_prompt_style == "paper_compact":
+    if reasoning_dataset_name and reasoning_prompt_style in {"paper_native", "paper_compact"}:
         print(
-            "Using paper-compact reasoning prompts with slot caps: "
+            f"Using {reasoning_prompt_style.replace('_', '-')} reasoning prompts with slot caps: "
             f"interpro={compact_interpro_limit}, "
             f"ppi={compact_ppi_limit}, "
             f"go_speculations_per_aspect={compact_go_speculation_limit}"
@@ -849,8 +878,9 @@ def load_cafa5_dataset(
         ask_all_go_aspects: When using reasoning data, if True, always asks for all 3 GO aspects
                            (Molecular Function, Biological Process, Cellular Component) regardless
                            of what ground truth data is available (default=False). Useful for evaluation.
-        reasoning_prompt_style: Prompt style for reasoning data. "paper_compact" restricts
-                               text context to paper-style slots for RL continuation tuning.
+        reasoning_prompt_style: Prompt style for reasoning data. "paper_native" keeps the
+                               paper-style freer-form continuation contract, while
+                               "paper_compact" is a stricter structured ablation.
         compact_interpro_limit: Maximum number of InterPro lines kept in paper-compact prompts.
         compact_ppi_limit: Maximum number of PPI lines kept in paper-compact prompts.
         compact_go_speculation_limit: Maximum GO IDs kept per aspect in paper-compact prompts.
@@ -1089,9 +1119,9 @@ def load_cafa5_dataset(
                     desc="Removing protein function summaries",
                 )
 
-            if reasoning_dataset_name and reasoning_prompt_style == "paper_compact":
+            if reasoning_dataset_name and reasoning_prompt_style in {"paper_native", "paper_compact"}:
                 print(
-                    "Using paper-compact reasoning prompts with slot caps: "
+                    f"Using {reasoning_prompt_style.replace('_', '-')} reasoning prompts with slot caps: "
                     f"interpro={compact_interpro_limit}, "
                     f"ppi={compact_ppi_limit}, "
                     f"go_speculations_per_aspect={compact_go_speculation_limit}"

@@ -121,6 +121,34 @@ CAFA5_REASONING_TEMPLATE_WITH_CONTEXT_PPI_UNIPROT = {
 # Paper-compact reasoning template for RL continuation tuning.
 # The text context is intentionally restricted to the paper-style slots;
 # protein residue and GO graph embeddings are provided separately.
+CAFA5_REASONING_TEMPLATE_PAPER_NATIVE = {
+    "system_prompt": (
+        "You are a scientific assistant specialized in protein function prediction. "
+        "The protein residues and GO graph are already provided as multimodal context. "
+        "Given organism information, InterPro annotations, protein-protein interaction "
+        "(PPI) partners, and initial GO term hypotheses, reason step by step about the "
+        "protein's molecular function, biological process, and cellular component. "
+        "Use the evidence as a starting point, revise weak hypotheses when needed, and "
+        "finish with a concise final answer that summarizes the most likely GO terms and "
+        "overall protein function in UniProt-style prose."
+    ),
+    "user_prompt": (
+        "Reason step by step about the protein's function across Molecular Function, "
+        "Biological Process, and Cellular Component. Use the evidence below as a "
+        "starting point, improve upon the initial GO hypotheses when needed, and finish "
+        "with a concise final answer.\n\n"
+        "Organism: {organism}\n\n"
+        "InterPro annotations:\n{interpro_data}\n\n"
+        "PPI partners:\n{ppi_data}\n\n"
+        "Initial GO term hypotheses:\n"
+        "Molecular Function (MF): {go_mf_speculations}\n"
+        "Biological Process (BP): {go_bp_speculations}\n"
+        "Cellular Component (CC): {go_cc_speculations}\n"
+    ),
+}
+
+# Paper-compact reasoning template for structured ablations.
+# This is intentionally stricter than the paper-native continuation contract.
 CAFA5_REASONING_TEMPLATE_PAPER_COMPACT = {
     "system_prompt": (
         "You are a scientific assistant specialized in protein function prediction. "

@@ -70,7 +70,7 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertIn('REWARD_SCALING=${REWARD_SCALING:-"batch"}', wrapper_text)
         self.assertIn('IMPORTANCE_SAMPLING_CAP=${IMPORTANCE_SAMPLING_CAP:-2.0}', wrapper_text)
         self.assertIn('REWARD_FINAL_ANSWER_ONLY=${REWARD_FINAL_ANSWER_ONLY:-"False"}', wrapper_text)
-        self.assertIn('REWARD_PREDICTION_SOURCE=${REWARD_PREDICTION_SOURCE:-"final_answer"}', wrapper_text)
+        self.assertIn('REWARD_PREDICTION_SOURCE=${REWARD_PREDICTION_SOURCE:-"auto"}', wrapper_text)
         self.assertIn('REWARD_FUNCS=${REWARD_FUNCS:-"ia_weighted_f1"}', wrapper_text)
         self.assertIn('REWARD_WEIGHTS=${REWARD_WEIGHTS:-"1.0"}', wrapper_text)
         self.assertIn('PYTHON_BIN=${PYTHON_BIN:-""}', wrapper_text)
@@ -79,8 +79,10 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertIn('torch.distributed.run', wrapper_text)
         self.assertIn('--nproc_per_node "$TRAIN_NUM_GPUS"', wrapper_text)
         self.assertIn('ADD_UNIPROT_SUMMARY=${ADD_UNIPROT_SUMMARY:-"False"}', wrapper_text)
-        self.assertIn('INCLUDE_PROTEIN_FUNCTION_SUMMARY=${INCLUDE_PROTEIN_FUNCTION_SUMMARY:-"False"}', wrapper_text)
-        self.assertIn('REASONING_PROMPT_STYLE=${REASONING_PROMPT_STYLE:-"paper_compact"}', wrapper_text)
+        self.assertIn('CONTINUATION_MODE=${CONTINUATION_MODE:-"paper_native"}', wrapper_text)
+        self.assertIn('if [ "$CONTINUATION_MODE" = "paper_native" ]; then', wrapper_text)
+        self.assertIn('INCLUDE_PROTEIN_FUNCTION_SUMMARY="True"', wrapper_text)
+        self.assertIn('REASONING_PROMPT_STYLE=${REASONING_PROMPT_STYLE:-"auto"}', wrapper_text)
         self.assertIn('COMPACT_INTERPRO_LIMIT=${COMPACT_INTERPRO_LIMIT:-12}', wrapper_text)
         self.assertIn('COMPACT_PPI_LIMIT=${COMPACT_PPI_LIMIT:-10}', wrapper_text)
         self.assertIn('COMPACT_GO_SPECULATION_LIMIT=${COMPACT_GO_SPECULATION_LIMIT:-8}', wrapper_text)
@@ -89,6 +91,7 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertIn('if [ -z "${ROLLOUT_LOGPROB_MICROBATCH_SIZE+x}" ]; then', wrapper_text)
         self.assertIn('ROLLOUT_LOGPROB_MICROBATCH_SIZE=1', wrapper_text)
         self.assertIn('ROLLOUT_LOGPROB_MICROBATCH_SIZE=4', wrapper_text)
+        self.assertIn('SAMPLING_CONTRACT=${SAMPLING_CONTRACT:-"auto"}', wrapper_text)
         self.assertIn('TEMPERATURE=${TEMPERATURE:-1.0}', wrapper_text)
         self.assertIn('TOP_P=${TOP_P:-0.95}', wrapper_text)
         self.assertIn('TOP_K=${TOP_K:-20}', wrapper_text)
@@ -128,10 +131,12 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertIn('--importance_sampling_cap "$IMPORTANCE_SAMPLING_CAP"', wrapper_text)
         self.assertIn('--reward_prediction_source "$REWARD_PREDICTION_SOURCE"', wrapper_text)
         self.assertIn('--include_protein_function_summary "$INCLUDE_PROTEIN_FUNCTION_SUMMARY"', wrapper_text)
+        self.assertIn('--continuation_mode "$CONTINUATION_MODE"', wrapper_text)
         self.assertIn('--reasoning_prompt_style "$REASONING_PROMPT_STYLE"', wrapper_text)
         self.assertIn('--compact_interpro_limit "$COMPACT_INTERPRO_LIMIT"', wrapper_text)
         self.assertIn('--compact_ppi_limit "$COMPACT_PPI_LIMIT"', wrapper_text)
         self.assertIn('--compact_go_speculation_limit "$COMPACT_GO_SPECULATION_LIMIT"', wrapper_text)
+        self.assertIn('--sampling_contract "$SAMPLING_CONTRACT"', wrapper_text)
         self.assertIn('--per_device_train_batch_size "$PER_DEVICE_TRAIN_BATCH_SIZE"', wrapper_text)
         self.assertIn('--per_device_eval_batch_size "$PER_DEVICE_EVAL_BATCH_SIZE"', wrapper_text)
         self.assertIn('TRAIN_LAUNCH_PREFIX=()', wrapper_text)
@@ -226,6 +231,23 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertNotIn("top_p", kwargs)
         self.assertNotIn("top_k", kwargs)
 
+    def test_build_generation_kwargs_uses_checkpoint_native_sampling_for_paper_native_train(self):
+        args = GRPO.parse_args(
+            [
+                "--text_model_name",
+                "hf-model",
+            ]
+        )
+        tokenizer = type("Tokenizer", (), {"pad_token_id": 0, "eos_token_id": 1, "encode": lambda self, text, add_special_tokens=False: [1]})()
+
+        kwargs = GRPO.build_generation_kwargs(args, tokenizer, for_eval=False)
+
+        self.assertNotIn("do_sample", kwargs)
+        self.assertNotIn("temperature", kwargs)
+        self.assertNotIn("top_p", kwargs)
+        self.assertNotIn("top_k", kwargs)
+        self.assertNotIn("stopping_criteria", kwargs)
+
     def test_go_aspect_coverage_reward_tracks_requested_aspects(self):
         completion = (
             "<think>reasoning</think>"
@@ -241,12 +263,12 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
             2.0 / 3.0,
         )
 
-    def test_inspect_completion_uses_final_answer_go_ids_by_default(self):
+    def test_inspect_completion_uses_reasoning_trace_go_ids_by_default(self):
         completion = "<think>reasoning</think>GO:0007165</tool_call>"
         meta = GRPO.inspect_completion(completion)
 
         self.assertEqual(meta["predicted_go_ids"], ["GO:0007165"])
-        self.assertEqual(meta["prediction_source"], "final_answer")
+        self.assertEqual(meta["prediction_source"], "reasoning_trace")
 
     def test_inspect_completion_in_reasoning_trace_mode_keeps_trace_go_ids(self):
         completion = (
@@ -388,9 +410,11 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertEqual(args.rotating_eval_max_samples, 256)
         self.assertEqual(args.reward_funcs, "ia_weighted_f1")
         self.assertEqual(args.reward_weights, "1.0")
-        self.assertEqual(args.reward_prediction_source, "final_answer")
+        self.assertEqual(args.continuation_mode, "paper_native")
+        self.assertEqual(args.sampling_contract, "checkpoint_native")
+        self.assertEqual(args.reward_prediction_source, "reasoning_trace")
         self.assertEqual(args.min_new_tokens, 1)
-        self.assertEqual(args.reasoning_prompt_style, "paper_compact")
+        self.assertEqual(args.reasoning_prompt_style, "paper_native")
         self.assertEqual(args.compact_interpro_limit, 12)
         self.assertEqual(args.compact_ppi_limit, 10)
         self.assertEqual(args.compact_go_speculation_limit, 8)
