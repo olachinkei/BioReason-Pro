@@ -167,8 +167,8 @@ SFT_CONVERSION_LORA_DROPOUT=${SFT_CONVERSION_LORA_DROPOUT:-0.05}
 SEED=${SEED:-42}
 LEARNING_RATE=${LEARNING_RATE:-3e-5}
 WEIGHT_DECAY=${WEIGHT_DECAY:-0.0}
-TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-8}
-EVAL_BATCH_SIZE=${EVAL_BATCH_SIZE:-4}
+PER_DEVICE_TRAIN_BATCH_SIZE=${PER_DEVICE_TRAIN_BATCH_SIZE:-${TRAIN_BATCH_SIZE:-1}}
+PER_DEVICE_EVAL_BATCH_SIZE=${PER_DEVICE_EVAL_BATCH_SIZE:-${EVAL_BATCH_SIZE:-4}}
 NUM_WORKERS=${NUM_WORKERS:-0}
 MAX_STEPS=${MAX_STEPS:-300}
 MAX_EPOCHS=${MAX_EPOCHS:-1}
@@ -179,7 +179,7 @@ ADAM_EPSILON=${ADAM_EPSILON:-1e-8}
 LR_SCHEDULER_TYPE=${LR_SCHEDULER_TYPE:-"cosine"}
 WARMUP_RATIO=${WARMUP_RATIO:-0.03}
 MAX_TRAIN_SAMPLES=${MAX_TRAIN_SAMPLES:--1}
-MAX_EVAL_SAMPLES=${MAX_EVAL_SAMPLES:-128}
+MAX_EVAL_SAMPLES=${MAX_EVAL_SAMPLES:-200}
 EVAL_SAMPLE_STRATEGY=${EVAL_SAMPLE_STRATEGY:-"stratified_aspect_profile"}
 EVAL_EVERY_N_STEPS=${EVAL_EVERY_N_STEPS:-50}
 SAVE_EVERY_N_STEPS=${SAVE_EVERY_N_STEPS:-50}
@@ -231,6 +231,7 @@ CHECKPOINT_ARTIFACT_ALIASES=${CHECKPOINT_ARTIFACT_ALIASES:-"latest,213.221.225.2
 
 PREP_COMMAND=()
 TRAIN_COMMAND=()
+TRAIN_LAUNCH_PREFIX=()
 OPTIONAL_GO_EMBEDDINGS_ARG=()
 PYTHON_BIN=${PYTHON_BIN:-""}
 
@@ -247,6 +248,19 @@ if [ -z "$PYTHON_BIN" ]; then
     echo "Error: no Python executable found for RL wrapper"
     exit 1
   fi
+fi
+
+if [ "$TRAIN_NUM_GPUS" -gt 1 ]; then
+  TRAIN_LAUNCH_PREFIX=(
+    "$PYTHON_BIN"
+    -m
+    torch.distributed.run
+    --standalone
+    --nnodes=1
+    --nproc_per_node "$TRAIN_NUM_GPUS"
+  )
+else
+  TRAIN_LAUNCH_PREFIX=("$PYTHON_BIN")
 fi
 
 if as_bool "$TRAIN_USE_SRUN"; then
@@ -485,7 +499,7 @@ if [ -n "$RESUME_FROM_RAW_CHECKPOINT" ]; then
   RESUME_ARGS=(--resume_from_raw_checkpoint "$RESUME_FROM_RAW_CHECKPOINT")
 fi
 
-stdbuf -oL -eL "${TRAIN_COMMAND[@]}" "$PYTHON_BIN" train_protein_grpo.py \
+stdbuf -oL -eL "${TRAIN_COMMAND[@]}" "${TRAIN_LAUNCH_PREFIX[@]}" train_protein_grpo.py \
   --run_name "$WANDB_RUN_NAME" \
   --seed "$SEED" \
   --wandb_project "$BASE_WANDB_PROJECT" \
@@ -557,8 +571,8 @@ stdbuf -oL -eL "${TRAIN_COMMAND[@]}" "$PYTHON_BIN" train_protein_grpo.py \
   --disable_model_dropout "$DISABLE_MODEL_DROPOUT" \
   --learning_rate "$LEARNING_RATE" \
   --weight_decay "$WEIGHT_DECAY" \
-  --train_batch_size "$TRAIN_BATCH_SIZE" \
-  --eval_batch_size "$EVAL_BATCH_SIZE" \
+  --per_device_train_batch_size "$PER_DEVICE_TRAIN_BATCH_SIZE" \
+  --per_device_eval_batch_size "$PER_DEVICE_EVAL_BATCH_SIZE" \
   --num_workers "$NUM_WORKERS" \
   --max_steps "$MAX_STEPS" \
   --max_epochs "$MAX_EPOCHS" \

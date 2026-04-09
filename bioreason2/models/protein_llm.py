@@ -9,7 +9,7 @@ try:
 except ImportError:  # pragma: no cover - optional in stable non-Unsloth runs
     FastLanguageModel = None
 
-from typing import Optional, List, Union
+from typing import Any, Dict, List, Optional, Sequence, Union
 from pathlib import Path
 
 from bioreason2.models.pl.processing_pl import PLProcessor
@@ -385,6 +385,175 @@ class ProteinLLMModel(nn.Module):
         self.go_embeddings_cache[aspect] = cached_embedding
         print(f"✅ Loaded checkpoint-bundled GO embedding cache from {cache_path} for aspect '{aspect}'")
 
+    def build_multimodal_cache(
+        self,
+        *,
+        protein_sequences: Optional[List[str]] = None,
+        batch_idx_map: Optional[List[int]] = None,
+        batch_size: int,
+        structure_coords: Optional[torch.Tensor] = None,
+        go_aspects: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Precompute projected protein / GO features for reuse across rollouts."""
+        cache: Dict[str, Any] = {
+            "batch_size": int(batch_size),
+            "protein_embeddings": None,
+            "go_embeddings": None,
+        }
+        if protein_sequences is not None and batch_idx_map is not None:
+            cache["protein_embeddings"] = self.process_protein_embeddings(
+                protein_sequences,
+                batch_idx_map,
+                batch_size,
+                structure_coords=structure_coords,
+            )
+        if go_aspects is not None:
+            cache["go_embeddings"] = self.process_go_aspects(go_aspects, batch_size)
+        return cache
+
+    def expand_multimodal_cache(self, cache: Optional[Dict[str, Any]], repeat_count: int) -> Optional[Dict[str, Any]]:
+        """Repeat a single-example cache across rollout copies without re-encoding proteins."""
+        if cache is None:
+            return None
+        if repeat_count <= 0:
+            raise ValueError(f"repeat_count must be positive, got {repeat_count}")
+
+        protein_embeddings = cache.get("protein_embeddings")
+        go_embeddings = cache.get("go_embeddings")
+        expanded_cache: Dict[str, Any] = {
+            "batch_size": repeat_count,
+            "protein_embeddings": None,
+            "go_embeddings": None,
+        }
+        if protein_embeddings:
+            if len(protein_embeddings) != 1:
+                raise ValueError(
+                    "expand_multimodal_cache currently expects a single-example cache, "
+                    f"got {len(protein_embeddings)} protein embedding groups"
+                )
+            expanded_cache["protein_embeddings"] = [protein_embeddings[0] for _ in range(repeat_count)]
+        if go_embeddings:
+            if len(go_embeddings) != 1:
+                raise ValueError(
+                    "expand_multimodal_cache currently expects a single-example cache, "
+                    f"got {len(go_embeddings)} GO embedding groups"
+                )
+            expanded_cache["go_embeddings"] = [go_embeddings[0] for _ in range(repeat_count)]
+        return expanded_cache
+
+    def _apply_multimodal_replacements(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        text_inputs_embeds: torch.Tensor,
+        multimodal_cache: Optional[Dict[str, Any]] = None,
+        protein_sequences: Optional[List[str]] = None,
+        batch_idx_map: Optional[List[int]] = None,
+        structure_coords: Optional[torch.Tensor] = None,
+        go_aspects: Optional[List[str]] = None,
+    ) -> torch.Tensor:
+        batch_size = int(input_ids.shape[0])
+
+        if multimodal_cache is None:
+            multimodal_cache = self.build_multimodal_cache(
+                protein_sequences=protein_sequences,
+                batch_idx_map=batch_idx_map,
+                batch_size=batch_size,
+                structure_coords=structure_coords,
+                go_aspects=go_aspects,
+            )
+
+        batch_protein_embeds = multimodal_cache.get("protein_embeddings")
+        if batch_protein_embeds:
+            mask = input_ids == self.protein_token_id
+            n_protein_tokens = mask.sum().item()
+            protein_embeds_flat = torch.cat(batch_protein_embeds, dim=0)
+            n_protein_features = protein_embeds_flat.shape[0]
+
+            if n_protein_features != n_protein_tokens:
+                raise ValueError(
+                    f"Protein features and protein tokens do not match: "
+                    f"features {n_protein_features}, tokens: {n_protein_tokens}"
+                )
+
+            protein_embeds_flat = protein_embeds_flat.to(dtype=text_inputs_embeds.dtype)
+            if n_protein_tokens > 0:
+                orig_shape = text_inputs_embeds.shape
+                hidden_size = orig_shape[-1]
+                embeds_2d = text_inputs_embeds.view(-1, hidden_size)
+                mask_flat = mask.view(-1)
+                idx = mask_flat.nonzero(as_tuple=False).squeeze(1)
+                diff = protein_embeds_flat - embeds_2d.index_select(0, idx)
+                embeds_2d = embeds_2d.scatter_add(0, idx.unsqueeze(1).expand(-1, hidden_size), diff)
+                text_inputs_embeds = embeds_2d.view(orig_shape)
+
+        go_embeddings = multimodal_cache.get("go_embeddings")
+        if go_embeddings:
+            go_mask = input_ids == self.go_token_id
+            n_go_tokens = go_mask.sum().item()
+            go_embeds_flat = torch.cat([emb for emb in go_embeddings if emb.numel() > 0], dim=0)
+            n_go_features = go_embeds_flat.shape[0] if go_embeds_flat.numel() > 0 else 0
+
+            if n_go_features != n_go_tokens:
+                raise ValueError(
+                    f"GO embeddings and GO tokens do not match: embeddings {n_go_features}, tokens: {n_go_tokens}"
+                )
+
+            if n_go_tokens > 0:
+                go_embeds_flat = go_embeds_flat.to(dtype=text_inputs_embeds.dtype)
+                orig_shape = text_inputs_embeds.shape
+                hidden_size = orig_shape[-1]
+                embeds_2d = text_inputs_embeds.view(-1, hidden_size)
+                mask_flat = go_mask.view(-1)
+                idx = mask_flat.nonzero(as_tuple=False).squeeze(1)
+                diff = go_embeds_flat - embeds_2d.index_select(0, idx)
+                embeds_2d = embeds_2d.scatter_add(0, idx.unsqueeze(1).expand(-1, hidden_size), diff)
+                text_inputs_embeds = embeds_2d.view(orig_shape)
+
+        return text_inputs_embeds
+
+    def prepare_multimodal_prefix(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        protein_sequences: Optional[List[str]] = None,
+        batch_idx_map: Optional[List[int]] = None,
+        structure_coords: Optional[torch.Tensor] = None,
+        go_aspects: Optional[List[str]] = None,
+        multimodal_cache: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Prepare inputs_embeds once so caller can reuse the multimodal prefix."""
+        text_inputs_embeds = self.text_model.get_input_embeddings()(input_ids)
+        text_inputs_embeds = self._apply_multimodal_replacements(
+            input_ids=input_ids,
+            text_inputs_embeds=text_inputs_embeds,
+            multimodal_cache=multimodal_cache,
+            protein_sequences=protein_sequences,
+            batch_idx_map=batch_idx_map,
+            structure_coords=structure_coords,
+            go_aspects=go_aspects,
+        )
+        return {
+            "inputs_embeds": text_inputs_embeds,
+            "attention_mask": attention_mask,
+        }
+
+    def forward_from_prepared_prefix(
+        self,
+        *,
+        inputs_embeds: torch.Tensor,
+        attention_mask: torch.Tensor,
+        labels: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        return self.text_model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            labels=labels,
+            **kwargs,
+        )
+
     def forward(
         self,
         input_ids: Optional[torch.Tensor] = None,
@@ -394,6 +563,8 @@ class ProteinLLMModel(nn.Module):
         structure_coords: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         go_aspects: Optional[List[str]] = None,
+        multimodal_cache: Optional[Dict[str, Any]] = None,
+        prepared_inputs_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -416,83 +587,20 @@ class ProteinLLMModel(nn.Module):
         if input_ids is None or attention_mask is None:
             raise ValueError("input_ids and attention_mask must be provided")
 
-        batch_size = input_ids.shape[0]
-
-        # Get text embeddings from the model's embedding layer
-        text_inputs_embeds = self.text_model.get_input_embeddings()(input_ids)
-
-        # Process GO aspects if provided
-        go_embeddings = None
-        if go_aspects is not None:
-            go_embeddings = self.process_go_aspects(go_aspects, batch_size)
-
-        # Process protein sequences if provided
-        if protein_sequences is not None and batch_idx_map is not None:
-            # Find positions where protein tokens should be replaced
-            mask = input_ids == self.protein_token_id
-            n_protein_tokens = mask.sum().item()
-
-            batch_protein_embeds = self.process_protein_embeddings(
-                protein_sequences,
-                batch_idx_map,
-                batch_size,
+        if prepared_inputs_embeds is None:
+            prepared = self.prepare_multimodal_prefix(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                protein_sequences=protein_sequences,
+                batch_idx_map=batch_idx_map,
                 structure_coords=structure_coords,
+                go_aspects=go_aspects,
+                multimodal_cache=multimodal_cache,
             )
-            protein_embeds_flat = torch.cat(batch_protein_embeds, dim=0)
-            n_protein_features = protein_embeds_flat.shape[0]
+            prepared_inputs_embeds = prepared["inputs_embeds"]
 
-            if n_protein_features != n_protein_tokens:
-                raise ValueError(
-                    f"Protein features and protein tokens do not match: "
-                    f"features {n_protein_features}, tokens: {n_protein_tokens}"
-                )
-
-            protein_embeds_flat = protein_embeds_flat.to(dtype=text_inputs_embeds.dtype)
-
-            # Replace protein tokens with actual protein embeddings (out-of-place to preserve autograd graph)
-            if n_protein_tokens > 0:
-                orig_shape = text_inputs_embeds.shape  # (B, L, H)
-                hidden_size = orig_shape[-1]
-                embeds_2d = text_inputs_embeds.view(-1, hidden_size)
-                mask_flat = mask.view(-1)
-                idx = mask_flat.nonzero(as_tuple=False).squeeze(1)
-                # Compute difference at masked positions and scatter-add it to get an updated tensor without in-place assignment
-                diff = protein_embeds_flat - embeds_2d.index_select(0, idx)
-                embeds_2d = embeds_2d.scatter_add(0, idx.unsqueeze(1).expand(-1, hidden_size), diff)
-                text_inputs_embeds = embeds_2d.view(orig_shape)
-
-        # Process GO embeddings if provided
-        if go_embeddings is not None:
-            # Find positions where GO tokens should be replaced
-            go_mask = input_ids == self.go_token_id
-
-            # Count tokens and embeddings
-            n_go_tokens = go_mask.sum().item()
-            go_embeds_flat = torch.cat([emb for emb in go_embeddings if emb.numel() > 0], dim=0)
-            n_go_features = go_embeds_flat.shape[0] if go_embeds_flat.numel() > 0 else 0
-
-            if n_go_features != n_go_tokens:
-                raise ValueError(
-                    f"GO embeddings and GO tokens do not match: " f"embeddings {n_go_features}, tokens: {n_go_tokens}"
-                )
-
-            if n_go_tokens > 0:
-                # Ensure GO embeddings have the same dtype as text embeddings
-                go_embeds_flat = go_embeds_flat.to(dtype=text_inputs_embeds.dtype)
-
-                # Replace GO tokens with actual GO embeddings (out-of-place)
-                orig_shape = text_inputs_embeds.shape  # (B, L, H)
-                hidden_size = orig_shape[-1]
-                embeds_2d = text_inputs_embeds.view(-1, hidden_size)
-                mask_flat = go_mask.view(-1)
-                idx = mask_flat.nonzero(as_tuple=False).squeeze(1)
-                diff = go_embeds_flat - embeds_2d.index_select(0, idx)
-                embeds_2d = embeds_2d.scatter_add(0, idx.unsqueeze(1).expand(-1, hidden_size), diff)
-                text_inputs_embeds = embeds_2d.view(orig_shape)
-
-        # Forward pass through the text model
-        outputs = self.text_model(
-            inputs_embeds=text_inputs_embeds,
+        outputs = self.forward_from_prepared_prefix(
+            inputs_embeds=prepared_inputs_embeds,
             attention_mask=attention_mask,
             labels=labels,
             **kwargs,
@@ -509,6 +617,8 @@ class ProteinLLMModel(nn.Module):
         batch_idx_map: Optional[List[int]] = None,
         structure_coords: Optional[torch.Tensor] = None,
         go_aspects: Optional[List[str]] = None,
+        multimodal_cache: Optional[Dict[str, Any]] = None,
+        prepared_inputs_embeds: Optional[torch.Tensor] = None,
         **generation_kwargs,
     ) -> Union[torch.Tensor, List[str]]:
         """
@@ -533,81 +643,18 @@ class ProteinLLMModel(nn.Module):
         if input_ids is None or attention_mask is None:
             raise ValueError("input_ids and attention_mask must be provided")
 
-        batch_size = input_ids.shape[0]
-
-        # Get text embeddings from the model's embedding layer
-        text_inputs_embeds = self.text_model.get_input_embeddings()(input_ids)
-
-        # Process GO aspects if provided
-        go_embeddings = None
-        if go_aspects is not None:
-            go_embeddings = self.process_go_aspects(go_aspects, batch_size)
-
-        # Process protein sequences if provided
-        if protein_sequences is not None and batch_idx_map is not None:
-            batch_protein_embeds = self.process_protein_embeddings(
-                protein_sequences,
-                batch_idx_map,
-                batch_size,
+        if prepared_inputs_embeds is None:
+            prepared = self.prepare_multimodal_prefix(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                protein_sequences=protein_sequences,
+                batch_idx_map=batch_idx_map,
                 structure_coords=structure_coords,
+                go_aspects=go_aspects,
+                multimodal_cache=multimodal_cache,
             )
-
-            # Find positions where protein tokens should be replaced
-            mask = input_ids == self.protein_token_id
-
-            # Count tokens and embeddings
-            n_protein_tokens = mask.sum().item()
-            protein_embeds_flat = torch.cat(batch_protein_embeds, dim=0)
-            n_protein_features = protein_embeds_flat.shape[0]
-
-            if n_protein_features != n_protein_tokens:
-                raise ValueError(
-                    f"Protein features and protein tokens do not match: "
-                    f"features {n_protein_features}, tokens: {n_protein_tokens}"
-                )
-
-            # Ensure protein embeddings have the same dtype as text embeddings
-            protein_embeds_flat = protein_embeds_flat.to(dtype=text_inputs_embeds.dtype)
-
-            # Replace protein tokens with actual protein embeddings (out-of-place)
-            if n_protein_tokens > 0:
-                orig_shape = text_inputs_embeds.shape  # (B, L, H)
-                hidden_size = orig_shape[-1]
-                embeds_2d = text_inputs_embeds.view(-1, hidden_size)
-                mask_flat = mask.view(-1)
-                idx = mask_flat.nonzero(as_tuple=False).squeeze(1)
-                diff = protein_embeds_flat - embeds_2d.index_select(0, idx)
-                embeds_2d = embeds_2d.scatter_add(0, idx.unsqueeze(1).expand(-1, hidden_size), diff)
-                text_inputs_embeds = embeds_2d.view(orig_shape)
-
-        # Process GO embeddings if provided
-        if go_embeddings is not None:
-            # Find positions where GO tokens should be replaced
-            go_mask = input_ids == self.go_token_id
-
-            # Count tokens and embeddings
-            n_go_tokens = go_mask.sum().item()
-            go_embeds_flat = torch.cat([emb for emb in go_embeddings if emb.numel() > 0], dim=0)
-            n_go_features = go_embeds_flat.shape[0] if go_embeds_flat.numel() > 0 else 0
-
-            if n_go_features != n_go_tokens:
-                raise ValueError(
-                    f"GO embeddings and GO tokens do not match: " f"embeddings {n_go_features}, tokens: {n_go_tokens}"
-                )
-
-            if n_go_tokens > 0:
-                # Ensure GO embeddings have the same dtype as text embeddings
-                go_embeds_flat = go_embeds_flat.to(dtype=text_inputs_embeds.dtype)
-
-                # Replace GO tokens with actual GO embeddings (out-of-place)
-                orig_shape = text_inputs_embeds.shape  # (B, L, H)
-                hidden_size = orig_shape[-1]
-                embeds_2d = text_inputs_embeds.view(-1, hidden_size)
-                mask_flat = go_mask.view(-1)
-                idx = mask_flat.nonzero(as_tuple=False).squeeze(1)
-                diff = go_embeds_flat - embeds_2d.index_select(0, idx)
-                embeds_2d = embeds_2d.scatter_add(0, idx.unsqueeze(1).expand(-1, hidden_size), diff)
-                text_inputs_embeds = embeds_2d.view(orig_shape)
+            prepared_inputs_embeds = prepared["inputs_embeds"]
+        text_inputs_embeds = prepared_inputs_embeds
 
         # Generation with embeddings
         text_inputs_embeds = text_inputs_embeds.to(input_ids.device)

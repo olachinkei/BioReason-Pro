@@ -150,6 +150,11 @@ class TrainingTrackingContractsTest(unittest.TestCase):
             batch_size=2,
             train_batch_size=2,
             eval_batch_size=4,
+            per_device_train_batch_size=1,
+            per_device_eval_batch_size=4,
+            world_size=8,
+            global_unique_proteins_per_step=8,
+            global_num_trajectories_per_step=192,
             gradient_accumulation_steps=1,
             adam_beta1=0.9,
             adam_beta2=0.999,
@@ -202,6 +207,10 @@ class TrainingTrackingContractsTest(unittest.TestCase):
             weave_trace_budget=64,
             weave_trace_full_group_count=4,
             weave_trace_full_rollouts_per_group=24,
+            distributed_enabled=True,
+            distributed_strategy="single_node_ddp",
+            multimodal_cache_enabled=True,
+            ref_logprob_cache_enabled=True,
             job_time_limit="12:00:00",
             training_stage=None,
             cafa5_dataset_name="disease_temporal_hc_reasoning_v1",
@@ -229,6 +238,11 @@ class TrainingTrackingContractsTest(unittest.TestCase):
         self.assertFalse(config["include_protein_function_summary"])
         self.assertEqual(config["train_batch_size"], 2)
         self.assertEqual(config["eval_batch_size"], 4)
+        self.assertEqual(config["per_device_train_batch_size"], 1)
+        self.assertEqual(config["per_device_eval_batch_size"], 4)
+        self.assertEqual(config["world_size"], 8)
+        self.assertEqual(config["global_unique_proteins_per_step"], 8)
+        self.assertEqual(config["global_num_trajectories_per_step"], 192)
         self.assertEqual(config["max_eval_samples"], 100)
         self.assertEqual(config["eval_sample_strategy"], "stratified_aspect_profile")
         self.assertEqual(config["max_eval_batches"], 0)
@@ -261,6 +275,10 @@ class TrainingTrackingContractsTest(unittest.TestCase):
         self.assertEqual(config["kl_beta"], 1e-4)
         self.assertEqual(config["weave_trace_full_group_count"], 4)
         self.assertEqual(config["weave_trace_full_rollouts_per_group"], 24)
+        self.assertTrue(config["distributed_enabled"])
+        self.assertEqual(config["distributed_strategy"], "single_node_ddp")
+        self.assertTrue(config["multimodal_cache_enabled"])
+        self.assertTrue(config["ref_logprob_cache_enabled"])
         self.assertEqual(config["rotating_eval_every_n_steps"], 100)
         self.assertEqual(metadata["checkpoint_dir"], "data/artifacts/models/train_rl_output/demo")
 

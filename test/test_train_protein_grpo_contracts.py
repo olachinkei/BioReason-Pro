@@ -47,9 +47,9 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertIn('SFT_CONVERSION_LORA_DROPOUT=${SFT_CONVERSION_LORA_DROPOUT:-0.05}', wrapper_text)
         self.assertIn('CAFA5_DATASET=${CAFA5_DATASET:-""}', wrapper_text)
         self.assertIn('WEAVE_TRACE_BUDGET=${WEAVE_TRACE_BUDGET:-128}', wrapper_text)
-        self.assertIn('EVAL_BATCH_SIZE=${EVAL_BATCH_SIZE:-4}', wrapper_text)
-        self.assertIn('TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-8}', wrapper_text)
-        self.assertIn('MAX_EVAL_SAMPLES=${MAX_EVAL_SAMPLES:-128}', wrapper_text)
+        self.assertIn('PER_DEVICE_TRAIN_BATCH_SIZE=${PER_DEVICE_TRAIN_BATCH_SIZE:-${TRAIN_BATCH_SIZE:-1}}', wrapper_text)
+        self.assertIn('PER_DEVICE_EVAL_BATCH_SIZE=${PER_DEVICE_EVAL_BATCH_SIZE:-${EVAL_BATCH_SIZE:-4}}', wrapper_text)
+        self.assertIn('MAX_EVAL_SAMPLES=${MAX_EVAL_SAMPLES:-200}', wrapper_text)
         self.assertIn('MAX_EVAL_BATCHES=${MAX_EVAL_BATCHES:-0}', wrapper_text)
         self.assertIn('ROTATING_EVAL_EVERY_N_STEPS=${ROTATING_EVAL_EVERY_N_STEPS:-100}', wrapper_text)
         self.assertIn('ROTATING_EVAL_MAX_SAMPLES=${ROTATING_EVAL_MAX_SAMPLES:-256}', wrapper_text)
@@ -75,6 +75,9 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertIn('REWARD_WEIGHTS=${REWARD_WEIGHTS:-"1.0"}', wrapper_text)
         self.assertIn('PYTHON_BIN=${PYTHON_BIN:-""}', wrapper_text)
         self.assertIn('if [ -x "$(pwd)/.venv-gpu/bin/python" ]; then', wrapper_text)
+        self.assertIn('if [ "$TRAIN_NUM_GPUS" -gt 1 ]; then', wrapper_text)
+        self.assertIn('torch.distributed.run', wrapper_text)
+        self.assertIn('--nproc_per_node "$TRAIN_NUM_GPUS"', wrapper_text)
         self.assertIn('ADD_UNIPROT_SUMMARY=${ADD_UNIPROT_SUMMARY:-"False"}', wrapper_text)
         self.assertIn('INCLUDE_PROTEIN_FUNCTION_SUMMARY=${INCLUDE_PROTEIN_FUNCTION_SUMMARY:-"False"}', wrapper_text)
         self.assertIn('REASONING_PROMPT_STYLE=${REASONING_PROMPT_STYLE:-"paper_compact"}', wrapper_text)
@@ -127,7 +130,10 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertIn('--compact_interpro_limit "$COMPACT_INTERPRO_LIMIT"', wrapper_text)
         self.assertIn('--compact_ppi_limit "$COMPACT_PPI_LIMIT"', wrapper_text)
         self.assertIn('--compact_go_speculation_limit "$COMPACT_GO_SPECULATION_LIMIT"', wrapper_text)
-        self.assertIn('stdbuf -oL -eL "${TRAIN_COMMAND[@]}" "$PYTHON_BIN" train_protein_grpo.py', wrapper_text)
+        self.assertIn('--per_device_train_batch_size "$PER_DEVICE_TRAIN_BATCH_SIZE"', wrapper_text)
+        self.assertIn('--per_device_eval_batch_size "$PER_DEVICE_EVAL_BATCH_SIZE"', wrapper_text)
+        self.assertIn('TRAIN_LAUNCH_PREFIX=()', wrapper_text)
+        self.assertIn('stdbuf -oL -eL "${TRAIN_COMMAND[@]}" "${TRAIN_LAUNCH_PREFIX[@]}" train_protein_grpo.py', wrapper_text)
 
     def test_extract_go_ids_preserves_order_and_deduplicates(self):
         text = "GO:0008150 and GO:0003674 and GO:0008150 again"
@@ -272,6 +278,17 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertEqual(len(grouped_advantages), 2)
         self.assertAlmostEqual(sum(grouped_advantages[0]) + sum(grouped_advantages[1]), 0.0, places=5)
 
+    def test_build_batch_semantics_matches_single_node_8gpu_target(self):
+        args = mock.Mock(train_batch_size=1, eval_batch_size=4, num_generations=24)
+
+        semantics = GRPO.build_batch_semantics(args, world_size=8)
+
+        self.assertEqual(semantics["per_device_train_batch_size"], 1)
+        self.assertEqual(semantics["per_device_eval_batch_size"], 4)
+        self.assertEqual(semantics["world_size"], 8)
+        self.assertEqual(semantics["global_unique_proteins_per_step"], 8)
+        self.assertEqual(semantics["global_num_trajectories_per_step"], 192)
+
     def test_truncation_penalty_reward_penalizes_long_non_terminal_output(self):
         completion = "<think>reasoning</think>" + " word" * 330
 
@@ -321,9 +338,9 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertEqual(args.reasoning_dataset_config, "disease_temporal_hc_reasoning_v1")
         self.assertEqual(args.checkpoint_artifact_name, "train-rl-output")
         self.assertEqual(args.output_dir, "data/artifacts/models/train_rl_output")
-        self.assertEqual(args.train_batch_size, 8)
+        self.assertEqual(args.train_batch_size, 1)
         self.assertEqual(args.eval_batch_size, 4)
-        self.assertEqual(args.max_eval_samples, 128)
+        self.assertEqual(args.max_eval_samples, 200)
         self.assertEqual(args.eval_sample_strategy, "stratified_aspect_profile")
         self.assertEqual(args.max_eval_batches, 0)
         self.assertEqual(args.loss_type, "dr_grpo")

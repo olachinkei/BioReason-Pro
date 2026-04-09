@@ -10,6 +10,7 @@ GO encoder, and reasoning dataset format intact.
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 from functools import lru_cache
 import importlib.util
 import json
@@ -751,6 +752,7 @@ def compute_batch_relative_advantages(
     *,
     epsilon_std: float = 1e-6,
     reward_scaling: str = "batch",
+    distributed_device: Any = None,
 ) -> Tuple[List[List[float]], float]:
     if not grouped_rewards:
         return [], 0.0
@@ -762,8 +764,25 @@ def compute_batch_relative_advantages(
     if not flat_rewards:
         return [[] for _ in grouped_rewards], 0.0
 
-    flat_mean = sum(flat_rewards) / len(flat_rewards)
-    variance = sum((reward - flat_mean) ** 2 for reward in flat_rewards) / len(flat_rewards)
+    flat_sum = float(sum(flat_rewards))
+    flat_sq_sum = float(sum(reward * reward for reward in flat_rewards))
+    flat_count = float(len(flat_rewards))
+
+    if distributed_device is not None and is_distributed_enabled():
+        import torch
+
+        stats = torch.tensor(
+            [flat_sum, flat_sq_sum, flat_count],
+            device=distributed_device,
+            dtype=torch.float64,
+        )
+        distributed_reduce_tensor(stats, op="sum")
+        flat_sum = float(stats[0].item())
+        flat_sq_sum = float(stats[1].item())
+        flat_count = float(stats[2].item())
+
+    flat_mean = flat_sum / flat_count
+    variance = (flat_sq_sum / flat_count) - (flat_mean * flat_mean)
     global_std = math.sqrt(max(variance, 0.0))
     if global_std < epsilon_std:
         return [[0.0 for _ in group_rewards] for group_rewards in grouped_rewards], global_std
@@ -927,8 +946,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--learning_rate", type=float, default=3e-5)
     parser.add_argument("--weight_decay", type=float, default=0.0)
-    parser.add_argument("--train_batch_size", type=int, default=8)
-    parser.add_argument("--eval_batch_size", type=int, default=4)
+    parser.add_argument(
+        "--train_batch_size",
+        "--per_device_train_batch_size",
+        dest="train_batch_size",
+        type=int,
+        default=1,
+    )
+    parser.add_argument(
+        "--eval_batch_size",
+        "--per_device_eval_batch_size",
+        dest="eval_batch_size",
+        type=int,
+        default=4,
+    )
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--max_steps", type=int, default=300)
     parser.add_argument("--max_epochs", type=int, default=1)
@@ -939,7 +970,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr_scheduler_type", type=str, default="cosine", choices=["constant", "cosine"])
     parser.add_argument("--warmup_ratio", type=float, default=0.03)
     parser.add_argument("--max_train_samples", type=int, default=-1)
-    parser.add_argument("--max_eval_samples", type=int, default=128)
+    parser.add_argument("--max_eval_samples", type=int, default=200)
     parser.add_argument(
         "--eval_sample_strategy",
         type=str,
@@ -1048,6 +1079,143 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         setattr(args, field_name, _str2bool(getattr(args, field_name)))
 
     return args
+
+
+def can_cache_multimodal_prefix(args: argparse.Namespace) -> bool:
+    return not any(
+        (
+            getattr(args, "protein_model_finetune", False),
+            getattr(args, "train_projector", False),
+            getattr(args, "train_go_modules", False),
+        )
+    )
+
+
+def build_batch_semantics(args: argparse.Namespace, world_size: int) -> Dict[str, float]:
+    per_device_train_batch_size = max(int(getattr(args, "train_batch_size", 1)), 1)
+    per_device_eval_batch_size = max(int(getattr(args, "eval_batch_size", 1)), 1)
+    num_generations = max(int(getattr(args, "num_generations", 1)), 1)
+    global_unique_proteins_per_step = int(per_device_train_batch_size * max(int(world_size), 1))
+    return {
+        "per_device_train_batch_size": per_device_train_batch_size,
+        "per_device_eval_batch_size": per_device_eval_batch_size,
+        "world_size": max(int(world_size), 1),
+        "global_unique_proteins_per_step": global_unique_proteins_per_step,
+        "global_num_trajectories_per_step": global_unique_proteins_per_step * num_generations,
+        "global_unique_proteins_target": global_unique_proteins_per_step,
+    }
+
+
+def unwrap_model(model: Any) -> Any:
+    return model.module if hasattr(model, "module") else model
+
+
+def is_distributed_enabled() -> bool:
+    try:
+        import torch.distributed as dist
+    except ImportError:
+        return False
+    return dist.is_available() and dist.is_initialized()
+
+
+def get_distributed_rank() -> int:
+    if not is_distributed_enabled():
+        return 0
+    import torch.distributed as dist
+
+    return int(dist.get_rank())
+
+
+def get_distributed_world_size() -> int:
+    if not is_distributed_enabled():
+        return 1
+    import torch.distributed as dist
+
+    return int(dist.get_world_size())
+
+
+def is_main_process() -> bool:
+    return get_distributed_rank() == 0
+
+
+def distributed_barrier() -> None:
+    if not is_distributed_enabled():
+        return
+    import torch.distributed as dist
+
+    dist.barrier()
+
+
+def distributed_reduce_tensor(tensor: Any, *, op: str = "sum") -> Any:
+    if not is_distributed_enabled():
+        return tensor
+    import torch.distributed as dist
+
+    if op == "sum":
+        reduce_op = dist.ReduceOp.SUM
+    elif op == "max":
+        reduce_op = dist.ReduceOp.MAX
+    else:
+        raise ValueError(f"Unsupported distributed reduce op: {op}")
+    dist.all_reduce(tensor, op=reduce_op)
+    return tensor
+
+
+def distributed_sum_scalar(value: float, device: Any) -> float:
+    import torch
+
+    tensor = torch.tensor(float(value), device=device, dtype=torch.float64)
+    distributed_reduce_tensor(tensor, op="sum")
+    return float(tensor.item())
+
+
+def distributed_max_scalar(value: float, device: Any) -> float:
+    import torch
+
+    tensor = torch.tensor(float(value), device=device, dtype=torch.float64)
+    distributed_reduce_tensor(tensor, op="max")
+    return float(tensor.item())
+
+
+def init_distributed_runtime() -> Dict[str, Any]:
+    import torch
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("train_protein_grpo.py requires CUDA. Run it on the CoreWeave GPU cluster.")
+
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank_env = os.environ.get("LOCAL_RANK")
+    local_rank = int(local_rank_env) if local_rank_env is not None else 0
+
+    runtime = {
+        "enabled": world_size > 1,
+        "rank": rank,
+        "world_size": world_size,
+        "local_rank": local_rank,
+        "backend": None,
+    }
+
+    if world_size > 1:
+        import torch.distributed as dist
+
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl", init_method="env://")
+        runtime["backend"] = "nccl"
+        runtime["device"] = torch.device("cuda", local_rank)
+    else:
+        torch.cuda.set_device(0)
+        runtime["device"] = torch.device("cuda", 0)
+
+    return runtime
+
+
+def cleanup_distributed_runtime() -> None:
+    if not is_distributed_enabled():
+        return
+    import torch.distributed as dist
+
+    dist.destroy_process_group()
 
 
 def set_seed(seed: int) -> None:
@@ -1297,25 +1465,47 @@ def load_rl_datasets(args: argparse.Namespace) -> Tuple[Any, Any, Any]:
     return train_dataset, fixed_val_dataset, full_val_dataset
 
 
-def build_dataloader(dataset: Any, model: Any, batch_size: int, num_workers: int, shuffle: bool) -> Any:
+def build_dataloader(
+    dataset: Any,
+    model: Any,
+    batch_size: int,
+    num_workers: int,
+    shuffle: bool,
+    *,
+    distributed: bool = False,
+    seed: int = 42,
+) -> Any:
     from functools import partial
 
     from torch.utils.data import DataLoader
+    from torch.utils.data.distributed import DistributedSampler
 
     from bioreason2.dataset.cafa5.collate import qwen_protein_collate_fn
 
+    base_model = unwrap_model(model)
     collate_fn = partial(
         qwen_protein_collate_fn,
-        processor=model.processor,
-        max_length_text=model.max_length_text,
-        max_length_protein=model.max_length_protein,
+        processor=base_model.processor,
+        max_length_text=base_model.max_length_text,
+        max_length_protein=base_model.max_length_protein,
         return_answer_in_batch=False,
         inference_mode=True,
     )
+    sampler = None
+    if distributed:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=get_distributed_world_size(),
+            rank=get_distributed_rank(),
+            shuffle=shuffle,
+            seed=seed,
+            drop_last=False,
+        )
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=shuffle if sampler is None else False,
+        sampler=sampler,
         num_workers=num_workers,
         collate_fn=collate_fn,
     )
@@ -1401,6 +1591,15 @@ def expand_example_for_rollouts(example: Mapping[str, Any], rollout_count: int) 
     }
 
 
+def expand_single_example_multimodal_cache(model: Any, cache: Optional[Dict[str, Any]], rollout_count: int) -> Optional[Dict[str, Any]]:
+    if cache is None:
+        return None
+    expand = getattr(model, "expand_multimodal_cache", None)
+    if not callable(expand):
+        return None
+    return expand(cache, rollout_count)
+
+
 def decode_completion(tokenizer: Any, completion_ids: Any) -> str:
     text = tokenizer.decode(completion_ids, skip_special_tokens=False).strip()
     for marker in ("<|im_end|>", "<|endoftext|>"):
@@ -1465,6 +1664,8 @@ def build_rollout_group_inputs(
     example: Mapping[str, Any],
     completion_ids_list: Sequence[Any],
     pad_token_id: int,
+    *,
+    multimodal_cache: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     import torch
 
@@ -1507,6 +1708,7 @@ def build_rollout_group_inputs(
         "batch_idx_map": expanded_example["batch_idx_map"],
         "structure_coords": expanded_example["structure_coords"],
         "go_aspects": expanded_example["go_aspects"],
+        "multimodal_cache": multimodal_cache,
     }
 
 
@@ -1546,6 +1748,21 @@ def slice_rollout_group(
     elif isinstance(structure_coords, list) and len(structure_coords) == total_rollouts:
         structure_coords = structure_coords[start_idx:end_idx]
 
+    multimodal_cache = rollout_group.get("multimodal_cache")
+    sliced_multimodal_cache = None
+    if isinstance(multimodal_cache, Mapping):
+        sliced_multimodal_cache = {
+            "batch_size": end_idx - start_idx,
+            "protein_embeddings": None,
+            "go_embeddings": None,
+        }
+        protein_embeddings = multimodal_cache.get("protein_embeddings")
+        if isinstance(protein_embeddings, list):
+            sliced_multimodal_cache["protein_embeddings"] = protein_embeddings[start_idx:end_idx]
+        go_embeddings = multimodal_cache.get("go_embeddings")
+        if isinstance(go_embeddings, list):
+            sliced_multimodal_cache["go_embeddings"] = go_embeddings[start_idx:end_idx]
+
     return {
         "combined_input_ids": rollout_group["combined_input_ids"][start_idx:end_idx],
         "combined_attention_mask": rollout_group["combined_attention_mask"][start_idx:end_idx],
@@ -1555,6 +1772,7 @@ def slice_rollout_group(
         "batch_idx_map": sliced_batch_idx_map,
         "structure_coords": structure_coords,
         "go_aspects": list(rollout_group["go_aspects"][start_idx:end_idx]),
+        "multimodal_cache": sliced_multimodal_cache,
     }
 
 
@@ -1570,6 +1788,26 @@ def build_combined_inputs(prompt_input_ids: Any, prompt_attention_mask: Any, com
     return combined_input_ids, combined_attention_mask, prompt_len
 
 
+def maybe_build_example_multimodal_cache(
+    model: Any,
+    example: Mapping[str, Any],
+    args: argparse.Namespace,
+) -> Optional[Dict[str, Any]]:
+    if not can_cache_multimodal_prefix(args):
+        return None
+    base_model = unwrap_model(model)
+    build_cache = getattr(base_model, "build_multimodal_cache", None)
+    if not callable(build_cache):
+        return None
+    return build_cache(
+        protein_sequences=list(example.get("protein_sequences") or []),
+        batch_idx_map=list(example.get("batch_idx_map") or []),
+        batch_size=int(example["input_ids"].shape[0]),
+        structure_coords=example.get("structure_coords"),
+        go_aspects=list(example.get("go_aspects") or []),
+    )
+
+
 def compute_completion_token_log_probs(
     model: Any,
     input_ids: Any,
@@ -1579,6 +1817,7 @@ def compute_completion_token_log_probs(
     batch_idx_map: Sequence[int],
     structure_coords: Any,
     go_aspects: Sequence[str],
+    multimodal_cache: Optional[Dict[str, Any]] = None,
 ) -> Any:
     import torch
     import torch.nn.functional as F
@@ -1590,6 +1829,7 @@ def compute_completion_token_log_probs(
         batch_idx_map=list(batch_idx_map),
         structure_coords=structure_coords,
         go_aspects=list(go_aspects),
+        multimodal_cache=multimodal_cache,
     )
     logits = outputs.logits[:, :-1, :]
     targets = input_ids[:, 1:]
@@ -1693,6 +1933,7 @@ def compute_rollout_policy_statistics(
             subgroup["batch_idx_map"],
             subgroup["structure_coords"],
             subgroup["go_aspects"],
+            subgroup.get("multimodal_cache"),
         )
         token_mask = subgroup["completion_attention"].to(device=token_log_probs.device, dtype=token_log_probs.dtype)
         sequence_log_probs = (token_log_probs * token_mask).sum(dim=1)
@@ -1726,10 +1967,16 @@ def compute_old_policy_sequence_log_probs(
     completion_ids_list: Sequence[Any],
     pad_token_id: int,
     microbatch_size: int = 0,
+    multimodal_cache: Optional[Dict[str, Any]] = None,
 ) -> List[float]:
     import torch
 
-    rollout_group = build_rollout_group_inputs(example, completion_ids_list, pad_token_id)
+    rollout_group = build_rollout_group_inputs(
+        example,
+        completion_ids_list,
+        pad_token_id,
+        multimodal_cache=multimodal_cache,
+    )
     valid_mask = rollout_group["completion_attention"].bool()
     if not torch.any(valid_mask.any(dim=1)):
         return [0.0 for _ in completion_ids_list]
@@ -1743,6 +1990,28 @@ def compute_old_policy_sequence_log_probs(
     return [float(value.detach().item()) for value in sequence_log_probs]
 
 
+def precompute_ref_policy_log_probs(
+    ref_model: Any,
+    rollout_group: Mapping[str, Any],
+    *,
+    microbatch_size: int = 0,
+) -> Optional[Any]:
+    import torch
+
+    if ref_model is None:
+        return None
+    valid_mask = rollout_group["completion_attention"].bool()
+    if not torch.any(valid_mask.any(dim=1)):
+        return None
+    with torch.no_grad():
+        ref_log_probs, _, _ = compute_rollout_policy_statistics(
+            ref_model,
+            rollout_group,
+            microbatch_size=microbatch_size,
+        )
+    return ref_log_probs
+
+
 def compute_group_policy_losses_batched(
     model: Any,
     ref_model: Any,
@@ -1752,10 +2021,13 @@ def compute_group_policy_losses_batched(
     old_sequence_log_probs: Sequence[float],
     pad_token_id: int,
     args: argparse.Namespace,
+    rollout_group: Optional[Mapping[str, Any]] = None,
+    cached_ref_log_probs: Optional[Any] = None,
 ) -> Tuple[Any, Dict[str, float], bool]:
     import torch
 
-    rollout_group = build_rollout_group_inputs(example, completion_ids_list, pad_token_id)
+    if rollout_group is None:
+        rollout_group = build_rollout_group_inputs(example, completion_ids_list, pad_token_id)
     valid_mask = rollout_group["completion_attention"].bool()
     nonempty_rollouts = valid_mask.any(dim=1)
     if not torch.any(nonempty_rollouts):
@@ -1768,7 +2040,9 @@ def compute_group_policy_losses_batched(
     )
 
     with torch.no_grad():
-        if ref_model is not None:
+        if cached_ref_log_probs is not None:
+            ref_log_probs = cached_ref_log_probs.to(device=current_log_probs.device, dtype=current_log_probs.dtype)
+        elif ref_model is not None:
             ref_log_probs, _, _ = compute_rollout_policy_statistics(
                 ref_model,
                 rollout_group,
@@ -1821,6 +2095,8 @@ def compute_group_policy_losses_sequential(
     advantages: Sequence[float],
     old_sequence_log_probs: Sequence[float],
     args: argparse.Namespace,
+    multimodal_cache: Optional[Dict[str, Any]] = None,
+    cached_ref_log_probs: Optional[Any] = None,
 ) -> Tuple[Any, Dict[str, float], bool]:
     import torch
 
@@ -1828,7 +2104,9 @@ def compute_group_policy_losses_sequential(
     kl_values: List[float] = []
     ratio_values: List[float] = []
     trainable = False
-    for completion_ids, advantage, old_sequence_log_prob in zip(completion_ids_list, advantages, old_sequence_log_probs):
+    for rollout_idx, (completion_ids, advantage, old_sequence_log_prob) in enumerate(
+        zip(completion_ids_list, advantages, old_sequence_log_probs)
+    ):
         if completion_ids.numel() <= 0:
             continue
         trainable = True
@@ -1846,9 +2124,15 @@ def compute_group_policy_losses_sequential(
             example["batch_idx_map"],
             example["structure_coords"],
             example["go_aspects"],
+            multimodal_cache,
         )
         with torch.no_grad():
-            if ref_model is not None:
+            if cached_ref_log_probs is not None:
+                ref_log_probs = cached_ref_log_probs[rollout_idx : rollout_idx + 1].to(
+                    device=current_log_probs.device,
+                    dtype=current_log_probs.dtype,
+                )
+            elif ref_model is not None:
                 ref_log_probs = compute_completion_token_log_probs(
                     ref_model,
                     combined_ids,
@@ -1858,6 +2142,7 @@ def compute_group_policy_losses_sequential(
                     example["batch_idx_map"],
                     example["structure_coords"],
                     example["go_aspects"],
+                    multimodal_cache,
                 )
             else:
                 ref_log_probs = torch.zeros_like(current_log_probs)
@@ -1897,6 +2182,7 @@ def generate_rollouts_sequential(
     global_step: int,
     epoch_idx: int,
     prompt_len: int,
+    example_multimodal_cache: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Any], List[str]]:
     completion_ids_list: List[Any] = []
     completions: List[str] = []
@@ -1914,6 +2200,7 @@ def generate_rollouts_sequential(
             batch_idx_map=example["batch_idx_map"],
             structure_coords=example["structure_coords"],
             go_aspects=example["go_aspects"],
+            multimodal_cache=example_multimodal_cache,
             **generation_kwargs,
         )
         completion_ids = extract_completion_ids(generated_ids, example["input_ids"])
@@ -1934,11 +2221,13 @@ def generate_rollouts_for_example(
     *,
     global_step: int,
     epoch_idx: int,
+    example_multimodal_cache: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Any], List[str]]:
     import torch
 
     prompt_len = example["input_ids"].shape[1]
     rollout_batch = expand_example_for_rollouts(example, args.num_generations)
+    rollout_multimodal_cache = expand_single_example_multimodal_cache(model, example_multimodal_cache, args.num_generations)
     generation_kwargs = build_generation_kwargs(args, tokenizer, for_eval=False)
     try:
         print(
@@ -1953,6 +2242,7 @@ def generate_rollouts_for_example(
             batch_idx_map=rollout_batch["batch_idx_map"],
             structure_coords=rollout_batch["structure_coords"],
             go_aspects=rollout_batch["go_aspects"],
+            multimodal_cache=rollout_multimodal_cache,
             **generation_kwargs,
         )
         completion_ids_list = extract_completion_ids_batch(generated_ids, rollout_batch["input_ids"])
@@ -1986,6 +2276,7 @@ def generate_rollouts_for_example(
         global_step=global_step,
         epoch_idx=epoch_idx,
         prompt_len=prompt_len,
+        example_multimodal_cache=example_multimodal_cache,
     )
 
 
@@ -2181,6 +2472,7 @@ def compute_reward_diagnostics(
 def save_raw_checkpoint(model: Any, checkpoint_dir: Path, step: int, args: argparse.Namespace) -> Path:
     import torch
 
+    model = unwrap_model(model)
     step_dir = checkpoint_dir / f"checkpoint-{step}"
     step_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2217,6 +2509,7 @@ def export_hf_model(model: Any, save_dir: Path) -> None:
     import shutil
     import torch
 
+    model = unwrap_model(model)
     export_dir = save_dir / "exported_hf"
     if export_dir.exists():
         shutil.rmtree(export_dir)
@@ -2567,8 +2860,31 @@ def maybe_run_rotating_validation_eval(
     return rotating_metrics
 
 
+def build_zero_connected_loss(model: Any) -> Any:
+    import torch
+
+    reference_param = None
+    for param in model.parameters():
+        if param.requires_grad:
+            reference_param = param
+            break
+    if reference_param is None:
+        device = next(model.parameters()).device
+        return torch.zeros((), device=device, dtype=torch.float32)
+    return reference_param.reshape(-1)[0] * 0.0
+
+
+def aggregate_mean_metric(local_sum: float, local_count: float, device: Any) -> float:
+    global_sum = distributed_sum_scalar(local_sum, device)
+    global_count = distributed_sum_scalar(local_count, device)
+    if global_count <= 0.0:
+        return 0.0
+    return global_sum / global_count
+
+
 def train(args: argparse.Namespace) -> None:
     import torch
+    from torch.nn.parallel import DistributedDataParallel as DDP
     from torch.nn.utils import clip_grad_norm_
     from torch.optim import AdamW
 
@@ -2581,14 +2897,16 @@ def train(args: argparse.Namespace) -> None:
         prepare_model_artifact_directory,
         sync_run_config,
     )
+    distributed = init_distributed_runtime()
+    device = distributed["device"]
+    rank = distributed["rank"]
+    world_size = distributed["world_size"]
+    is_main = rank == 0
 
-    set_seed(args.seed)
+    set_seed(args.seed + rank)
     configure_reward_context(args)
     torch.set_float32_matmul_precision("high")
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device.type != "cuda":
-        raise RuntimeError("train_protein_grpo.py requires CUDA. Run it on the CoreWeave GPU cluster.")
+    batch_semantics = build_batch_semantics(args, world_size)
 
     run_name = args.run_name or f"train-rl-{int(time.time())}"
     output_dir = Path(args.output_dir)
@@ -2598,364 +2916,143 @@ def train(args: argparse.Namespace) -> None:
 
     tracking_config = build_training_tracking_config(args=args, run_name=run_name, job_type="train_rl")
     tracking_config["model_artifact"] = args.checkpoint_artifact_name or args.model_artifact
+    tracking_config.update(batch_semantics)
+    tracking_config["distributed_enabled"] = distributed["enabled"]
+    tracking_config["distributed_strategy"] = "single_node_ddp" if distributed["enabled"] else "single_gpu"
+    tracking_config["multimodal_cache_enabled"] = can_cache_multimodal_prefix(args)
+    tracking_config["ref_logprob_cache_enabled"] = bool(args.kl_beta > 0)
 
-    model = instantiate_model(args, trainable=True).to(device)
-    ref_model = instantiate_model(args, trainable=False).to(device) if args.kl_beta > 0 else None
+    wandb_run = None
+    weave_trace_state = None
+    final_checkpoint_dir: Optional[Path] = None
 
-    train_dataset, fixed_val_dataset, full_val_dataset = load_rl_datasets(args)
-    train_loader = build_dataloader(train_dataset, model, args.train_batch_size, args.num_workers, shuffle=True)
-    val_loader = build_dataloader(fixed_val_dataset, model, args.eval_batch_size, args.num_workers, shuffle=False)
+    try:
+        base_model = instantiate_model(args, trainable=True).to(device)
+        if args.resume_from_raw_checkpoint:
+            checkpoint = torch.load(args.resume_from_raw_checkpoint, map_location="cpu", weights_only=False)
+            base_model.load_state_dict(checkpoint, strict=False)
+            if is_main:
+                print(f"Resumed RL model weights from {args.resume_from_raw_checkpoint}")
 
-    tokenizer = model.text_tokenizer
-    reward_names = parse_csv_items(args.reward_funcs)
-    reward_weights = parse_reward_weights(args.reward_weights, len(reward_names))
-    reward_context = resolve_reward_context()
-    resolved_ia_file_path = require_training_ia_file(args, reward_names)
-    if resolved_ia_file_path:
-        print(f"Using IA-weighted RL reward with IA file: {resolved_ia_file_path}")
-
-    if args.resume_from_raw_checkpoint:
-        checkpoint = torch.load(args.resume_from_raw_checkpoint, map_location="cpu", weights_only=False)
-        model.load_state_dict(checkpoint, strict=False)
-        print(f"Resumed RL model weights from {args.resume_from_raw_checkpoint}")
-
-    optimizer = AdamW(
-        [parameter for parameter in model.parameters() if parameter.requires_grad],
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay,
-        betas=(args.adam_beta1, args.adam_beta2),
-        eps=args.adam_epsilon,
-    )
-    total_update_passes = max(args.max_steps, 1) * max(args.steps_per_generation, 1) * max(args.num_iterations, 1)
-    optimizer_step_budget = max(math.ceil(total_update_passes / max(args.gradient_accumulation_steps, 1)), 1)
-    warmup_steps = int(optimizer_step_budget * max(args.warmup_ratio, 0.0))
-    if args.lr_scheduler_type == "cosine":
-        from transformers import get_cosine_schedule_with_warmup
-
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=optimizer_step_budget,
-        )
-    else:
-        scheduler = None
-
-    ensure_weave_server_cache_dir(output_dir)
-    wandb_run = maybe_init_wandb(args, tracking_config)
-
-    if wandb_run is not None:
-        sync_run_config(wandb_run, tracking_config)
-        sync_run_config(
-            wandb_run,
-            {
-                "dataset_train_size": len(train_dataset),
-                "dataset_validation_size": len(fixed_val_dataset),
-                "dataset_validation_full_size": len(full_val_dataset),
-            },
-        )
-        maybe_use_artifact_refs(
-            wandb_run,
-            {
-                "temporal_split_artifact": args.temporal_split_artifact,
-                "dataset_artifact": args.dataset_artifact,
-                "base_checkpoint": args.base_checkpoint,
-            },
-        )
-        maybe_bootstrap_wandb_history(
-            wandb_run,
-            reward_names=reward_names,
-        )
-    weave_trace_state = maybe_init_weave(args, output_dir)
-    if wandb_run is not None:
-        sync_run_config(
-            wandb_run,
-            {
-                "weave_trace_enabled": bool(weave_trace_state is not None),
-                "weave_trace_budget": int(getattr(args, "weave_trace_budget", 0)),
-            },
-        )
-
-    best_val_reward = float("-inf")
-    global_step = 0
-    last_eval_step: Optional[int] = None
-    optimizer_substep = 0
-    optimizer.zero_grad(set_to_none=True)
-
-    for epoch_idx in range(args.max_epochs):
-        if global_step >= args.max_steps:
-            break
-
-        for batch in train_loader:
-            model.train()
-            print(f"Starting RL train batch at global_step={global_step}, epoch={epoch_idx}.")
-            batch_size = batch["input_ids"].shape[0]
-            reward_totals: List[float] = []
-            reward_component_scores: Dict[str, List[float]] = {reward_name: [] for reward_name in reward_names}
-            diagnostic_component_scores: Dict[str, List[float]] = {
-                reward_name: [] for reward_name in DIAGNOSTIC_REWARD_NAMES
-            }
-            completion_lengths: List[int] = []
-            kl_values: List[float] = []
-            ratio_means: List[float] = []
-            ratio_maxes: List[float] = []
-            trainable_group_count = 0
-            pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
-            grouped_rewards: List[List[float]] = []
-            rollout_records: List[Dict[str, Any]] = []
-
-            for example_idx in range(batch_size):
-                example = extract_example_from_batch(batch, example_idx, device)
-
-                model.eval()
-                completion_ids_list, completions = generate_rollouts_for_example(
-                    model,
-                    example,
-                    tokenizer,
-                    args,
-                    global_step=global_step,
-                    epoch_idx=epoch_idx,
-                )
-                old_sequence_log_probs = compute_old_policy_sequence_log_probs(
-                    model,
-                    example,
-                    completion_ids_list,
-                    pad_token_id,
-                    microbatch_size=args.rollout_logprob_microbatch_size,
-                )
-                model.train()
-                completion_lengths.extend(int(completion_ids.numel()) for completion_ids in completion_ids_list)
-
-                total_rewards, reward_components = compute_group_rewards(
-                    completions,
-                    example["sample_meta"],
-                    reward_names,
-                    reward_weights,
-                )
-                diagnostic_components = compute_reward_diagnostics(completions, example["sample_meta"])
-                grouped_rewards.append(total_rewards)
-                rollout_records.append(
-                    {
-                        "example": example,
-                        "completion_ids_list": completion_ids_list,
-                        "completions": completions,
-                        "total_rewards": total_rewards,
-                        "reward_components": reward_components,
-                        "diagnostic_components": diagnostic_components,
-                        "old_sequence_log_probs": old_sequence_log_probs,
-                    }
-                )
-                for reward_name, scores in reward_components.items():
-                    reward_component_scores.setdefault(reward_name, []).extend(scores)
-                for reward_name, scores in diagnostic_components.items():
-                    diagnostic_component_scores.setdefault(reward_name, []).extend(scores)
-                reward_totals.extend(total_rewards)
-            grouped_advantages, global_reward_std = compute_batch_relative_advantages(
-                grouped_rewards,
-                epsilon_std=args.advantage_epsilon_std,
-                reward_scaling=args.reward_scaling,
+        model = base_model
+        if distributed["enabled"]:
+            model = DDP(
+                base_model,
+                device_ids=[distributed["local_rank"]],
+                output_device=distributed["local_rank"],
+                find_unused_parameters=True,
             )
-            for record, advantages in zip(rollout_records, grouped_advantages):
-                record["advantages"] = advantages
-                if any(completion_ids.numel() > 0 for completion_ids in record["completion_ids_list"]):
-                    trainable_group_count += 1
-                if not record["completions"]:
-                    continue
-                trace_rollout_count = 1
-                if weave_trace_state and weave_trace_state.get("full_group_budget", 0) > 0:
-                    trace_rollout_count = min(
-                        len(record["completions"]),
-                        max(int(weave_trace_state.get("full_group_rollouts", 0)), 1),
-                    )
-                    weave_trace_state["full_group_budget"] -= 1
-                for rollout_idx in range(trace_rollout_count):
-                    maybe_trace_generation(
-                        weave_trace_state,
-                        split="train",
-                        global_step=global_step,
-                        sample_meta=record["example"]["sample_meta"],
-                        completion=record["completions"][rollout_idx],
-                        total_reward=record["total_rewards"][rollout_idx] if record["total_rewards"] else 0.0,
-                        advantage=advantages[rollout_idx] if advantages else None,
-                        reward_components={
-                            reward_name: record["reward_components"][reward_name][rollout_idx]
-                            for reward_name in record["reward_components"]
-                        },
-                    )
+        ref_model = instantiate_model(args, trainable=False).to(device) if args.kl_beta > 0 else None
 
-            if trainable_group_count == 0:
-                global_step += 1
-                skipped_payload = {
-                    "loss_learning_rate": optimizer.param_groups[0]["lr"],
-                    "data_step_num_groups_submitted": float(batch_size),
-                    "data_step_num_groups_trainable": float(trainable_group_count),
-                    "data_step_num_trajectories": float(len(reward_totals)),
-                    "data_step_num_datums": float(batch_size),
-                    "data_step_trainer_tokens": float(sum(completion_lengths)),
-                    "reward": sum(reward_totals) / max(len(reward_totals), 1) if reward_totals else 0.0,
-                    "reward_std_dev": float(global_reward_std),
-                    "train_skipped_update": 1.0,
-                }
-                for reward_name, scores in reward_component_scores.items():
-                    if scores:
-                        skipped_payload[f"reward_component/{reward_name}"] = sum(scores) / len(scores)
-                for reward_name, scores in diagnostic_component_scores.items():
-                    if scores:
-                        skipped_payload[f"diagnostic/{reward_name}"] = sum(scores) / len(scores)
-                if wandb_run is not None:
-                    print(f"Logging RL skipped-update metrics at global_step={global_step}.")
-                    wandb_run.log(attach_global_step(skipped_payload, global_step), step=global_step)
-                    print(f"RL skipped-update metrics logged at global_step={global_step}.")
+        train_dataset, fixed_val_dataset, full_val_dataset = load_rl_datasets(args)
+        train_loader = build_dataloader(
+            train_dataset,
+            model,
+            int(batch_semantics["per_device_train_batch_size"]),
+            args.num_workers,
+            shuffle=True,
+            distributed=distributed["enabled"],
+            seed=args.seed,
+        )
+        val_loader = None
+        if is_main:
+            val_loader = build_dataloader(
+                fixed_val_dataset,
+                model,
+                int(batch_semantics["per_device_eval_batch_size"]),
+                args.num_workers,
+                shuffle=False,
+                distributed=False,
+                seed=args.seed,
+            )
 
-                if args.eval_every_n_steps > 0 and global_step % args.eval_every_n_steps == 0:
-                    print(f"Starting RL validation eval at global_step={global_step} after skipped update.")
-                    val_metrics = evaluate_policy(
-                        model=model,
-                        ref_model=ref_model,
-                        dataloader=val_loader,
-                        tokenizer=tokenizer,
-                        args=args,
-                        reward_names=reward_names,
-                        reward_weights=reward_weights,
-                        device=device,
-                        trace_state=weave_trace_state,
-                        global_step=global_step,
-                        trace_split_name="validation_fixed",
-                    )
-                    if wandb_run is not None:
-                        wandb_run.log(attach_global_step(val_metrics, global_step), step=global_step)
-                        print(f"RL validation metrics logged at global_step={global_step}.")
-                    last_eval_step = global_step
-                    if val_metrics["eval_reward"] > best_val_reward:
-                        best_val_reward = val_metrics["eval_reward"]
-                        save_raw_checkpoint(model, raw_checkpoint_dir / "best", global_step, args)
-                    maybe_run_rotating_validation_eval(
-                        model=model,
-                        ref_model=ref_model,
-                        full_val_dataset=full_val_dataset,
-                        tokenizer=tokenizer,
-                        args=args,
-                        reward_names=reward_names,
-                        reward_weights=reward_weights,
-                        device=device,
-                        trace_state=weave_trace_state,
-                        global_step=global_step,
-                        wandb_run=wandb_run,
-                    )
+        tokenizer = base_model.text_tokenizer
+        multimodal_cache_enabled = can_cache_multimodal_prefix(args)
+        reward_names = parse_csv_items(args.reward_funcs)
+        reward_weights = parse_reward_weights(args.reward_weights, len(reward_names))
+        resolved_ia_file_path = require_training_ia_file(args, reward_names)
+        if resolved_ia_file_path and is_main:
+            print(f"Using IA-weighted RL reward with IA file: {resolved_ia_file_path}")
 
-                if args.save_every_n_steps > 0 and global_step % args.save_every_n_steps == 0:
-                    save_raw_checkpoint(model, raw_checkpoint_dir, global_step, args)
+        optimizer = AdamW(
+            [parameter for parameter in model.parameters() if parameter.requires_grad],
+            lr=args.learning_rate,
+            weight_decay=args.weight_decay,
+            betas=(args.adam_beta1, args.adam_beta2),
+            eps=args.adam_epsilon,
+        )
+        total_update_passes = max(args.max_steps, 1) * max(args.steps_per_generation, 1) * max(args.num_iterations, 1)
+        optimizer_step_budget = max(math.ceil(total_update_passes / max(args.gradient_accumulation_steps, 1)), 1)
+        warmup_steps = int(optimizer_step_budget * max(args.warmup_ratio, 0.0))
+        if args.lr_scheduler_type == "cosine":
+            from transformers import get_cosine_schedule_with_warmup
 
-                if global_step >= args.max_steps:
-                    break
-                continue
+            scheduler = get_cosine_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=warmup_steps,
+                num_training_steps=optimizer_step_budget,
+            )
+        else:
+            scheduler = None
 
-            grad_norm_value = 0.0
-            optimizer.zero_grad(set_to_none=True)
-            update_losses: List[float] = []
-            total_update_passes = max(args.steps_per_generation, 1) * max(args.num_iterations, 1)
-            for update_idx in range(total_update_passes):
-                update_loss_accumulator = 0.0
-                update_trainable_groups = 0
-                for record in rollout_records:
-                    try:
-                        group_loss, group_metrics, has_trainable_rollout = compute_group_policy_losses_batched(
-                            model,
-                            ref_model,
-                            record["example"],
-                            record["completion_ids_list"],
-                            record["advantages"],
-                            record["old_sequence_log_probs"],
-                            pad_token_id,
-                            args,
-                        )
-                    except torch.cuda.OutOfMemoryError:
-                        print(
-                            "CUDA Out of Memory during batched RL loss computation; "
-                            "falling back to sequential rollout loss computation for this prompt."
-                        )
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        group_loss, group_metrics, has_trainable_rollout = compute_group_policy_losses_sequential(
-                            model,
-                            ref_model,
-                            record["example"],
-                            record["completion_ids_list"],
-                            record["advantages"],
-                            record["old_sequence_log_probs"],
-                            args,
-                        )
-
-                    if not has_trainable_rollout:
-                        continue
-
-                    scaled_group_loss = group_loss / max(float(trainable_group_count), 1.0)
-                    scaled_group_loss.backward()
-                    update_loss_accumulator += float(group_loss.detach().item())
-                    update_trainable_groups += 1
-                    if group_metrics:
-                        if "kl_mean" in group_metrics:
-                            kl_values.append(float(group_metrics["kl_mean"]))
-                        if "ratio_mean" in group_metrics:
-                            ratio_means.append(float(group_metrics["ratio_mean"]))
-                        if "ratio_max" in group_metrics:
-                            ratio_maxes.append(float(group_metrics["ratio_max"]))
-
-                if update_trainable_groups <= 0:
-                    continue
-
-                optimizer_substep += 1
-                should_step = (
-                    optimizer_substep % max(args.gradient_accumulation_steps, 1) == 0
-                    or update_idx == total_update_passes - 1
-                )
-                if should_step:
-                    grad_norm = clip_grad_norm_(
-                        [parameter for parameter in model.parameters() if parameter.requires_grad],
-                        args.max_grad_norm,
-                    )
-                    grad_norm_value = float(grad_norm.item()) if hasattr(grad_norm, "item") else float(grad_norm)
-                    optimizer.step()
-                    if scheduler is not None:
-                        scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
-                update_losses.append(update_loss_accumulator / update_trainable_groups)
-
-            global_step += 1
-
-            log_payload = {
-                "loss_train": sum(update_losses) / max(len(update_losses), 1) if update_losses else 0.0,
-                "reward": sum(reward_totals) / max(len(reward_totals), 1),
-                "reward_std_dev": float(global_reward_std),
-                "loss_kl_div": sum(kl_values) / max(len(kl_values), 1) if kl_values else 0.0,
-                "loss_policy_ratio_mean": sum(ratio_means) / max(len(ratio_means), 1) if ratio_means else 0.0,
-                "loss_policy_ratio_max": max(ratio_maxes) if ratio_maxes else 0.0,
-                "loss_learning_rate": optimizer.param_groups[0]["lr"],
-                "loss_grad_norm": grad_norm_value,
-                "data_step_num_groups_submitted": float(batch_size),
-                "data_step_num_groups_trainable": float(trainable_group_count),
-                "data_step_num_trajectories": float(len(reward_totals)),
-                "data_step_num_datums": float(batch_size),
-                "data_step_trainer_tokens": float(sum(completion_lengths)),
-                "data_step_num_update_passes": float(total_update_passes),
-                "train_skipped_update": 0.0,
-            }
-            for reward_name, scores in reward_component_scores.items():
-                if not scores:
-                    continue
-                log_payload[f"reward_component/{reward_name}"] = sum(scores) / len(scores)
-            for reward_name, scores in diagnostic_component_scores.items():
-                if not scores:
-                    continue
-                log_payload[f"diagnostic/{reward_name}"] = sum(scores) / len(scores)
+        if is_main:
+            ensure_weave_server_cache_dir(output_dir)
+            wandb_run = maybe_init_wandb(args, tracking_config)
             if wandb_run is not None:
-                print(f"Logging RL train metrics at global_step={global_step}.")
-                wandb_run.log(attach_global_step(log_payload, global_step), step=global_step)
-                print(f"RL train metrics logged at global_step={global_step}.")
+                sync_run_config(wandb_run, tracking_config)
+                sync_run_config(
+                    wandb_run,
+                    {
+                        "dataset_train_size": len(train_dataset),
+                        "dataset_validation_size": len(fixed_val_dataset),
+                        "dataset_validation_full_size": len(full_val_dataset),
+                        **batch_semantics,
+                        "distributed_enabled": distributed["enabled"],
+                        "distributed_world_size": world_size,
+                        "distributed_strategy": "single_node_ddp" if distributed["enabled"] else "single_gpu",
+                    },
+                )
+                maybe_use_artifact_refs(
+                    wandb_run,
+                    {
+                        "temporal_split_artifact": args.temporal_split_artifact,
+                        "dataset_artifact": args.dataset_artifact,
+                        "base_checkpoint": args.base_checkpoint,
+                    },
+                )
+                maybe_bootstrap_wandb_history(
+                    wandb_run,
+                    reward_names=reward_names,
+                )
+            weave_trace_state = maybe_init_weave(args, output_dir)
+            if wandb_run is not None:
+                sync_run_config(
+                    wandb_run,
+                    {
+                        "weave_trace_enabled": bool(weave_trace_state is not None),
+                        "weave_trace_budget": int(getattr(args, "weave_trace_budget", 0)),
+                    },
+                )
 
-            if args.eval_every_n_steps > 0 and global_step % args.eval_every_n_steps == 0:
-                print(f"Starting RL validation eval at global_step={global_step}.")
+        best_val_reward = float("-inf")
+        global_step = 0
+        last_eval_step: Optional[int] = None
+        optimizer_substep = 0
+        optimizer.zero_grad(set_to_none=True)
+
+        def maybe_run_eval_and_save(current_step: int) -> None:
+            nonlocal best_val_reward, last_eval_step
+
+            should_eval = args.eval_every_n_steps > 0 and current_step % args.eval_every_n_steps == 0
+            should_save = args.save_every_n_steps > 0 and current_step % args.save_every_n_steps == 0
+            if not should_eval and not should_save:
+                return
+
+            distributed_barrier()
+            if should_eval and is_main and val_loader is not None:
+                print(f"Starting RL validation eval at global_step={current_step}.")
                 val_metrics = evaluate_policy(
-                    model=model,
+                    model=base_model,
                     ref_model=ref_model,
                     dataloader=val_loader,
                     tokenizer=tokenizer,
@@ -2964,18 +3061,18 @@ def train(args: argparse.Namespace) -> None:
                     reward_weights=reward_weights,
                     device=device,
                     trace_state=weave_trace_state,
-                    global_step=global_step,
+                    global_step=current_step,
                     trace_split_name="validation_fixed",
                 )
                 if wandb_run is not None:
-                    wandb_run.log(attach_global_step(val_metrics, global_step), step=global_step)
-                    print(f"RL validation metrics logged at global_step={global_step}.")
-                last_eval_step = global_step
+                    wandb_run.log(attach_global_step(val_metrics, current_step), step=current_step)
+                    print(f"RL validation metrics logged at global_step={current_step}.")
+                last_eval_step = current_step
                 if val_metrics["eval_reward"] > best_val_reward:
                     best_val_reward = val_metrics["eval_reward"]
-                    save_raw_checkpoint(model, raw_checkpoint_dir / "best", global_step, args)
+                    save_raw_checkpoint(base_model, raw_checkpoint_dir / "best", current_step, args)
                 maybe_run_rotating_validation_eval(
-                    model=model,
+                    model=base_model,
                     ref_model=ref_model,
                     full_val_dataset=full_val_dataset,
                     tokenizer=tokenizer,
@@ -2984,41 +3081,363 @@ def train(args: argparse.Namespace) -> None:
                     reward_weights=reward_weights,
                     device=device,
                     trace_state=weave_trace_state,
-                    global_step=global_step,
+                    global_step=current_step,
                     wandb_run=wandb_run,
                 )
+            distributed_barrier()
 
-            if args.save_every_n_steps > 0 and global_step % args.save_every_n_steps == 0:
-                save_raw_checkpoint(model, raw_checkpoint_dir, global_step, args)
+            if should_save and is_main:
+                save_raw_checkpoint(base_model, raw_checkpoint_dir, current_step, args)
+            distributed_barrier()
 
+        for epoch_idx in range(args.max_epochs):
             if global_step >= args.max_steps:
                 break
+            sampler = getattr(train_loader, "sampler", None)
+            if distributed["enabled"] and hasattr(sampler, "set_epoch"):
+                sampler.set_epoch(epoch_idx)
 
-    if global_step > 0 and last_eval_step != global_step:
-        print(f"Starting RL final validation eval at global_step={global_step}.")
-        final_val_metrics = evaluate_policy(
-            model=model,
-            ref_model=ref_model,
-            dataloader=val_loader,
-            tokenizer=tokenizer,
-            args=args,
-            reward_names=reward_names,
-            reward_weights=reward_weights,
-            device=device,
-            trace_state=weave_trace_state,
-            global_step=global_step,
-            trace_split_name="validation_final",
-        )
-        final_val_metrics = {f"final/{key}": value for key, value in final_val_metrics.items()}
-        if wandb_run is not None:
-            wandb_run.log(attach_global_step(final_val_metrics, global_step), step=global_step)
-            print(f"RL final validation metrics logged at global_step={global_step}.")
+            for batch in train_loader:
+                model.train()
+                if is_main:
+                    print(f"Starting RL train batch at global_step={global_step}, epoch={epoch_idx}.")
+                local_batch_size = batch["input_ids"].shape[0]
+                reward_totals: List[float] = []
+                reward_component_scores: Dict[str, List[float]] = {reward_name: [] for reward_name in reward_names}
+                diagnostic_component_scores: Dict[str, List[float]] = {
+                    reward_name: [] for reward_name in DIAGNOSTIC_REWARD_NAMES
+                }
+                completion_lengths: List[int] = []
+                kl_values: List[float] = []
+                ratio_means: List[float] = []
+                ratio_maxes: List[float] = []
+                local_trainable_group_count = 0
+                pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+                grouped_rewards: List[List[float]] = []
+                rollout_records: List[Dict[str, Any]] = []
 
-    final_checkpoint_dir = save_raw_checkpoint(model, raw_checkpoint_dir, global_step, args)
-    export_hf_model(model, output_dir)
+                for example_idx in range(local_batch_size):
+                    example = extract_example_from_batch(batch, example_idx, device)
+                    example_multimodal_cache = (
+                        maybe_build_example_multimodal_cache(base_model, example, args)
+                        if multimodal_cache_enabled
+                        else None
+                    )
+                    rollout_multimodal_cache = (
+                        expand_single_example_multimodal_cache(base_model, example_multimodal_cache, args.num_generations)
+                        if example_multimodal_cache is not None
+                        else None
+                    )
 
-    if wandb_run is not None:
-        try:
+                    base_model.eval()
+                    completion_ids_list, completions = generate_rollouts_for_example(
+                        base_model,
+                        example,
+                        tokenizer,
+                        args,
+                        global_step=global_step,
+                        epoch_idx=epoch_idx,
+                        example_multimodal_cache=example_multimodal_cache,
+                    )
+                    old_sequence_log_probs = compute_old_policy_sequence_log_probs(
+                        base_model,
+                        example,
+                        completion_ids_list,
+                        pad_token_id,
+                        microbatch_size=args.rollout_logprob_microbatch_size,
+                        multimodal_cache=rollout_multimodal_cache,
+                    )
+                    rollout_group = build_rollout_group_inputs(
+                        example,
+                        completion_ids_list,
+                        pad_token_id,
+                        multimodal_cache=rollout_multimodal_cache,
+                    )
+                    cached_ref_log_probs = precompute_ref_policy_log_probs(
+                        ref_model,
+                        rollout_group,
+                        microbatch_size=args.rollout_logprob_microbatch_size,
+                    )
+                    model.train()
+                    completion_lengths.extend(int(completion_ids.numel()) for completion_ids in completion_ids_list)
+
+                    total_rewards, reward_components = compute_group_rewards(
+                        completions,
+                        example["sample_meta"],
+                        reward_names,
+                        reward_weights,
+                    )
+                    diagnostic_components = compute_reward_diagnostics(completions, example["sample_meta"])
+                    grouped_rewards.append(total_rewards)
+                    rollout_records.append(
+                        {
+                            "example": example,
+                            "completion_ids_list": completion_ids_list,
+                            "completions": completions,
+                            "total_rewards": total_rewards,
+                            "reward_components": reward_components,
+                            "diagnostic_components": diagnostic_components,
+                            "old_sequence_log_probs": old_sequence_log_probs,
+                            "rollout_group": rollout_group,
+                            "example_multimodal_cache": example_multimodal_cache,
+                            "rollout_multimodal_cache": rollout_multimodal_cache,
+                            "cached_ref_log_probs": cached_ref_log_probs,
+                        }
+                    )
+                    for reward_name, scores in reward_components.items():
+                        reward_component_scores.setdefault(reward_name, []).extend(scores)
+                    for reward_name, scores in diagnostic_components.items():
+                        diagnostic_component_scores.setdefault(reward_name, []).extend(scores)
+                    reward_totals.extend(total_rewards)
+
+                grouped_advantages, global_reward_std = compute_batch_relative_advantages(
+                    grouped_rewards,
+                    epsilon_std=args.advantage_epsilon_std,
+                    reward_scaling=args.reward_scaling,
+                    distributed_device=device,
+                )
+                for record, advantages in zip(rollout_records, grouped_advantages):
+                    record["advantages"] = advantages
+                    if any(completion_ids.numel() > 0 for completion_ids in record["completion_ids_list"]):
+                        local_trainable_group_count += 1
+                    if not record["completions"]:
+                        continue
+                    trace_rollout_count = 1
+                    if weave_trace_state and weave_trace_state.get("full_group_budget", 0) > 0:
+                        trace_rollout_count = min(
+                            len(record["completions"]),
+                            max(int(weave_trace_state.get("full_group_rollouts", 0)), 1),
+                        )
+                        weave_trace_state["full_group_budget"] -= 1
+                    for rollout_idx in range(trace_rollout_count):
+                        maybe_trace_generation(
+                            weave_trace_state,
+                            split="train",
+                            global_step=global_step,
+                            sample_meta=record["example"]["sample_meta"],
+                            completion=record["completions"][rollout_idx],
+                            total_reward=record["total_rewards"][rollout_idx] if record["total_rewards"] else 0.0,
+                            advantage=advantages[rollout_idx] if advantages else None,
+                            reward_components={
+                                reward_name: record["reward_components"][reward_name][rollout_idx]
+                                for reward_name in record["reward_components"]
+                            },
+                        )
+
+                global_trainable_group_count = int(round(distributed_sum_scalar(float(local_trainable_group_count), device)))
+                local_groups_submitted = float(local_batch_size)
+                local_trajectories = float(len(reward_totals))
+                local_tokens = float(sum(completion_lengths))
+                global_groups_submitted_rank_sum = distributed_sum_scalar(local_groups_submitted, device)
+                global_trajectories_rank_sum = distributed_sum_scalar(local_trajectories, device)
+                global_datums_rank_sum = distributed_sum_scalar(float(local_batch_size), device)
+                global_tokens_rank_sum = distributed_sum_scalar(local_tokens, device)
+                global_groups_target = float(batch_semantics["global_unique_proteins_target"])
+                global_trajectories_target = float(batch_semantics["global_num_trajectories_per_step"])
+
+                if global_trainable_group_count == 0:
+                    global_step += 1
+                    skipped_payload = {
+                        "loss_learning_rate": optimizer.param_groups[0]["lr"],
+                        "data_step_num_groups_submitted": global_groups_target,
+                        "data_step_num_groups_submitted_rank_sum": global_groups_submitted_rank_sum,
+                        "data_step_num_groups_trainable": float(global_trainable_group_count),
+                        "data_step_num_trajectories": global_trajectories_target,
+                        "data_step_num_trajectories_rank_sum": global_trajectories_rank_sum,
+                        "data_step_num_datums": global_groups_target,
+                        "data_step_num_datums_rank_sum": global_datums_rank_sum,
+                        "data_step_trainer_tokens": global_tokens_rank_sum,
+                        "reward": aggregate_mean_metric(sum(reward_totals), float(len(reward_totals)), device),
+                        "reward_std_dev": float(global_reward_std),
+                        "train_skipped_update": 1.0,
+                    }
+                    for reward_name, scores in reward_component_scores.items():
+                        if scores:
+                            skipped_payload[f"reward_component/{reward_name}"] = aggregate_mean_metric(
+                                sum(scores),
+                                float(len(scores)),
+                                device,
+                            )
+                    for reward_name, scores in diagnostic_component_scores.items():
+                        if scores:
+                            skipped_payload[f"diagnostic/{reward_name}"] = aggregate_mean_metric(
+                                sum(scores),
+                                float(len(scores)),
+                                device,
+                            )
+                    if wandb_run is not None and is_main:
+                        print(f"Logging RL skipped-update metrics at global_step={global_step}.")
+                        wandb_run.log(attach_global_step(skipped_payload, global_step), step=global_step)
+                        print(f"RL skipped-update metrics logged at global_step={global_step}.")
+
+                    maybe_run_eval_and_save(global_step)
+                    if global_step >= args.max_steps:
+                        break
+                    continue
+
+                grad_norm_value = 0.0
+                optimizer.zero_grad(set_to_none=True)
+                local_update_loss_sums: List[float] = []
+                local_update_loss_counts: List[float] = []
+                total_update_passes = max(args.steps_per_generation, 1) * max(args.num_iterations, 1)
+                for update_idx in range(total_update_passes):
+                    optimizer_substep += 1
+                    should_step = (
+                        optimizer_substep % max(args.gradient_accumulation_steps, 1) == 0
+                        or update_idx == total_update_passes - 1
+                    )
+                    sync_context = nullcontext()
+                    if distributed["enabled"] and not should_step:
+                        sync_context = model.no_sync()
+                    with sync_context:
+                        local_backward_terms = []
+                        update_loss_accumulator = 0.0
+                        update_trainable_groups = 0
+                        for record in rollout_records:
+                            try:
+                                group_loss, group_metrics, has_trainable_rollout = compute_group_policy_losses_batched(
+                                    model,
+                                    ref_model,
+                                    record["example"],
+                                    record["completion_ids_list"],
+                                    record["advantages"],
+                                    record["old_sequence_log_probs"],
+                                    pad_token_id,
+                                    args,
+                                    rollout_group=record.get("rollout_group"),
+                                    cached_ref_log_probs=record.get("cached_ref_log_probs"),
+                                )
+                            except torch.cuda.OutOfMemoryError:
+                                if is_main:
+                                    print(
+                                        "CUDA Out of Memory during batched RL loss computation; "
+                                        "falling back to sequential rollout loss computation for this prompt."
+                                    )
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                                group_loss, group_metrics, has_trainable_rollout = compute_group_policy_losses_sequential(
+                                    model,
+                                    ref_model,
+                                    record["example"],
+                                    record["completion_ids_list"],
+                                    record["advantages"],
+                                    record["old_sequence_log_probs"],
+                                    args,
+                                    multimodal_cache=record.get("example_multimodal_cache"),
+                                    cached_ref_log_probs=record.get("cached_ref_log_probs"),
+                                )
+
+                            if not has_trainable_rollout:
+                                continue
+
+                            local_backward_terms.append(group_loss / max(float(global_trainable_group_count), 1.0))
+                            update_loss_accumulator += float(group_loss.detach().item())
+                            update_trainable_groups += 1
+                            if group_metrics:
+                                if "kl_mean" in group_metrics:
+                                    kl_values.append(float(group_metrics["kl_mean"]))
+                                if "ratio_mean" in group_metrics:
+                                    ratio_means.append(float(group_metrics["ratio_mean"]))
+                                if "ratio_max" in group_metrics:
+                                    ratio_maxes.append(float(group_metrics["ratio_max"]))
+
+                        backward_loss = (
+                            torch.stack(local_backward_terms).sum()
+                            if local_backward_terms
+                            else build_zero_connected_loss(base_model)
+                        )
+                        backward_loss.backward()
+
+                    if should_step:
+                        grad_norm = clip_grad_norm_(
+                            [parameter for parameter in model.parameters() if parameter.requires_grad],
+                            args.max_grad_norm,
+                        )
+                        grad_norm_value = float(grad_norm.item()) if hasattr(grad_norm, "item") else float(grad_norm)
+                        optimizer.step()
+                        if scheduler is not None:
+                            scheduler.step()
+                        optimizer.zero_grad(set_to_none=True)
+                    local_update_loss_sums.append(update_loss_accumulator)
+                    local_update_loss_counts.append(float(update_trainable_groups))
+
+                global_step += 1
+                loss_train_sum = distributed_sum_scalar(sum(local_update_loss_sums), device)
+                loss_train_count = distributed_sum_scalar(sum(local_update_loss_counts), device)
+                log_payload = {
+                    "loss_train": (loss_train_sum / loss_train_count) if loss_train_count > 0 else 0.0,
+                    "reward": aggregate_mean_metric(sum(reward_totals), float(len(reward_totals)), device),
+                    "reward_std_dev": float(global_reward_std),
+                    "loss_kl_div": aggregate_mean_metric(sum(kl_values), float(len(kl_values)), device),
+                    "loss_policy_ratio_mean": aggregate_mean_metric(sum(ratio_means), float(len(ratio_means)), device),
+                    "loss_policy_ratio_max": distributed_max_scalar(max(ratio_maxes) if ratio_maxes else 0.0, device),
+                    "loss_learning_rate": optimizer.param_groups[0]["lr"],
+                    "loss_grad_norm": grad_norm_value,
+                    "data_step_num_groups_submitted": global_groups_target,
+                    "data_step_num_groups_submitted_rank_sum": global_groups_submitted_rank_sum,
+                    "data_step_num_groups_trainable": float(global_trainable_group_count),
+                    "data_step_num_trajectories": global_trajectories_target,
+                    "data_step_num_trajectories_rank_sum": global_trajectories_rank_sum,
+                    "data_step_num_datums": global_groups_target,
+                    "data_step_num_datums_rank_sum": global_datums_rank_sum,
+                    "data_step_trainer_tokens": global_tokens_rank_sum,
+                    "data_step_num_update_passes": float(total_update_passes),
+                    "train_skipped_update": 0.0,
+                }
+                for reward_name, scores in reward_component_scores.items():
+                    if not scores:
+                        continue
+                    log_payload[f"reward_component/{reward_name}"] = aggregate_mean_metric(
+                        sum(scores),
+                        float(len(scores)),
+                        device,
+                    )
+                for reward_name, scores in diagnostic_component_scores.items():
+                    if not scores:
+                        continue
+                    log_payload[f"diagnostic/{reward_name}"] = aggregate_mean_metric(
+                        sum(scores),
+                        float(len(scores)),
+                        device,
+                    )
+                if wandb_run is not None and is_main:
+                    print(f"Logging RL train metrics at global_step={global_step}.")
+                    wandb_run.log(attach_global_step(log_payload, global_step), step=global_step)
+                    print(f"RL train metrics logged at global_step={global_step}.")
+
+                maybe_run_eval_and_save(global_step)
+                if global_step >= args.max_steps:
+                    break
+
+        distributed_barrier()
+        if global_step > 0 and last_eval_step != global_step and is_main and val_loader is not None:
+            print(f"Starting RL final validation eval at global_step={global_step}.")
+            final_val_metrics = evaluate_policy(
+                model=base_model,
+                ref_model=ref_model,
+                dataloader=val_loader,
+                tokenizer=tokenizer,
+                args=args,
+                reward_names=reward_names,
+                reward_weights=reward_weights,
+                device=device,
+                trace_state=weave_trace_state,
+                global_step=global_step,
+                trace_split_name="validation_final",
+            )
+            final_val_metrics = {f"final/{key}": value for key, value in final_val_metrics.items()}
+            if wandb_run is not None:
+                wandb_run.log(attach_global_step(final_val_metrics, global_step), step=global_step)
+                print(f"RL final validation metrics logged at global_step={global_step}.")
+        distributed_barrier()
+
+        if is_main:
+            final_checkpoint_dir = save_raw_checkpoint(base_model, raw_checkpoint_dir, global_step, args)
+            export_hf_model(base_model, output_dir)
+
+        distributed_barrier()
+
+        if wandb_run is not None and is_main:
             import wandb
 
             artifact_export_dir = output_dir / "_artifact_export"
@@ -3054,17 +3473,19 @@ def train(args: argparse.Namespace) -> None:
                     {
                         "model_artifact": checkpoint_status["artifact_name"],
                         "model_artifact_aliases": checkpoint_status["aliases"],
-                        "last_raw_checkpoint": str(final_checkpoint_dir),
+                        "last_raw_checkpoint": str(final_checkpoint_dir) if final_checkpoint_dir else "",
                         "weave_trace_project": weave_trace_state["project"] if weave_trace_state else None,
                         "weave_trace_count": weave_trace_state["logged"] if weave_trace_state else 0,
                     },
                 )
-        finally:
+    finally:
+        if wandb_run is not None and is_main:
             if weave_trace_state and weave_trace_state.get("client") is not None:
                 flush = getattr(weave_trace_state["client"], "flush", None)
                 if callable(flush):
                     flush()
             wandb_run.finish()
+        cleanup_distributed_runtime()
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:

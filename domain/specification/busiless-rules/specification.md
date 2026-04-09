@@ -417,7 +417,7 @@ Paper reference values retained as the canonical comparison point:
 Operational adaptation for the current CoreWeave continuation-tuning setup:
 
 - The paper values above are the reference, but exact runtime values may be reduced for single-job continuation tuning under the fixed `12:00:00` wall-time limit
-- When running the current single-node continuation setup, prefer preserving the paper's `B/G=8` unique proteins per step by keeping `num_generations=24` and setting `train_batch_size=8`, then reduce `max_steps` and/or `max_new_tokens` before reducing group diversity
+- When running the current single-node 8 GPU continuation setup, prefer preserving the paper's `B/G=8` unique proteins per step by keeping `num_generations=24` and setting `per_device_train_batch_size=1` so that `world_size=8` yields `global_unique_proteins_per_step=8`, then reduce `max_steps` and/or `max_new_tokens` before reducing group diversity
 - Any deviation from the paper reference, especially `num_generations`, `max_new_tokens`, `train_batch_size`, `max_steps`, and IA availability, must be explicit in W&B config
 - `reward_weights` and all RL-control parameters (`loss_type`, clip epsilons, reward scaling mode, IS cap, scheduler settings, KL beta, and final-answer-only reward mode) must remain visible in W&B config for each RL run
 - Even though the paper describes reward extraction from the reasoning trace, the output format should still terminate as soon as the structured `GO_SUMMARY` block is complete rather than waiting on optional prose such as `FUNCTION_SUMMARY`
@@ -431,3 +431,6 @@ Operational adaptation for the current CoreWeave continuation-tuning setup:
 - Optional fields such as UniProt prose summaries, extended function descriptions, or other long metadata should be excluded from the paper-faithful RL prompt path unless they are being tested as an explicit ablation
 - The first comparison between `SFT -> RL` and `paper RL -> continuation RL` should keep the objective, reward extraction, sampling controls, and memory controls identical so that the initialization checkpoint is the only changed variable
 - If `paper RL -> continuation RL` shows collapsed within-group reward variance or low rollout diversity, follow-up tuning may shorten `max_steps` and/or strengthen the KL anchor, but that should be recorded as a separate ablation rather than the first A/B comparison
+- For the current implementation, paper-faithful single-node 8 GPU runs should log both per-device and global batch semantics in W&B config: `per_device_train_batch_size`, `world_size`, `global_unique_proteins_per_step`, and `global_num_trajectories_per_step`
+- Because the current code samples `G` rollouts per protein prompt, the paper's published `per-device batch size=6` is not treated as a strict implementation target; the canonical invariant is instead `G=24`, `B/G=8`, and therefore `global_num_trajectories_per_step=192`
+- Rollout acceleration should first come from caching frozen multimodal inputs and frozen-reference log-probs, not from reducing `num_generations`; lowering group diversity is a secondary fallback only after cache-based acceleration has been tried
