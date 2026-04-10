@@ -84,6 +84,59 @@ class FakeWeaveModule:
         return FakeWeaveAttributes(self, payload)
 
 
+class FakeWandbConfig(dict):
+    def update(self, values, allow_val_change=False):
+        self["allow_val_change"] = allow_val_change
+        super().update(values)
+
+
+class FakeWandbRun:
+    def __init__(self, *, entity: str, project: str, run_id: str = "demo123") -> None:
+        self.entity = entity
+        self.project = project
+        self.id = run_id
+        self.path = f"{entity}/{project}/{run_id}" if entity and project else ""
+        self.url = f"https://wandb.ai/{entity}/{project}/runs/{run_id}" if entity and project else ""
+        self.logged: list[dict[str, object]] = []
+        self.define_metric_calls: list[dict[str, object]] = []
+        self.finished = False
+        self.used_artifacts: list[tuple[str, object]] = []
+        self.config = FakeWandbConfig()
+
+    def log(self, payload, step=None):
+        self.logged.append({"payload": dict(payload), "step": step})
+
+    def define_metric(self, name, **kwargs):
+        self.define_metric_calls.append({"name": name, "kwargs": dict(kwargs)})
+
+    def finish(self):
+        self.finished = True
+
+    def use_artifact(self, artifact_ref, type=None):
+        self.used_artifacts.append((artifact_ref, type))
+
+
+class FakeWandbModule:
+    def __init__(self) -> None:
+        self.init_calls: list[dict[str, object]] = []
+        self.define_metric_calls: list[dict[str, object]] = []
+        self.runs: list[FakeWandbRun] = []
+        self.run = None
+
+    def init(self, **kwargs):
+        self.init_calls.append(dict(kwargs))
+        run = FakeWandbRun(
+            entity=str(kwargs.get("entity") or ""),
+            project=str(kwargs.get("project") or ""),
+        )
+        self.runs.append(run)
+        self.run = run
+        return run
+
+    def define_metric(self, name, **kwargs):
+        self.define_metric_calls.append({"name": name, "kwargs": dict(kwargs)})
+
+
 class TrainProteinGrpoContractsTest(unittest.TestCase):
     def write_executable(self, path: Path, body: str) -> Path:
         path.write_text(body, encoding="utf-8")
@@ -235,7 +288,7 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertEqual(algorithm.total_trajectories, 192)
         self.assertEqual(algorithm.steps_per_generation, 2)
         self.assertEqual(algorithm.num_iterations, 1)
-        self.assertEqual(algorithm.max_new_tokens, 10000)
+        self.assertEqual(algorithm.max_new_tokens, 2048)
         self.assertEqual(runtime_spec.optimizer_micro_batch_size_per_gpu, 6)
         self.assertEqual(runtime_spec.gradient_accumulation_steps, 4)
         self.assertEqual(runtime_spec.target_num_nodes, 2)
@@ -246,6 +299,7 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertEqual(args.dataset_num_proc, 4)
         self.assertEqual(args.vllm_attention_backend, "XFORMERS")
         self.assertEqual(args.vllm_worker_multiproc_method, "spawn")
+        self.assertFalse(args.vllm_enable_sleep_mode)
         self.assertFalse(args.vllm_use_v1)
 
     def test_parse_args_accepts_deepspeed_local_rank_flag(self):
@@ -263,6 +317,11 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertIsNone(GRPO.resolve_dataset_num_proc(0))
         self.assertIsNone(GRPO.resolve_dataset_num_proc(-3))
         self.assertEqual(GRPO.resolve_dataset_num_proc(4), 4)
+
+    def test_resolve_effective_dataset_num_proc_clamps_distributed_workers(self):
+        self.assertEqual(GRPO.resolve_effective_dataset_num_proc(4, distributed=True), 1)
+        self.assertEqual(GRPO.resolve_effective_dataset_num_proc(4, distributed=False), 4)
+        self.assertIsNone(GRPO.resolve_effective_dataset_num_proc(0, distributed=True))
 
     def test_extract_go_terms_requires_final_answer_block(self):
         self.assertIsNone(GRPO.extract_go_terms_from_final_answer("GO:0007165"))
@@ -324,6 +383,97 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
             [0],
         )
 
+    def test_resolve_effective_vllm_sleep_mode_disables_subprocess_backend(self):
+        subprocess_args = GRPO.parse_args(
+            [
+                "--text_model_name",
+                "/tmp/demo-model",
+                "--rollout_backend",
+                "subprocess",
+                "--vllm_enable_sleep_mode",
+                "true",
+            ]
+        )
+        inprocess_args = GRPO.parse_args(
+            [
+                "--text_model_name",
+                "/tmp/demo-model",
+                "--rollout_backend",
+                "inprocess",
+                "--vllm_enable_sleep_mode",
+                "true",
+            ]
+        )
+
+        self.assertFalse(GRPO.resolve_effective_vllm_sleep_mode(subprocess_args))
+        self.assertTrue(GRPO.resolve_effective_vllm_sleep_mode(inprocess_args))
+
+    def test_rollout_worker_refresh_defers_subprocess_restart_until_next_generate(self):
+        worker = object.__new__(GRPO.VLLMRolloutWorker)
+        worker.backend = "subprocess"
+        worker.checkpoint_dir = Path("/tmp/original")
+        worker.args = mock.Mock()
+        worker.runtime = mock.Mock()
+
+        with mock.patch.object(worker, "_stop_subprocess") as stop_mock, mock.patch.object(
+            worker, "_start_subprocess"
+        ) as start_mock:
+            worker.refresh(Path("/tmp/next"))
+
+        self.assertEqual(worker.checkpoint_dir, Path("/tmp/next"))
+        stop_mock.assert_called_once_with()
+        start_mock.assert_not_called()
+
+    def test_rollout_worker_unload_stops_subprocess_without_sleep_mode_and_generate_restarts_it(self):
+        worker = object.__new__(GRPO.VLLMRolloutWorker)
+        worker.backend = "subprocess"
+        worker.checkpoint_dir = Path("/tmp/current")
+        worker.args = GRPO.parse_args(
+            [
+                "--text_model_name",
+                "/tmp/demo-model",
+                "--rollout_backend",
+                "subprocess",
+                "--vllm_enable_sleep_mode",
+                "false",
+            ]
+        )
+        worker.runtime = mock.Mock()
+        worker._connection = None
+        worker._process = None
+
+        with mock.patch.object(worker, "_stop_subprocess") as stop_mock:
+            worker.unload()
+        stop_mock.assert_called_once_with()
+
+        connection = mock.Mock()
+
+        def fake_start(checkpoint_dir: Path) -> None:
+            self.assertEqual(checkpoint_dir, Path("/tmp/current"))
+            worker._connection = connection
+
+        with mock.patch.object(worker, "_start_subprocess", side_effect=fake_start) as start_mock, mock.patch.object(
+            worker, "_recv_response", return_value={"status": "ok", "outputs": ["demo"]}
+        ) as recv_mock, mock.patch.object(GRPO, "build_rollout_query_payload", return_value={"query": "payload"}):
+            worker._connection = None
+            worker.generate_group(
+                query=GRPO.PreparedQuery(
+                    input_ids=None,
+                    attention_mask=None,
+                    protein_sequences=[],
+                    batch_idx_map=[],
+                    structure_coords=None,
+                    go_aspects=[],
+                    sample_meta={},
+                    prompt_text="",
+                    multimodal_cache=None,
+                ),
+                repeat_count=1,
+                sampling=GRPO.SamplingSpec(),
+            )
+        start_mock.assert_called_once_with(Path("/tmp/current"))
+        recv_mock.assert_called_once()
+
     def test_build_deepspeed_config_matches_spec_shape(self):
         args = GRPO.parse_args(["--text_model_name", "/tmp/demo-model"])
         runtime_spec = GRPO.build_runtime_spec(args)
@@ -362,6 +512,10 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         )
         self.assertEqual(config["model_artifact"], "train-rl-output")
         self.assertEqual(config["reward_extraction"], "final_answer_block_only")
+        self.assertEqual(config["paper_target_rollouts_per_query"], 24.0)
+        self.assertEqual(config["paper_target_max_new_tokens"], 10000.0)
+        self.assertEqual(config["paper_deviation_max_new_tokens"], 1.0)
+        self.assertEqual(config["wandb_project"], "bioreasoning-pro")
 
     def test_build_trace_path_is_rank_scoped_when_distributed(self):
         runtime = GRPO.DistributedRuntime(enabled=True, rank=3, world_size=8, local_rank=3, device="cpu")
@@ -493,11 +647,13 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
             self.assertEqual(payload["resolved_paths"]["cafa5_dataset"], str(dataset_dir))
             self.assertEqual(payload["launch_contract"]["target_world_size"], 8)
             self.assertEqual(payload["launch_contract"]["attn_implementation"], "auto")
-            self.assertEqual(payload["launch_contract"]["dataset_num_proc"], 4)
+            self.assertEqual(payload["launch_contract"]["dataset_num_proc"], 1)
             self.assertEqual(payload["launch_contract"]["vllm_attention_backend"], "XFORMERS")
             self.assertEqual(payload["launch_contract"]["vllm_worker_multiproc_method"], "spawn")
+            self.assertFalse(payload["launch_contract"]["vllm_enable_sleep_mode"])
             self.assertFalse(payload["launch_contract"]["vllm_use_v1"])
             self.assertEqual(payload["failures"], [])
+            self.assertTrue(any("dataset_num_proc is automatically reduced to 1" in item for item in payload["warnings"]))
 
     def test_go_graph_loading_and_propagation_supports_part_of_and_is_a(self):
         obo_text = """
@@ -570,8 +726,10 @@ relationship: part_of GO:0000002 ! child
                 entry for entry in entries if entry["tool"] == "python" and Path(entry["argv"][0]).name == "train_protein_grpo.py"
             )
             self.assertEqual(self.value_after(train_entry["argv"], "--wandb_project"), "explicit-project")
+            self.assertEqual(self.value_after(train_entry["argv"], "--max_new_tokens"), "2048")
             self.assertEqual(self.value_after(train_entry["argv"], "--vllm_attention_backend"), "XFORMERS")
             self.assertEqual(self.value_after(train_entry["argv"], "--vllm_worker_multiproc_method"), "spawn")
+            self.assertEqual(self.value_after(train_entry["argv"], "--vllm_enable_sleep_mode"), "false")
             self.assertEqual(self.value_after(train_entry["argv"], "--vllm_use_v1"), "0")
             self.assertFalse(any(entry["tool"] == "deepspeed" for entry in entries))
             asset_keys = {
@@ -630,8 +788,10 @@ relationship: part_of GO:0000002 ! child
             self.assertEqual(self.value_after(deepspeed_entry["argv"], "--master_addr"), "10.0.0.1")
             self.assertEqual(self.value_after(deepspeed_entry["argv"], "--master_port"), "29500")
             self.assertEqual(self.value_after(deepspeed_entry["argv"], "--node_rank"), "0")
+            self.assertEqual(self.value_after(deepspeed_entry["argv"], "--max_new_tokens"), "2048")
             self.assertEqual(self.value_after(deepspeed_entry["argv"], "--vllm_attention_backend"), "XFORMERS")
             self.assertEqual(self.value_after(deepspeed_entry["argv"], "--vllm_worker_multiproc_method"), "spawn")
+            self.assertEqual(self.value_after(deepspeed_entry["argv"], "--vllm_enable_sleep_mode"), "false")
             self.assertEqual(self.value_after(deepspeed_entry["argv"], "--vllm_use_v1"), "0")
             self.assertNotIn("--hostfile", deepspeed_entry["argv"])
 
@@ -722,6 +882,99 @@ relationship: part_of GO:0000002 ! child
             self.assertEqual(fake_weave.init_calls[0]["project"], "demo-entity/demo-project")
             self.assertEqual(fake_weave.init_calls[0]["global_attributes"]["run_name"], "demo-run")
             self.assertEqual(fake_weave.init_calls[0]["global_attributes"]["job_type"], "train_rl")
+
+    def test_run_tracker_infers_wandb_identity_and_logs_startup_metrics(self):
+        fake_wandb = FakeWandbModule()
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.dict(os.environ, {}, clear=True), mock.patch.dict(
+            sys.modules, {"wandb": fake_wandb}
+        ):
+            output_dir = Path(tmpdir) / "train-output"
+            args = GRPO.parse_args(
+                [
+                    "--text_model_name",
+                    "/tmp/demo-model",
+                    "--output_dir",
+                    str(output_dir),
+                    "--base_checkpoint",
+                    "wandb-healthcare/bioreasoning-pro/bioreason-pro-rl-paper:production",
+                ]
+            )
+            args.run_name = "demo-run"
+            args.trace_rollouts_to_weave = False
+            runtime = GRPO.DistributedRuntime(enabled=False, rank=0, world_size=1, local_rank=0, device="cpu")
+            config = {
+                "queries_per_step": 8,
+                "rollouts_per_query": 24,
+                "total_trajectories_per_step": 192,
+                "max_new_tokens": 2048,
+                "steps_per_generation": 2,
+                "num_iterations": 1,
+                "paper_runtime_deviation_from_spec": 1.0,
+                "paper_target_rollouts_per_query": 24.0,
+                "paper_target_max_new_tokens": 10000.0,
+                "paper_deviation_max_new_tokens": 1.0,
+            }
+
+            tracker = GRPO.RunTracker(args=args, config=config, output_dir=output_dir, runtime=runtime)
+
+            self.assertEqual(fake_wandb.init_calls[0]["entity"], "wandb-healthcare")
+            self.assertEqual(fake_wandb.init_calls[0]["project"], "bioreasoning-pro")
+            self.assertEqual(fake_wandb.init_calls[0]["dir"], str((output_dir / "wandb").resolve()))
+            self.assertEqual(args.wandb_entity, "wandb-healthcare")
+            self.assertEqual(args.wandb_project, "bioreasoning-pro")
+            self.assertEqual(tracker.wandb_run_path, "wandb-healthcare/bioreasoning-pro/demo123")
+            self.assertTrue((output_dir / "wandb_run_info.json").exists())
+            define_metric_names = [item["name"] for item in fake_wandb.runs[0].define_metric_calls]
+            self.assertIn("trainer/global_step", define_metric_names)
+            self.assertIn("train/*", define_metric_names)
+            self.assertIn("timing/*", define_metric_names)
+            self.assertIn("paper/*", define_metric_names)
+            startup_payload = fake_wandb.runs[0].logged[0]["payload"]
+            self.assertEqual(fake_wandb.runs[0].logged[0]["step"], 0)
+            self.assertEqual(startup_payload["trainer/global_step"], 0)
+            self.assertEqual(startup_payload["system/wandb_initialized"], 1.0)
+            self.assertEqual(startup_payload["runtime/rollouts_per_query"], 24.0)
+            self.assertEqual(startup_payload["paper/runtime_deviation_from_spec"], 1.0)
+
+    def test_log_metrics_adds_namespaced_wandb_series(self):
+        fake_wandb = FakeWandbModule()
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.dict(os.environ, {}, clear=True), mock.patch.dict(
+            sys.modules, {"wandb": fake_wandb}
+        ):
+            output_dir = Path(tmpdir) / "train-output"
+            args = GRPO.parse_args(
+                [
+                    "--text_model_name",
+                    "/tmp/demo-model",
+                    "--output_dir",
+                    str(output_dir),
+                    "--base_checkpoint",
+                    "wandb-healthcare/bioreasoning-pro/bioreason-pro-rl-paper:production",
+                ]
+            )
+            args.run_name = "demo-run"
+            args.trace_rollouts_to_weave = False
+            runtime = GRPO.DistributedRuntime(enabled=False, rank=0, world_size=1, local_rank=0, device="cpu")
+            tracker = GRPO.RunTracker(args=args, config={}, output_dir=output_dir, runtime=runtime)
+
+            tracker.log_metrics(
+                {
+                    "reward_mean": 0.25,
+                    "loss_mean": 0.125,
+                    "validation_reward_mean": 0.5,
+                    "timing_rollout_seconds": 12.0,
+                },
+                step=7,
+            )
+
+            payload = fake_wandb.runs[0].logged[-1]["payload"]
+            self.assertEqual(fake_wandb.runs[0].logged[-1]["step"], 7)
+            self.assertEqual(payload["trainer/global_step"], 7)
+            self.assertEqual(payload["reward_mean"], 0.25)
+            self.assertEqual(payload["train/reward_mean"], 0.25)
+            self.assertEqual(payload["train/loss_mean"], 0.125)
+            self.assertEqual(payload["validation/reward_mean"], 0.5)
+            self.assertEqual(payload["timing/rollout_seconds"], 12.0)
 
     def test_log_rollout_trace_includes_run_name_in_jsonl(self):
         fake_weave = FakeWeaveModule()
