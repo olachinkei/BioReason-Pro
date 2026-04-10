@@ -355,7 +355,12 @@ Split-specific rules:
 
 The logical phase name for RL is fixed to `train_rl`.  
 Entry points are fixed to `train_protein_grpo.py` and `scripts/sh_train_protein_grpo.sh`.  
-W&B runs are started with `wandb.init(..., job_type="train_rl")`.
+- At the beginning of code
+  - W&B runs are started with `wandb.init(..., job_type="train_rl")`.
+  - W&B traces are started with weave.init()
+- logging with wandb
+  - rollout should be logged with W&B weave (@weave.op decorator)
+  - metrics should be logged with W&B models (wandb.log)
 
 ### 8.2 Input and Strict Rules
 
@@ -370,12 +375,12 @@ Fixed rules:
 - Rollout / reward optimization uses the `train` split of the benchmark
 - Checkpoint selection and offline sanity-check use the full `validation` split of **200 proteins**
 - The `test` split is not used for RL training
-- When deriving RL datasets, source data comes from the `train` split only
 - Canonical input is the `bioreason-pro-rl-paper` artifact
-- Validation split construction is fixed to deterministic `stratified_aspect_profile`
 - Reward metrics, KL metrics, and training stability indicators are saved via `wandb.log()`
 - Rollout traces are saved with Weave
 - RL output checkpoint is registered as a W&B Artifact
+- The detailed paper-faithful RL implementation notes are maintained in:
+  [specification_rl.md](/Users/keisuke/Project/learning/drug_discovery/BioReason-Pro/domain/specification/busiless-rules/specification_rl.md)
 
 ### 8.3 Execution Conditions
 
@@ -386,63 +391,10 @@ Fixed rules:
 - Time limit at submission is `12:00:00`
 - Operations assume checkpoint / resume
 - Local output directory is treated as scratch; the source of truth is W&B Artifact ref
-
-## Note. BioReason-Pro RL Reference
-
-The reference algorithm for BioReason-Pro RL is **DR-GRPO** rather than plain GRPO.  
-Operationally, this means the RL implementation should follow the following paper-level principles:
-
-- Sequence-level importance sampling correction, not token-level correction
-- Advantage defined as `(reward - group_mean_reward) / (global_batch_std + eps_std)`
-- Reward extracted from the generated **reasoning trace via GO-term regex matching**, i.e. regex over the model's generated trace rather than a final-answer-only block, matching the Appendix description of the paper
-- GO predictions propagated through `is_a` and `part_of` before scoring
-- Reward aligned to **IA-weighted F1 / Fmax_w** with an explicit IA file; paper-faithful RL should fail closed rather than silently falling back
-- Asymmetric Clip-Higher behavior with `epsilon_low=7e-4` and `epsilon_high=9e-4`
-- Small KL anchor (`beta=1e-4`) and Dr. GRPO style length-bias mitigation via fixed-length normalization
-
-Paper reference values retained as the canonical comparison point:
-
-- group size `G=24`
-- steps per generation `=2`
-- inner optimization iterations `=1`
-- LoRA `rank=16`, `alpha=32`, `dropout=0.05`
-- AdamW `lr=3e-5`, `beta1=0.9`, `beta2=0.999`, `eps=1e-8`, `weight_decay=0`
-- scheduler `cosine`, `warmup_ratio=0.03`
-- sampling `temperature=1.0`, `top_k=20`, `top_p=0.95`, `min_p=0`, `repetition_penalty=1.0`
-- prompt length reference `512`
-- completion length reference `10,000`
-- RL steps reference `1,200`
-- seed `42`
-
-Operational adaptation for the current CoreWeave continuation-tuning setup:
-
-- The paper values above are the reference, and the canonical continuation path should keep `max_new_tokens=10000` so rollout failures are diagnosed from full generations rather than from an artificially short cap
-- When running the current single-node 8 GPU continuation setup, prefer preserving the paper's `B/G=8` unique proteins per step by keeping `num_generations=24` and setting `per_device_train_batch_size=1` so that `world_size=8` yields `global_unique_proteins_per_step=8`, then reduce `max_steps` and/or `max_new_tokens` before reducing group diversity
-- Any deviation from the paper reference, especially `num_generations`, `max_new_tokens`, `train_batch_size`, `max_steps`, and IA availability, must be explicit in W&B config
-- `reward_weights` and all RL-control parameters (`loss_type`, clip epsilons, reward scaling mode, IS cap, scheduler settings, KL beta, and final-answer-only reward mode) must remain visible in W&B config for each RL run
-- Canonical RL continuation should now be treated as `continuation_mode=paper_native`
-- `paper_native` means:
-  - prompt style resolves to a freer-form paper-style reasoning prompt that keeps the compact evidence slots but does **not** require a custom `GO_SUMMARY` schema
-  - reward extraction defaults to `reward_prediction_source=reasoning_trace`
-  - rollout sampling defaults to `sampling_contract=checkpoint_native`, meaning the packaged checkpoint `generation_config` is respected unless an explicit ablation overrides it
-  - custom `GO_SUMMARY_END` stopping is disabled and generation falls back to normal EOS / model-native stopping
-- `paper_compact` / `repo_structured` remains available, but only as an explicit structured ablation that asks for a tagged `GO_SUMMARY` block and may use `final_answer` or `structured_go_summary` reward extraction
-- In the current codebase, `final_answer` means the post-`</think>` answer region; for `paper_native` this is primarily an evaluation-time extraction concept, while RL reward still uses `reasoning_trace`
-- The paper's prompt-length reference `512` applies to the **text context only**; protein residue embeddings and GO graph embeddings are separate multimodal inputs and should not be counted against that text budget
-- RL text prompts should therefore stay close to the paper's compact slot structure rather than carrying full free-form metadata dumps
-- The preferred RL text slots are: `organism`, `interpro_annotations`, `ppi_partners`, `go_mf_speculations`, `go_bp_speculations`, `go_cc_speculations`, and `focus_aspect`
-- `go_*_speculations` should be rendered per aspect as `GO:XXXXXXX (term name)` strings, matching Table S19, rather than GO IDs alone
-- `ppi_partners` should stay close to the paper's data pipeline convention of top-10 high-confidence STRING partners, not an open-ended dump
-- In practical terms, the raw **text context** should remain compact and close to the paper slots above; note that the implementation expands `<|protein_pad|>` and `<|go_graph_pad|>` into many tokenizer-visible placeholders before replacement, so trainer-side `prompt_len` is not the same quantity as the paper's `max prompt length = 512`
-- The paper-faithful RL prompt path should therefore exclude long metadata dumps from the prompt body, but it may still ask for a concise UniProt-style final answer because that matches the freer-form continuation contract more closely than the custom tagged summary ablation
-- The paper-faithful RL prompt path should not explicitly request prose endings such as `Summarize in UniProt format.`; it should encourage the model to stop once the structured GO answer is complete
-- Optional fields such as UniProt prose summaries, extended function descriptions, or other long metadata should be excluded from the paper-faithful RL prompt path unless they are being tested as an explicit ablation
-- The first comparison between `SFT -> RL` and `paper RL -> continuation RL` should keep the objective, reward extraction, sampling controls, and memory controls identical so that the initialization checkpoint is the only changed variable
-- If `paper RL -> continuation RL` shows collapsed within-group reward variance or low rollout diversity, follow-up tuning may shorten `max_steps` and/or strengthen the KL anchor, but that should be recorded as a separate ablation rather than the first A/B comparison
-- For the current implementation, paper-faithful single-node 8 GPU runs should log both per-device and global batch semantics in W&B config: `per_device_train_batch_size`, `world_size`, `global_unique_proteins_per_step`, and `global_num_trajectories_per_step`
-- Because the current code samples `G` rollouts per protein prompt, the paper's published `per-device batch size=6` is not treated as a strict implementation target; the canonical invariant is instead `G=24`, `B/G=8`, and therefore `global_num_trajectories_per_step=192`
-- Rollout acceleration should first come from caching frozen multimodal inputs and frozen-reference log-probs, not from reducing `num_generations`; lowering group diversity is a secondary fallback only after cache-based acceleration has been tried
-- If distributed rollout generation must temporarily fall back to sequential mode for CUDA stability, that should be treated as a runtime deviation from the paper's efficient training setup and must be visible in W&B config or run notes
-- For single-node multi-GPU jobs, keep the runtime allocator and NCCL settings explicit in the launcher (`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512`, `NCCL_ASYNC_ERROR_HANDLING=1`, `NCCL_CUMEM_ENABLE=0`, and related single-node defaults) so paper-faithful hyperparameters are not confounded by avoidable runtime-memory drift
-- Smoke runs should also prefer the full `max_new_tokens=10000` cap when the goal is rollout diagnosis; if a shorter cap is used for systems triage, record it as an explicit smoke-only deviation
-- RL observability should log not only reward values but also rollout stop behavior: `stop_reason` (`summary_end`, `eos`, `max_tokens`, `unknown`), `max_new_tokens_hit_rate`, `has_go_summary_end`, and `first_go_summary_token_idx` so long generations can be distinguished from late-but-valid structured answers
+- Canonical RL execution follows the paper's rollout semantics:
+  - each step samples **8 unique query proteins** from the large `train` pool
+  - for each sampled protein, the old policy generates **`G=24` responses**
+  - one RL step therefore corresponds to **`8 proteins × 24 responses = 192 trajectories`**
+  - canonical training repeats this process for up to **`1,200` RL steps**
+- The detailed paper-faithful DR-GRPO implementation notes are maintained in:
+  [specification_rl.md](/Users/keisuke/Project/learning/drug_discovery/BioReason-Pro/domain/specification/busiless-rules/specification_rl.md)
