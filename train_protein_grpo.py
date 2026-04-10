@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
+from dataclasses import asdict, dataclass
 from functools import lru_cache
 import importlib.util
 import json
@@ -97,6 +98,7 @@ WANDB_BOOTSTRAP_METRICS = (
     "diagnostic/max_new_tokens_hit_rate",
     "diagnostic/reward_nonzero_rate",
     "diagnostic/filtered_rollout_rate",
+    "diagnostic/audit_only",
     "diagnostic/first_go_summary_token_idx_mean",
     "diagnostic/stop_reason_summary_end_rate",
     "diagnostic/stop_reason_eos_rate",
@@ -115,6 +117,30 @@ REWARD_CONTEXT: Dict[str, Any] = {
     "reward_prediction_source": "reasoning_trace",
     "continuation_mode": CONTINUATION_MODE_PAPER_NATIVE,
 }
+
+
+@dataclass(frozen=True)
+class RolloutStepSemantics:
+    per_device_train_batch_size: int
+    per_device_eval_batch_size: int
+    world_size: int
+    actual_global_unique_proteins_per_step: int
+    actual_global_num_trajectories_per_step: int
+    actual_rollout_group_size: int
+    rollout_query_batch_size_target: int
+    rollout_group_size_target: int
+    rollout_total_trajectories_target: int
+    global_unique_proteins_target: int
+    target_num_nodes: int
+    target_gpus_per_node: int
+    target_global_world_size: int
+    runtime_stack: str
+    rollout_execution_mode: str
+    paper_faithful_batch_shape: bool
+    paper_faithful_hardware_shape: bool
+    paper_faithful_runtime_stack: bool
+    paper_faithful_execution_mode: bool
+    paper_faithful_ready: bool
 
 
 def normalize_text(value: Any) -> str:
@@ -1080,6 +1106,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rotating_eval_seed_stride", type=int, default=9973)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--distributed_timeout_seconds", type=int, default=7200)
+    parser.add_argument("--audit_only", type=str, default="false")
+    parser.add_argument(
+        "--runtime_stack",
+        type=str,
+        default="custom_ddp",
+        choices=["deepspeed_vllm_colocate", "ddp_sequential", "ddp_batched", "custom_ddp"],
+    )
+    parser.add_argument(
+        "--rollout_execution_mode",
+        type=str,
+        default="per_example_sequential",
+        choices=["batch_first", "per_example_batched", "per_example_sequential"],
+    )
+    parser.add_argument("--rollout_query_batch_size", type=int, default=8)
+    parser.add_argument("--rollout_group_size", type=int, default=24)
+    parser.add_argument("--target_num_nodes", type=int, default=2)
+    parser.add_argument("--target_gpus_per_node", type=int, default=8)
 
     parser.add_argument("--loss_type", type=str, default="dr_grpo", choices=["dr_grpo"])
     parser.add_argument("--steps_per_generation", type=int, default=2)
@@ -1166,6 +1209,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "reward_final_answer_only",
         "require_ia_file",
         "ablation_from_paper_rl",
+        "audit_only",
     ]
 
     def _str2bool(raw: Any) -> bool:
@@ -1211,16 +1255,89 @@ def can_cache_multimodal_prefix(args: argparse.Namespace) -> bool:
 def build_batch_semantics(args: argparse.Namespace, world_size: int) -> Dict[str, float]:
     per_device_train_batch_size = max(int(getattr(args, "train_batch_size", 1)), 1)
     per_device_eval_batch_size = max(int(getattr(args, "eval_batch_size", 1)), 1)
-    num_generations = max(int(getattr(args, "num_generations", 1)), 1)
-    global_unique_proteins_per_step = int(per_device_train_batch_size * max(int(world_size), 1))
-    return {
-        "per_device_train_batch_size": per_device_train_batch_size,
-        "per_device_eval_batch_size": per_device_eval_batch_size,
-        "world_size": max(int(world_size), 1),
-        "global_unique_proteins_per_step": global_unique_proteins_per_step,
-        "global_num_trajectories_per_step": global_unique_proteins_per_step * num_generations,
-        "global_unique_proteins_target": global_unique_proteins_per_step,
-    }
+    actual_rollout_group_size = max(int(getattr(args, "num_generations", 1)), 1)
+    runtime_world_size = max(int(world_size), 1)
+    actual_global_unique_proteins_per_step = int(per_device_train_batch_size * runtime_world_size)
+    actual_global_num_trajectories_per_step = actual_global_unique_proteins_per_step * actual_rollout_group_size
+
+    rollout_query_batch_size_target = max(int(getattr(args, "rollout_query_batch_size", 8)), 1)
+    rollout_group_size_target = max(int(getattr(args, "rollout_group_size", 24)), 1)
+    target_total_trajectories = rollout_query_batch_size_target * rollout_group_size_target
+    target_num_nodes = max(int(getattr(args, "target_num_nodes", 2)), 1)
+    target_gpus_per_node = max(int(getattr(args, "target_gpus_per_node", 8)), 1)
+    target_global_world_size = target_num_nodes * target_gpus_per_node
+    runtime_stack = normalize_text(getattr(args, "runtime_stack", "custom_ddp")).strip() or "custom_ddp"
+    rollout_execution_mode = (
+        normalize_text(getattr(args, "rollout_execution_mode", "per_example_sequential")).strip()
+        or "per_example_sequential"
+    )
+
+    semantics = RolloutStepSemantics(
+        per_device_train_batch_size=per_device_train_batch_size,
+        per_device_eval_batch_size=per_device_eval_batch_size,
+        world_size=runtime_world_size,
+        actual_global_unique_proteins_per_step=actual_global_unique_proteins_per_step,
+        actual_global_num_trajectories_per_step=actual_global_num_trajectories_per_step,
+        actual_rollout_group_size=actual_rollout_group_size,
+        rollout_query_batch_size_target=rollout_query_batch_size_target,
+        rollout_group_size_target=rollout_group_size_target,
+        rollout_total_trajectories_target=target_total_trajectories,
+        global_unique_proteins_target=rollout_query_batch_size_target,
+        target_num_nodes=target_num_nodes,
+        target_gpus_per_node=target_gpus_per_node,
+        target_global_world_size=target_global_world_size,
+        runtime_stack=runtime_stack,
+        rollout_execution_mode=rollout_execution_mode,
+        paper_faithful_batch_shape=(
+            actual_global_unique_proteins_per_step == rollout_query_batch_size_target
+            and actual_rollout_group_size == rollout_group_size_target
+            and actual_global_num_trajectories_per_step == target_total_trajectories
+        ),
+        paper_faithful_hardware_shape=(runtime_world_size == target_global_world_size),
+        paper_faithful_runtime_stack=(runtime_stack == "deepspeed_vllm_colocate"),
+        paper_faithful_execution_mode=(rollout_execution_mode == "batch_first"),
+        paper_faithful_ready=False,
+    )
+    semantics_dict = asdict(semantics)
+    semantics_dict["global_unique_proteins_per_step"] = semantics.actual_global_unique_proteins_per_step
+    semantics_dict["global_num_trajectories_per_step"] = semantics.actual_global_num_trajectories_per_step
+    semantics_dict["paper_faithful_ready"] = float(
+        semantics.paper_faithful_batch_shape
+        and semantics.paper_faithful_runtime_stack
+        and semantics.paper_faithful_execution_mode
+    )
+    return semantics_dict
+
+
+def maybe_log_rollout_semantics(batch_semantics: Mapping[str, Any]) -> None:
+    summary = (
+        "RL rollout semantics: "
+        f"actual={int(batch_semantics['actual_global_unique_proteins_per_step'])} proteins x "
+        f"{int(batch_semantics['actual_rollout_group_size'])} rollouts = "
+        f"{int(batch_semantics['actual_global_num_trajectories_per_step'])} trajectories; "
+        f"target={int(batch_semantics['rollout_query_batch_size_target'])} x "
+        f"{int(batch_semantics['rollout_group_size_target'])} = "
+        f"{int(batch_semantics['rollout_total_trajectories_target'])}; "
+        f"runtime_stack={batch_semantics['runtime_stack']}; "
+        f"rollout_execution_mode={batch_semantics['rollout_execution_mode']}"
+    )
+    print(summary)
+    if not bool(batch_semantics.get("paper_faithful_batch_shape", False)):
+        print(
+            "⚠️  Current runtime batch shape does not match the paper target "
+            f"({int(batch_semantics['rollout_query_batch_size_target'])} proteins x "
+            f"{int(batch_semantics['rollout_group_size_target'])} rollouts)."
+        )
+    if not bool(batch_semantics.get("paper_faithful_runtime_stack", False)):
+        print(
+            "⚠️  Current runtime stack is not paper-faithful. "
+            "Expected runtime_stack=deepspeed_vllm_colocate."
+        )
+    if not bool(batch_semantics.get("paper_faithful_execution_mode", False)):
+        print(
+            "⚠️  Current rollout execution mode is not batch_first. "
+            "This is a runtime deviation from the paper's intended backend."
+        )
 
 
 def unwrap_model(model: Any) -> Any:
@@ -1697,6 +1814,120 @@ def extract_example_from_batch(batch: Mapping[str, Any], example_idx: int, devic
         "structure_coords": example_structure,
         "go_aspects": [example_go_aspect if example_go_aspect is not None else "all"],
         "sample_meta": extract_sample_meta_from_batch(batch, example_idx),
+    }
+
+
+def maybe_build_batch_multimodal_cache(
+    model: Any,
+    batch: Mapping[str, Any],
+    args: argparse.Namespace,
+    device: Any,
+) -> Optional[Dict[str, Any]]:
+    import torch
+
+    if not can_cache_multimodal_prefix(args):
+        return None
+    base_model = unwrap_model(model)
+    build_cache = getattr(base_model, "build_multimodal_cache", None)
+    if not callable(build_cache):
+        return None
+
+    structure_coords = batch.get("structure_coords")
+    if isinstance(structure_coords, torch.Tensor):
+        structure_coords = structure_coords.to(device)
+
+    return build_cache(
+        protein_sequences=list(batch.get("protein_sequences") or []),
+        batch_idx_map=list(batch.get("batch_idx_map") or []),
+        batch_size=int(batch["input_ids"].shape[0]),
+        structure_coords=structure_coords,
+        go_aspects=list(batch.get("batch_go_aspects") or []),
+    )
+
+
+def expand_batch_multimodal_cache(
+    cache: Optional[Dict[str, Any]],
+    repeat_count: int,
+) -> Optional[Dict[str, Any]]:
+    if cache is None:
+        return None
+    if repeat_count <= 0:
+        raise ValueError(f"repeat_count must be positive, got {repeat_count}")
+
+    expanded_cache: Dict[str, Any] = {
+        "batch_size": int(cache.get("batch_size", 0)) * repeat_count,
+        "protein_embeddings": None,
+        "go_embeddings": None,
+    }
+    protein_embeddings = cache.get("protein_embeddings")
+    if isinstance(protein_embeddings, list):
+        expanded_cache["protein_embeddings"] = [
+            embedding
+            for embedding in protein_embeddings
+            for _ in range(repeat_count)
+        ]
+    go_embeddings = cache.get("go_embeddings")
+    if isinstance(go_embeddings, list):
+        expanded_cache["go_embeddings"] = [
+            embedding
+            for embedding in go_embeddings
+            for _ in range(repeat_count)
+        ]
+    return expanded_cache
+
+
+def expand_batch_for_rollouts(
+    batch: Mapping[str, Any],
+    rollout_count: int,
+    device: Any,
+) -> Dict[str, Any]:
+    import torch
+
+    if rollout_count <= 0:
+        raise ValueError(f"rollout_count must be positive, got {rollout_count}")
+
+    input_ids = batch["input_ids"].to(device).repeat_interleave(rollout_count, dim=0)
+    attention_mask = batch["attention_mask"].to(device).repeat_interleave(rollout_count, dim=0)
+    batch_size = int(batch["input_ids"].shape[0])
+
+    structure_coords = batch.get("structure_coords")
+    if isinstance(structure_coords, torch.Tensor):
+        structure_coords = structure_coords.to(device).repeat_interleave(rollout_count, dim=0)
+
+    original_batch_idx_map = list(batch.get("batch_idx_map") or [])
+    original_protein_sequences = list(batch.get("protein_sequences") or [])
+    proteins_by_example: List[List[str]] = [[] for _ in range(batch_size)]
+    for protein_idx, mapped_idx in enumerate(original_batch_idx_map):
+        if 0 <= int(mapped_idx) < batch_size:
+            proteins_by_example[int(mapped_idx)].append(original_protein_sequences[protein_idx])
+
+    protein_sequences: List[str] = []
+    batch_idx_map: List[int] = []
+    row_to_example_idx: List[int] = []
+    for example_idx in range(batch_size):
+        for rollout_idx in range(rollout_count):
+            row_idx = example_idx * rollout_count + rollout_idx
+            row_to_example_idx.append(example_idx)
+            sequences = proteins_by_example[example_idx]
+            protein_sequences.extend(sequences)
+            batch_idx_map.extend([row_idx] * len(sequences))
+
+    base_go_aspects = list(batch.get("batch_go_aspects") or [])
+    go_aspects: List[str] = []
+    for example_idx in range(batch_size):
+        aspect = base_go_aspects[example_idx] if example_idx < len(base_go_aspects) else "all"
+        go_aspects.extend([aspect if aspect is not None else "all"] * rollout_count)
+
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "protein_sequences": protein_sequences,
+        "batch_idx_map": batch_idx_map,
+        "structure_coords": structure_coords,
+        "go_aspects": go_aspects,
+        "batch_size": batch_size,
+        "rollout_count": rollout_count,
+        "row_to_example_idx": row_to_example_idx,
     }
 
 
@@ -2622,6 +2853,89 @@ def generate_rollouts_for_example(
     )
 
 
+def generate_rollouts_for_batch(
+    model: Any,
+    batch: Mapping[str, Any],
+    tokenizer: Any,
+    args: argparse.Namespace,
+    *,
+    global_step: int,
+    epoch_idx: int,
+    device: Any,
+    batch_multimodal_cache: Optional[Dict[str, Any]] = None,
+) -> Optional[List[Dict[str, Any]]]:
+    import torch
+
+    local_batch_size = int(batch["input_ids"].shape[0])
+    if local_batch_size <= 0:
+        return []
+    if local_batch_size == 1:
+        return None
+    if is_distributed_enabled():
+        return None
+    if normalize_text(getattr(args, "rollout_execution_mode", "")).strip() != "batch_first":
+        return None
+
+    prompt_lens = batch["input_ids"].ne(tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0).sum(dim=1)
+    prompt_len_summary = [int(value) for value in prompt_lens.tolist()]
+    expanded_batch = expand_batch_for_rollouts(batch, args.num_generations, device)
+    expanded_cache = expand_batch_multimodal_cache(batch_multimodal_cache, args.num_generations)
+    generation_kwargs = build_generation_kwargs(args, tokenizer, for_eval=False)
+    try:
+        print(
+            "Generating RL rollout batch-first: "
+            f"global_step={global_step}, epoch={epoch_idx}, proteins={local_batch_size}, "
+            f"rollouts_per_protein={args.num_generations}, total_trajectories={local_batch_size * args.num_generations}, "
+            f"prompt_lens={prompt_len_summary}, max_new_tokens={args.max_new_tokens}"
+        )
+        generated_ids = model.generate(
+            input_ids=expanded_batch["input_ids"],
+            attention_mask=expanded_batch["attention_mask"],
+            protein_sequences=expanded_batch["protein_sequences"],
+            batch_idx_map=expanded_batch["batch_idx_map"],
+            structure_coords=expanded_batch["structure_coords"],
+            go_aspects=expanded_batch["go_aspects"],
+            multimodal_cache=expanded_cache,
+            **generation_kwargs,
+        )
+        completion_ids_list = extract_completion_ids_batch(generated_ids, expanded_batch["input_ids"])
+        completions = [decode_completion(tokenizer, completion_ids) for completion_ids in completion_ids_list]
+        per_example_outputs: List[Dict[str, Any]] = []
+        for example_idx in range(local_batch_size):
+            start_idx = example_idx * args.num_generations
+            end_idx = start_idx + args.num_generations
+            per_example_completion_ids = completion_ids_list[start_idx:end_idx]
+            per_example_completions = completions[start_idx:end_idx]
+            print(
+                "Completed RL rollout batch-first slice: "
+                f"global_step={global_step}, example_idx={example_idx}, "
+                f"completion_tokens={[int(item.numel()) for item in per_example_completion_ids]}"
+            )
+            per_example_outputs.append(
+                {
+                    "completion_ids_list": per_example_completion_ids,
+                    "completions": per_example_completions,
+                }
+            )
+        return per_example_outputs
+    except torch.cuda.OutOfMemoryError:
+        print(
+            "CUDA Out of Memory during batch-first RL rollout generation; "
+            "falling back to per-example rollout generation for this train batch."
+        )
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception as exc:
+        print(
+            f"Batch-first RL rollout generation failed: {exc}. "
+            "Falling back to per-example rollout generation for this train batch."
+        )
+        traceback.print_exc()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return None
+
+
 def evaluate_policy_example(
     model: Any,
     ref_model: Any,
@@ -3270,6 +3584,10 @@ def train(args: argparse.Namespace) -> None:
     configure_reward_context(args)
     torch.set_float32_matmul_precision("high")
     batch_semantics = build_batch_semantics(args, world_size)
+    for field_name, field_value in batch_semantics.items():
+        setattr(args, field_name, field_value)
+    if is_main:
+        maybe_log_rollout_semantics(batch_semantics)
 
     run_name = args.run_name or f"train-rl-{int(time.time())}"
     output_dir = Path(args.output_dir)
@@ -3453,7 +3771,7 @@ def train(args: argparse.Namespace) -> None:
                 )
             distributed_barrier()
 
-            if should_save and is_main:
+            if should_save and is_main and not args.audit_only:
                 save_raw_checkpoint(base_model, raw_checkpoint_dir, current_step, args)
             distributed_barrier()
 
@@ -3469,6 +3787,21 @@ def train(args: argparse.Namespace) -> None:
                 if is_main:
                     print(f"Starting RL train batch at global_step={global_step}, epoch={epoch_idx}.")
                 local_batch_size = batch["input_ids"].shape[0]
+                batch_multimodal_cache = (
+                    maybe_build_batch_multimodal_cache(base_model, batch, args, device)
+                    if multimodal_cache_enabled
+                    else None
+                )
+                batch_first_rollouts = generate_rollouts_for_batch(
+                    base_model,
+                    batch,
+                    tokenizer,
+                    args,
+                    global_step=global_step,
+                    epoch_idx=epoch_idx,
+                    device=device,
+                    batch_multimodal_cache=batch_multimodal_cache,
+                )
                 reward_totals: List[float] = []
                 reward_component_scores: Dict[str, List[float]] = {reward_name: [] for reward_name in reward_names}
                 diagnostic_component_scores: Dict[str, List[float]] = {
@@ -3508,15 +3841,19 @@ def train(args: argparse.Namespace) -> None:
                     )
 
                     base_model.eval()
-                    completion_ids_list, completions = generate_rollouts_for_example(
-                        base_model,
-                        example,
-                        tokenizer,
-                        args,
-                        global_step=global_step,
-                        epoch_idx=epoch_idx,
-                        example_multimodal_cache=example_multimodal_cache,
-                    )
+                    if batch_first_rollouts is not None:
+                        completion_ids_list = batch_first_rollouts[example_idx]["completion_ids_list"]
+                        completions = batch_first_rollouts[example_idx]["completions"]
+                    else:
+                        completion_ids_list, completions = generate_rollouts_for_example(
+                            base_model,
+                            example,
+                            tokenizer,
+                            args,
+                            global_step=global_step,
+                            epoch_idx=epoch_idx,
+                            example_multimodal_cache=example_multimodal_cache,
+                        )
                     old_sequence_log_probs = compute_old_policy_sequence_log_probs(
                         base_model,
                         example,
@@ -3673,6 +4010,7 @@ def train(args: argparse.Namespace) -> None:
                             float(len(reward_totals)),
                             device,
                         ),
+                        "diagnostic/audit_only": 1.0 if args.audit_only else 0.0,
                         "train_skipped_update": 1.0,
                     }
                     if first_go_summary_token_indices:
@@ -3705,6 +4043,87 @@ def train(args: argparse.Namespace) -> None:
                         print(f"Logging RL skipped-update metrics at global_step={global_step}.")
                         wandb_run.log(attach_global_step(skipped_payload, global_step), step=global_step)
                         print(f"RL skipped-update metrics logged at global_step={global_step}.")
+
+                    maybe_run_eval_and_save(global_step)
+                    if global_step >= args.max_steps:
+                        break
+                    continue
+
+                if args.audit_only:
+                    global_step += 1
+                    audit_payload = {
+                        "loss_train": 0.0,
+                        "reward": aggregate_mean_metric(sum(reward_totals), float(len(reward_totals)), device),
+                        "reward_std_dev": float(global_reward_std),
+                        "diagnostic/go_summary_end_rate": aggregate_mean_metric(
+                            go_summary_end_hits,
+                            float(len(reward_totals)),
+                            device,
+                        ),
+                        "diagnostic/max_new_tokens_hit_rate": aggregate_mean_metric(
+                            max_new_tokens_hits,
+                            float(len(reward_totals)),
+                            device,
+                        ),
+                        "diagnostic/reward_nonzero_rate": aggregate_mean_metric(
+                            reward_nonzero_hits,
+                            float(len(reward_totals)),
+                            device,
+                        ),
+                        "diagnostic/filtered_rollout_rate": aggregate_mean_metric(
+                            filtered_rollout_hits,
+                            float(len(reward_totals)),
+                            device,
+                        ),
+                        "diagnostic/audit_only": 1.0,
+                        "loss_kl_div": 0.0,
+                        "loss_policy_ratio_mean": 0.0,
+                        "loss_policy_ratio_max": 0.0,
+                        "loss_learning_rate": optimizer.param_groups[0]["lr"],
+                        "loss_grad_norm": 0.0,
+                        "data_step_num_groups_submitted": global_groups_target,
+                        "data_step_num_groups_submitted_rank_sum": global_groups_submitted_rank_sum,
+                        "data_step_num_groups_trainable": float(global_trainable_group_count),
+                        "data_step_num_trajectories": global_trajectories_target,
+                        "data_step_num_trajectories_rank_sum": global_trajectories_rank_sum,
+                        "data_step_num_datums": global_groups_target,
+                        "data_step_num_datums_rank_sum": global_datums_rank_sum,
+                        "data_step_trainer_tokens": global_tokens_rank_sum,
+                        "data_step_num_update_passes": 0.0,
+                        "train_skipped_update": 1.0,
+                    }
+                    if first_go_summary_token_indices:
+                        audit_payload["diagnostic/first_go_summary_token_idx_mean"] = aggregate_mean_metric(
+                            sum(first_go_summary_token_indices),
+                            float(len(first_go_summary_token_indices)),
+                            device,
+                        )
+                    for stop_reason, count in stop_reason_counts.items():
+                        audit_payload[f"diagnostic/stop_reason_{stop_reason}_rate"] = aggregate_mean_metric(
+                            count,
+                            float(len(reward_totals)),
+                            device,
+                        )
+                    for reward_name, scores in reward_component_scores.items():
+                        if not scores:
+                            continue
+                        audit_payload[f"reward_component/{reward_name}"] = aggregate_mean_metric(
+                            sum(scores),
+                            float(len(scores)),
+                            device,
+                        )
+                    for reward_name, scores in diagnostic_component_scores.items():
+                        if not scores:
+                            continue
+                        audit_payload[f"diagnostic/{reward_name}"] = aggregate_mean_metric(
+                            sum(scores),
+                            float(len(scores)),
+                            device,
+                        )
+                    if wandb_run is not None and is_main:
+                        print(f"Logging RL audit metrics at global_step={global_step}.")
+                        wandb_run.log(attach_global_step(audit_payload, global_step), step=global_step)
+                        print(f"RL audit metrics logged at global_step={global_step}.")
 
                     maybe_run_eval_and_save(global_step)
                     if global_step >= args.max_steps:
@@ -3903,7 +4322,7 @@ def train(args: argparse.Namespace) -> None:
                 print(f"RL final validation metrics logged at global_step={global_step}.")
         distributed_barrier()
 
-        if is_main:
+        if is_main and not args.audit_only:
             final_checkpoint_dir = save_raw_checkpoint(base_model, raw_checkpoint_dir, global_step, args)
             export_hf_model(base_model, output_dir)
 

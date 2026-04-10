@@ -153,10 +153,26 @@ class TrainingTrackingContractsTest(unittest.TestCase):
             eval_batch_size=4,
             per_device_train_batch_size=1,
             per_device_eval_batch_size=4,
+            runtime_stack="deepspeed_vllm_colocate",
+            rollout_execution_mode="batch_first",
+            rollout_query_batch_size=8,
+            rollout_group_size=24,
+            rollout_total_trajectories_target=192,
+            target_num_nodes=1,
+            target_gpus_per_node=8,
+            target_global_world_size=8,
             world_size=8,
+            actual_rollout_group_size=24,
+            actual_global_unique_proteins_per_step=8,
+            actual_global_num_trajectories_per_step=192,
             global_unique_proteins_per_step=8,
             global_num_trajectories_per_step=192,
             gradient_accumulation_steps=1,
+            paper_faithful_batch_shape=True,
+            paper_faithful_hardware_shape=True,
+            paper_faithful_runtime_stack=True,
+            paper_faithful_execution_mode=True,
+            paper_faithful_ready=1.0,
             adam_beta1=0.9,
             adam_beta2=0.999,
             adam_epsilon=1e-8,
@@ -174,6 +190,7 @@ class TrainingTrackingContractsTest(unittest.TestCase):
             rotating_eval_max_samples=256,
             rotating_eval_sample_strategy="stratified_aspect_profile",
             rotating_eval_seed_stride=9973,
+            audit_only=True,
             loss_type="dr_grpo",
             steps_per_generation=2,
             num_iterations=1,
@@ -243,12 +260,29 @@ class TrainingTrackingContractsTest(unittest.TestCase):
         self.assertEqual(config["eval_batch_size"], 4)
         self.assertEqual(config["per_device_train_batch_size"], 1)
         self.assertEqual(config["per_device_eval_batch_size"], 4)
+        self.assertEqual(config["runtime_stack"], "deepspeed_vllm_colocate")
+        self.assertEqual(config["rollout_execution_mode"], "batch_first")
+        self.assertEqual(config["rollout_query_batch_size_target"], 8)
+        self.assertEqual(config["rollout_group_size_target"], 24)
+        self.assertEqual(config["rollout_total_trajectories_target"], 192)
+        self.assertEqual(config["target_num_nodes"], 1)
+        self.assertEqual(config["target_gpus_per_node"], 8)
+        self.assertEqual(config["target_global_world_size"], 8)
         self.assertEqual(config["world_size"], 8)
+        self.assertEqual(config["actual_rollout_group_size"], 24)
+        self.assertEqual(config["actual_global_unique_proteins_per_step"], 8)
+        self.assertEqual(config["actual_global_num_trajectories_per_step"], 192)
         self.assertEqual(config["global_unique_proteins_per_step"], 8)
         self.assertEqual(config["global_num_trajectories_per_step"], 192)
+        self.assertTrue(config["paper_faithful_batch_shape"])
+        self.assertTrue(config["paper_faithful_hardware_shape"])
+        self.assertTrue(config["paper_faithful_runtime_stack"])
+        self.assertTrue(config["paper_faithful_execution_mode"])
+        self.assertEqual(config["paper_faithful_ready"], 1.0)
         self.assertEqual(config["max_eval_samples"], 100)
         self.assertEqual(config["eval_sample_strategy"], "stratified_aspect_profile")
         self.assertEqual(config["max_eval_batches"], 0)
+        self.assertTrue(config["audit_only"])
         self.assertEqual(config["loss_type"], "dr_grpo")
         self.assertEqual(config["steps_per_generation"], 2)
         self.assertEqual(config["num_iterations"], 1)

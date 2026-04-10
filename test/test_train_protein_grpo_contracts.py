@@ -55,6 +55,7 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertIn('ROTATING_EVAL_MAX_SAMPLES=${ROTATING_EVAL_MAX_SAMPLES:-256}', wrapper_text)
         self.assertIn('ROTATING_EVAL_SAMPLE_STRATEGY=${ROTATING_EVAL_SAMPLE_STRATEGY:-"stratified_aspect_profile"}', wrapper_text)
         self.assertIn('ROTATING_EVAL_SEED_STRIDE=${ROTATING_EVAL_SEED_STRIDE:-9973}', wrapper_text)
+        self.assertIn('AUDIT_ONLY=${AUDIT_ONLY:-"False"}', wrapper_text)
         self.assertIn('SEED=${SEED:-42}', wrapper_text)
         self.assertIn('LOSS_TYPE=${LOSS_TYPE:-"dr_grpo"}', wrapper_text)
         self.assertIn('STEPS_PER_GENERATION=${STEPS_PER_GENERATION:-2}', wrapper_text)
@@ -116,6 +117,7 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertIn('--ia_file_path "$IA_FILE_PATH"', wrapper_text)
         self.assertIn('--require_ia_file "$REQUIRE_IA_FILE"', wrapper_text)
         self.assertIn('--weave_trace_budget "$WEAVE_TRACE_BUDGET"', wrapper_text)
+        self.assertIn('--audit_only "$AUDIT_ONLY"', wrapper_text)
         self.assertIn('--weave_trace_full_group_count "$WEAVE_TRACE_FULL_GROUP_COUNT"', wrapper_text)
         self.assertIn('--weave_trace_full_rollouts_per_group "$WEAVE_TRACE_FULL_ROLLOUTS_PER_GROUP"', wrapper_text)
         self.assertIn('--loss_type "$LOSS_TYPE"', wrapper_text)
@@ -325,7 +327,17 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertAlmostEqual(sum(grouped_advantages[0]) + sum(grouped_advantages[1]), 0.0, places=5)
 
     def test_build_batch_semantics_matches_single_node_8gpu_target(self):
-        args = mock.Mock(train_batch_size=1, eval_batch_size=4, num_generations=24)
+        args = mock.Mock(
+            train_batch_size=1,
+            eval_batch_size=4,
+            num_generations=24,
+            rollout_query_batch_size=8,
+            rollout_group_size=24,
+            target_num_nodes=1,
+            target_gpus_per_node=8,
+            runtime_stack="deepspeed_vllm_colocate",
+            rollout_execution_mode="batch_first",
+        )
 
         semantics = GRPO.build_batch_semantics(args, world_size=8)
 
@@ -334,6 +346,35 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertEqual(semantics["world_size"], 8)
         self.assertEqual(semantics["global_unique_proteins_per_step"], 8)
         self.assertEqual(semantics["global_num_trajectories_per_step"], 192)
+        self.assertEqual(semantics["rollout_total_trajectories_target"], 192)
+        self.assertTrue(semantics["paper_faithful_batch_shape"])
+        self.assertTrue(semantics["paper_faithful_hardware_shape"])
+        self.assertTrue(semantics["paper_faithful_runtime_stack"])
+        self.assertTrue(semantics["paper_faithful_execution_mode"])
+        self.assertEqual(semantics["paper_faithful_ready"], 1.0)
+
+    def test_expand_batch_for_rollouts_preserves_example_major_layout(self):
+        try:
+            import torch
+        except ModuleNotFoundError:
+            self.skipTest("torch is unavailable in this test environment")
+
+        batch = {
+            "input_ids": torch.tensor([[1, 2], [3, 4]], dtype=torch.long),
+            "attention_mask": torch.ones((2, 2), dtype=torch.long),
+            "protein_sequences": ["AAA", "BBB", "CCC"],
+            "batch_idx_map": [0, 0, 1],
+            "structure_coords": torch.randn(2, 5, 3),
+            "batch_go_aspects": ["bp", "mf"],
+        }
+
+        expanded = GRPO.expand_batch_for_rollouts(batch, rollout_count=3, device=torch.device("cpu"))
+
+        self.assertEqual(tuple(expanded["input_ids"].shape), (6, 2))
+        self.assertEqual(expanded["row_to_example_idx"], [0, 0, 0, 1, 1, 1])
+        self.assertEqual(expanded["go_aspects"], ["bp", "bp", "bp", "mf", "mf", "mf"])
+        self.assertEqual(expanded["protein_sequences"], ["AAA", "BBB", "AAA", "BBB", "AAA", "BBB", "CCC", "CCC", "CCC"])
+        self.assertEqual(expanded["batch_idx_map"], [0, 0, 1, 1, 2, 2, 3, 4, 5])
 
     def test_truncation_penalty_reward_penalizes_long_non_terminal_output(self):
         completion = "<think>reasoning</think>" + " word" * 330
@@ -426,6 +467,7 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertEqual(args.weave_trace_full_rollouts_per_group, 24)
         self.assertTrue(args.gradient_checkpointing)
         self.assertTrue(args.disable_model_dropout)
+        self.assertFalse(args.audit_only)
         self.assertFalse(args.reward_final_answer_only)
         self.assertTrue(args.require_ia_file)
         self.assertFalse(args.ablation_from_paper_rl)
@@ -670,8 +712,7 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertIn("slice_rollout_group(", source)
         self.assertIn('protein_model_dir = export_dir / "protein_model"', source)
         self.assertIn('torch.save(model.protein_model.state_dict(), protein_model_dir / "pytorch_model.bin")', source)
-        self.assertNotIn('"loss_train": 0.0', source)
-        self.assertNotIn('"loss_kl_div": 0.0', source)
+        self.assertIn('"diagnostic/audit_only": 1.0', source)
         self.assertNotIn("train_rl_rollouts", source)
         self.assertNotIn("wandb.Table(", source)
         self.assertNotIn('"dataset/train_size"', source)
