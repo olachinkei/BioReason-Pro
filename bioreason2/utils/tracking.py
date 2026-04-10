@@ -347,7 +347,75 @@ def build_checkpoint_artifact_metadata(
     tracking_config: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build artifact metadata for checkpoint uploads."""
-    metadata = dict(tracking_config or {})
+    compact_keys = [
+        "benchmark_version",
+        "training_stage",
+        "training_job_type",
+        "continuation_mode",
+        "reasoning_prompt_style",
+        "sampling_contract",
+        "reward_prediction_source",
+        "reward_final_answer_only",
+        "runtime_stack",
+        "rollout_execution_mode",
+        "rollout_query_batch_size_target",
+        "rollout_group_size_target",
+        "rollout_total_trajectories_target",
+        "target_num_nodes",
+        "target_gpus_per_node",
+        "target_global_world_size",
+        "world_size",
+        "per_device_train_batch_size",
+        "per_device_eval_batch_size",
+        "actual_rollout_group_size",
+        "actual_global_unique_proteins_per_step",
+        "actual_global_num_trajectories_per_step",
+        "paper_faithful_ready",
+        "num_generations",
+        "train_batch_size",
+        "eval_batch_size",
+        "gradient_accumulation_steps",
+        "max_train_samples",
+        "max_eval_samples",
+        "max_steps",
+        "max_new_tokens",
+        "max_loss_completion_tokens",
+        "rollout_logprob_microbatch_size",
+        "temperature",
+        "top_p",
+        "top_k",
+        "min_p",
+        "repetition_penalty",
+        "do_sample",
+        "eval_do_sample",
+        "eval_temperature",
+        "eval_top_p",
+        "eval_top_k",
+        "loss_type",
+        "steps_per_generation",
+        "num_iterations",
+        "reward_scaling",
+        "importance_sampling_level",
+        "importance_sampling_cap",
+        "clip_epsilon_low",
+        "clip_epsilon_high",
+        "kl_beta",
+        "reward_funcs",
+        "reward_weights",
+        "ia_file_path",
+        "require_ia_file",
+        "audit_only",
+        "seed",
+        "output_dir",
+    ]
+
+    source = dict(tracking_config or {})
+    metadata: Dict[str, Any] = {}
+    for key in compact_keys:
+        value = source.get(key)
+        if value not in (None, ""):
+            metadata[key] = value
+
     metadata.update(
         {
             "run_name": run_name,
@@ -355,7 +423,13 @@ def build_checkpoint_artifact_metadata(
                 _get_arg(args, "checkpoint_dir"),
                 _get_arg(args, "output_dir"),
             ),
-            "training_stage": _get_arg(args, "training_stage"),
+            "training_stage": first_non_empty(
+                _get_arg(args, "training_stage"),
+                metadata.get("training_stage"),
+            ),
+            "tracking_config_key_count": len(source),
+            "tracking_config_compact": True,
+            "tracking_config_full_path": "training_metadata.json",
         }
     )
     return {key: value for key, value in metadata.items() if value not in (None, "")}

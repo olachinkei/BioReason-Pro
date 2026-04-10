@@ -1,4 +1,5 @@
 import copy
+import importlib.util
 
 import torch
 import torch.nn as nn
@@ -26,6 +27,81 @@ def _load_text_tokenizer(model_name: str, **kwargs):
         return AutoTokenizer.from_pretrained(model_name, fix_mistral_regex=True, **kwargs)
     except TypeError:
         return AutoTokenizer.from_pretrained(model_name, **kwargs)
+
+
+def _normalize_attn_implementation(value: Optional[str]) -> str:
+    normalized = (value or "").strip().lower()
+    if not normalized:
+        return "auto"
+    if normalized in {"flash", "fa2", "flash-attention-2", "flashattention2"}:
+        return "flash_attention_2"
+    return normalized
+
+
+def _flash_attn_is_available() -> bool:
+    return importlib.util.find_spec("flash_attn") is not None
+
+
+def _attention_candidates(requested: Optional[str]) -> List[str]:
+    normalized = _normalize_attn_implementation(requested)
+    if normalized == "auto":
+        candidates: List[str] = []
+        if torch.cuda.is_available() and _flash_attn_is_available():
+            candidates.append("flash_attention_2")
+        candidates.extend(["sdpa", "eager"])
+        return candidates
+    if normalized == "flash_attention_2" and not _flash_attn_is_available():
+        return ["sdpa", "eager"]
+    if normalized == "sdpa":
+        return ["sdpa", "eager"]
+    if normalized == "eager":
+        return ["eager"]
+    return [normalized]
+
+
+def _is_attention_backend_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return any(
+        needle in message
+        for needle in (
+            "flashattention",
+            "flash attention",
+            "flash_attn",
+            "attn_implementation",
+            "attention implementation",
+            "scaled dot product attention",
+            "sdpa",
+        )
+    )
+
+
+def _load_text_model_with_attention_fallback(model_name: str, **kwargs):
+    requested = kwargs.get("attn_implementation")
+    candidates = _attention_candidates(requested)
+    last_error: Optional[BaseException] = None
+    for index, candidate in enumerate(candidates):
+        load_kwargs = dict(kwargs)
+        load_kwargs["attn_implementation"] = candidate
+        try:
+            model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+            if requested not in (None, "", candidate):
+                print(
+                    f"Warning: requested attention backend '{requested}' resolved to '{candidate}' "
+                    f"for {model_name}."
+                )
+            return model, candidate
+        except (ImportError, RuntimeError, ValueError) as exc:
+            last_error = exc
+            if index + 1 >= len(candidates) or not _is_attention_backend_error(exc):
+                raise
+            next_candidate = candidates[index + 1]
+            print(
+                f"Warning: attention backend '{candidate}' is unavailable for {model_name}: "
+                f"{str(exc).splitlines()[0]} Falling back to '{next_candidate}'."
+            )
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"Failed to load text model {model_name} with any attention backend.")
 
 
 def _get_target_modules(model):
@@ -62,7 +138,7 @@ class ProteinLLMModel(nn.Module):
         protein_train_layer_start: int = 36,
         protein_embedding_layer: int = -1,
         go_model_finetune: bool = True,
-        attn_implementation: str = "flash_attention_2",
+        attn_implementation: str = "auto",
         go_obo_path: Optional[str] = None,
         precomputed_embeddings_path: Optional[str] = None,
         go_hidden_dim: int = 512,
@@ -89,7 +165,8 @@ class ProteinLLMModel(nn.Module):
             protein_train_layer_start: ESM3 layer to start training from. Use -1 or >=total_blocks for output heads only, 0 for all transformer layers. Defaults to 36.
             protein_embedding_layer: ESM3 layer to extract embeddings from. Use -1 for final output (default), 0-N for specific transformer layers. Only works with ESM3 models.
             go_model_finetune: Whether to finetune the GO graph encoder. Defaults to True.
-            attn_implementation: Attention implementation to use. Defaults to "flash_attention_2".
+            attn_implementation: Attention implementation to use. Defaults to "auto",
+                which prefers FlashAttention2 and falls back to SDPA/Eager when needed.
             go_obo_path: Path to GO ontology OBO file. If None, GO encoder will be disabled.
             precomputed_embeddings_path: Directory with GO embeddings .safetensors files.
             go_hidden_dim: Hidden dimension for GO GAT layers. Defaults to 512.
@@ -113,6 +190,7 @@ class ProteinLLMModel(nn.Module):
         self.max_length_text = max_length_text
         self.unified_go_encoder = unified_go_encoder
         self.use_unsloth = use_unsloth
+        self.attn_implementation = _normalize_attn_implementation(attn_implementation)
 
         if use_unsloth:
             if FastLanguageModel is None:
@@ -138,10 +216,10 @@ class ProteinLLMModel(nn.Module):
             }
             if quantization_config is not None:
                 text_model_kwargs["quantization_config"] = quantization_config
-            
-            self.text_model = AutoModelForCausalLM.from_pretrained(
+
+            self.text_model, self.attn_implementation = _load_text_model_with_attention_fallback(
                 text_model_name,
-                **text_model_kwargs
+                **text_model_kwargs,
             )
             self.text_tokenizer = _load_text_tokenizer(
                 text_model_name,

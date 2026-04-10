@@ -1,17 +1,4 @@
-#!/bin/bash
-
-# ===================================================================================================
-# SLURM Configuration
-# Adjust these to match your cluster. Example values shown.
-# ===================================================================================================
-# #SBATCH --job-name=train_protein_grpo
-# #SBATCH --partition=your_gpu_partition
-# #SBATCH --time=12:00:00
-# #SBATCH --gpus=1
-# #SBATCH --cpus-per-task=16
-# #SBATCH --mem=256gb
-# #SBATCH --output=train_protein_grpo_%j_%x.out
-# #SBATCH --error=train_protein_grpo_%j_%x.err
+#!/usr/bin/env bash
 
 set -euo pipefail
 
@@ -39,23 +26,6 @@ source_env_file_without_overrides() {
   done < "$env_file"
 }
 
-REGISTRY_ENV_FILE=${REGISTRY_ENV_FILE:-"configs/disease_benchmark/wandb_registry_paths.env"}
-if [ -f "$REGISTRY_ENV_FILE" ]; then
-  source_env_file_without_overrides "$REGISTRY_ENV_FILE"
-fi
-
-export PYTHONUNBUFFERED=1
-export PYTHONDONTWRITEBYTECODE=1
-export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,max_split_size_mb:512}
-export NCCL_DEBUG=${NCCL_DEBUG:-INFO}
-export TORCH_NCCL_ASYNC_ERROR_HANDLING=${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}
-export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-1}
-export NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-1}
-export NCCL_CUMEM_ENABLE=${NCCL_CUMEM_ENABLE:-0}
-export CUDA_DEVICE_ORDER=${CUDA_DEVICE_ORDER:-PCI_BUS_ID}
-
-unset SLURM_TRES_PER_TASK
-
 as_bool() {
   case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
     1|true|t|yes|y) return 0 ;;
@@ -63,610 +33,271 @@ as_bool() {
   esac
 }
 
+has_preflight_only() {
+  local idx=1
+  local total=$#
+  while [ "$idx" -le "$total" ]; do
+    local arg="${!idx}"
+    if [ "$arg" = "--preflight_only" ]; then
+      idx=$((idx + 1))
+      if [ "$idx" -le "$total" ]; then
+        as_bool "${!idx}" && return 0
+      else
+        return 0
+      fi
+    fi
+    idx=$((idx + 1))
+  done
+  return 1
+}
+
+require_env() {
+  local key="$1"
+  local value="${!key:-}"
+  if [ -z "$value" ]; then
+    echo "Error: $key is required for the exact 2x4 launch contract."
+    exit 1
+  fi
+}
+
+REGISTRY_ENV_FILE=${REGISTRY_ENV_FILE:-"configs/disease_benchmark/wandb_registry_paths.env"}
+if [ -f "$REGISTRY_ENV_FILE" ]; then
+  source_env_file_without_overrides "$REGISTRY_ENV_FILE"
+fi
+
+export PYTHONUNBUFFERED=1
+export PYTHONDONTWRITEBYTECODE=1
+export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
+export CUDA_DEVICE_ORDER="${CUDA_DEVICE_ORDER:-PCI_BUS_ID}"
+
+PYTHON_BIN=${PYTHON_BIN:-python}
+DEEPSPEED_BIN=${DEEPSPEED_BIN:-deepspeed}
 MODEL_SOURCE_RESOLVER=${MODEL_SOURCE_RESOLVER:-"scripts/materialize_model_source.py"}
 DATA_BUNDLE_RESOLVER=${DATA_BUNDLE_RESOLVER:-"scripts/materialize_data_bundle.py"}
 DATA_MANIFEST_PATH=${DATA_MANIFEST_PATH:-"configs/disease_benchmark/data_registry.json"}
 DATA_BUNDLE=${DATA_BUNDLE:-"main_production"}
-SFT_TO_HF_CONVERTER=${SFT_TO_HF_CONVERTER:-"bioreason2/utils/save_unsloth_ckpt.py"}
 
-BASE_WANDB_PROJECT=${BASE_WANDB_PROJECT:-"${WANDB_PROJECT:-bioreasoning-pro}"}
+WANDB_PROJECT=${WANDB_PROJECT:-"${BASE_WANDB_PROJECT:-bioreasoning-pro}"}
+BASE_WANDB_PROJECT=${BASE_WANDB_PROJECT:-"$WANDB_PROJECT"}
 WANDB_ENTITY=${WANDB_ENTITY:-""}
-WANDB_MODE=${WANDB_MODE:-""}
-EXPECTED_WANDB_ENTITY=${EXPECTED_WANDB_ENTITY:-"wandb-healthcare"}
-EXPECTED_WANDB_PROJECT=${EXPECTED_WANDB_PROJECT:-"bioreasoning-pro"}
-ALLOW_WANDB_PROJECT_MISMATCH=${ALLOW_WANDB_PROJECT_MISMATCH:-"False"}
 WEAVE_PROJECT=${WEAVE_PROJECT:-""}
-TRAIN_PARTITION=${TRAIN_PARTITION:-"h100"}
-TRAIN_NUM_GPUS=${TRAIN_NUM_GPUS:-1}
-TRAIN_CPUS_PER_TASK=${TRAIN_CPUS_PER_TASK:-16}
-TRAIN_MEM=${TRAIN_MEM:-"128G"}
-TRAIN_TIME_LIMIT=${TRAIN_TIME_LIMIT:-"12:00:00"}
-TRAIN_JOB_NAME=${TRAIN_JOB_NAME:-"bioreason-rl"}
-TRAIN_USE_SRUN=${TRAIN_USE_SRUN:-"True"}
-export OMP_NUM_THREADS=${OMP_NUM_THREADS:-$TRAIN_CPUS_PER_TASK}
-
-if ! as_bool "$ALLOW_WANDB_PROJECT_MISMATCH"; then
-  if [ -n "$WANDB_ENTITY" ] && [ "$WANDB_ENTITY" != "$EXPECTED_WANDB_ENTITY" ]; then
-    echo "Error: WANDB_ENTITY=$WANDB_ENTITY does not match expected $EXPECTED_WANDB_ENTITY"
-    exit 1
-  fi
-  if [ -n "$BASE_WANDB_PROJECT" ] && [ "$BASE_WANDB_PROJECT" != "$EXPECTED_WANDB_PROJECT" ]; then
-    echo "Error: BASE_WANDB_PROJECT=$BASE_WANDB_PROJECT does not match expected $EXPECTED_WANDB_PROJECT"
-    exit 1
-  fi
+if [ -z "$WEAVE_PROJECT" ] && [ -n "$WANDB_ENTITY" ]; then
+  WEAVE_PROJECT="${WANDB_ENTITY}/${WANDB_PROJECT}"
 fi
 
-MODEL_CACHE_ROOT=${MODEL_CACHE_ROOT:-"data/artifacts/models"}
-TRAIN_SFT_SOURCE_DIR=${TRAIN_SFT_SOURCE_DIR:-"${MODEL_CACHE_ROOT}/train_sft_output_source"}
-TRAIN_SFT_HF_DIR=${TRAIN_SFT_HF_DIR:-"${MODEL_CACHE_ROOT}/train_sft_output_hf"}
-PAPER_RL_MODEL_DIR=${PAPER_RL_MODEL_DIR:-"${MODEL_CACHE_ROOT}/bioreason_pro_rl_paper"}
-RL_OUTPUT_ROOT=${RL_OUTPUT_ROOT:-"${MODEL_CACHE_ROOT}/train_rl_output"}
-DATASET_CACHE_DIR=${DATASET_CACHE_DIR:-"${BIOREASON_DATASET_CACHE_DIR:-data/artifacts/hf_cache}"}
-CACHE_DIR=${CACHE_DIR:-"data/artifacts/cache"}
-STRUCTURE_DIR=${STRUCTURE_DIR:-"${BIOREASON_STRUCTURE_DIR:-data/structures}"}
-GO_EMBEDDINGS_PATH=${GO_EMBEDDINGS_PATH:-"${BIOREASON_GO_EMBEDDINGS_PATH:-}"}
-GO_OBO_PATH=${GO_OBO_PATH:-"${BIOREASON_GO_OBO_PATH:-bioreason2/dataset/go-basic.obo}"}
-IA_FILE_PATH=${IA_FILE_PATH:-"${BIOREASON_IA_FILE_PATH:-}"}
-REQUIRE_IA_FILE=${REQUIRE_IA_FILE:-"true"}
-
-CAFA5_DATASET=${CAFA5_DATASET:-""}
-REASONING_DATASET_NAME=${REASONING_DATASET_NAME:-"disease_temporal_hc_reasoning_v1"}
-INTERPRO_DATASET_NAME=${INTERPRO_DATASET_NAME:-"interpro_metadata"}
-
-BENCHMARK_VERSION=${BENCHMARK_VERSION:-"train=213->225, future=225->228, dev=200, holdout=400"}
-TEMPORAL_SPLIT_ARTIFACT=${TEMPORAL_SPLIT_ARTIFACT:-"${BIOREASON_MAIN_TEMPORAL_SPLIT_REGISTRY_PATH:-}"}
-DATASET_CONFIG=${DATASET_CONFIG:-"disease_temporal_hc_reasoning_v1"}
-REASONING_DATASET_CONFIG=${REASONING_DATASET_CONFIG:-"disease_temporal_hc_reasoning_v1"}
-DATASET_ARTIFACT=${DATASET_ARTIFACT:-"${BIOREASON_MAIN_REASONING_DATASET_REGISTRY_PATH:-}"}
-SHORTLIST_MODE=${SHORTLIST_MODE:-"high-confidence"}
-SHORTLIST_QUERY=${SHORTLIST_QUERY:-"reviewed:true AND organism_id:9606 AND cc_disease:* AND (xref:mim-* OR xref:orphanet-*) AND (go_exp:* OR go_ida:* OR go_ipi:* OR go_igi:* OR go_imp:* OR go_iep:* OR go_ic:* OR go_tas:*)"}
+BENCHMARK_VERSION=${BENCHMARK_VERSION:-"213 -> 221 -> 225 -> 228"}
 TRAIN_START_RELEASE=${TRAIN_START_RELEASE:-213}
 TRAIN_END_RELEASE=${TRAIN_END_RELEASE:-221}
 DEV_END_RELEASE=${DEV_END_RELEASE:-225}
 TEST_END_RELEASE=${TEST_END_RELEASE:-228}
-JOB_TIME_LIMIT=${JOB_TIME_LIMIT:-"12:00:00"}
 
-PRIMARY_BASE_CHECKPOINT=${BASE_CHECKPOINT:-"${BIOREASON_TRAIN_SFT_MODEL_REGISTRY_PATH:-}"}
-BASE_CHECKPOINT_LOCAL_DIR=${BASE_CHECKPOINT_LOCAL_DIR:-""}
-PAPER_RL_CHECKPOINT=${PAPER_RL_CHECKPOINT:-"${BIOREASON_RL_PAPER_MODEL_REGISTRY_PATH:-}"}
-ALLOW_PAPER_RL_ABLATION=${ALLOW_PAPER_RL_ABLATION:-"false"}
-RESUME_FROM_RAW_CHECKPOINT=${RESUME_FROM_RAW_CHECKPOINT:-""}
-
-PROTEIN_MODEL_NAME=${PROTEIN_MODEL_NAME:-"esm3_sm_open_v1"}
-ADD_UNIPROT_SUMMARY=${ADD_UNIPROT_SUMMARY:-"False"}
-IS_SWISSPROT=${IS_SWISSPROT:-"False"}
-INCLUDE_GO_DEFS=${INCLUDE_GO_DEFS:-"False"}
-INTERPRO_IN_PROMPT=${INTERPRO_IN_PROMPT:-"True"}
-PPI_IN_PROMPT=${PPI_IN_PROMPT:-"True"}
-PREDICT_INTERPRO=${PREDICT_INTERPRO:-"False"}
-SPLIT_GO_ASPECTS=${SPLIT_GO_ASPECTS:-"False"}
-CONTINUATION_MODE=${CONTINUATION_MODE:-"paper_native"}
-if [ -z "${INCLUDE_PROTEIN_FUNCTION_SUMMARY+x}" ]; then
-  if [ "$CONTINUATION_MODE" = "paper_native" ]; then
-    INCLUDE_PROTEIN_FUNCTION_SUMMARY="True"
-  else
-    INCLUDE_PROTEIN_FUNCTION_SUMMARY="False"
-  fi
-fi
-REASONING_PROMPT_STYLE=${REASONING_PROMPT_STYLE:-"auto"}
-COMPACT_INTERPRO_LIMIT=${COMPACT_INTERPRO_LIMIT:-12}
-COMPACT_PPI_LIMIT=${COMPACT_PPI_LIMIT:-10}
-COMPACT_GO_SPECULATION_LIMIT=${COMPACT_GO_SPECULATION_LIMIT:-8}
-MAX_LENGTH_TEXT=${MAX_LENGTH_TEXT:-512}
-MAX_LENGTH_PROTEIN=${MAX_LENGTH_PROTEIN:-2000}
-PROTEIN_EMBEDDING_LAYER=${PROTEIN_EMBEDDING_LAYER:-37}
-GO_HIDDEN_DIM=${GO_HIDDEN_DIM:-512}
-GO_NUM_GAT_LAYERS=${GO_NUM_GAT_LAYERS:-3}
-GO_NUM_HEADS=${GO_NUM_HEADS:-8}
-GO_NUM_REDUCED_EMBEDDINGS=${GO_NUM_REDUCED_EMBEDDINGS:-200}
-GO_EMBEDDING_DIM=${GO_EMBEDDING_DIM:-2560}
-UNIFIED_GO_ENCODER=${UNIFIED_GO_ENCODER:-"True"}
-PROTEIN_MODEL_FINETUNE=${PROTEIN_MODEL_FINETUNE:-"False"}
-TRAIN_PROJECTOR=${TRAIN_PROJECTOR:-"False"}
-TRAIN_GO_MODULES=${TRAIN_GO_MODULES:-"False"}
-
-USE_QLORA=${USE_QLORA:-"True"}
-BNB_4BIT_COMPUTE_DTYPE=${BNB_4BIT_COMPUTE_DTYPE:-"bfloat16"}
-BNB_4BIT_QUANT_TYPE=${BNB_4BIT_QUANT_TYPE:-"nf4"}
-BNB_4BIT_USE_DOUBLE_QUANT=${BNB_4BIT_USE_DOUBLE_QUANT:-"True"}
-LORA_RANK=${LORA_RANK:-16}
-LORA_ALPHA=${LORA_ALPHA:-32}
-LORA_DROPOUT=${LORA_DROPOUT:-0.05}
-GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-"True"}
-DISABLE_MODEL_DROPOUT=${DISABLE_MODEL_DROPOUT:-"True"}
-SFT_CONVERSION_LORA_RANK=${SFT_CONVERSION_LORA_RANK:-128}
-SFT_CONVERSION_LORA_ALPHA=${SFT_CONVERSION_LORA_ALPHA:-256}
-SFT_CONVERSION_LORA_DROPOUT=${SFT_CONVERSION_LORA_DROPOUT:-0.05}
-
-SEED=${SEED:-42}
-LEARNING_RATE=${LEARNING_RATE:-3e-5}
-WEIGHT_DECAY=${WEIGHT_DECAY:-0.0}
-PER_DEVICE_TRAIN_BATCH_SIZE=${PER_DEVICE_TRAIN_BATCH_SIZE:-${TRAIN_BATCH_SIZE:-1}}
-PER_DEVICE_EVAL_BATCH_SIZE=${PER_DEVICE_EVAL_BATCH_SIZE:-${EVAL_BATCH_SIZE:-4}}
-NUM_WORKERS=${NUM_WORKERS:-0}
-MAX_STEPS=${MAX_STEPS:-300}
-MAX_EPOCHS=${MAX_EPOCHS:-1}
-GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
-ADAM_BETA1=${ADAM_BETA1:-0.9}
-ADAM_BETA2=${ADAM_BETA2:-0.999}
-ADAM_EPSILON=${ADAM_EPSILON:-1e-8}
-LR_SCHEDULER_TYPE=${LR_SCHEDULER_TYPE:-"cosine"}
-WARMUP_RATIO=${WARMUP_RATIO:-0.03}
-MAX_TRAIN_SAMPLES=${MAX_TRAIN_SAMPLES:--1}
-MAX_EVAL_SAMPLES=${MAX_EVAL_SAMPLES:-200}
-EVAL_SAMPLE_STRATEGY=${EVAL_SAMPLE_STRATEGY:-"stratified_aspect_profile"}
-EVAL_EVERY_N_STEPS=${EVAL_EVERY_N_STEPS:-50}
-SAVE_EVERY_N_STEPS=${SAVE_EVERY_N_STEPS:-50}
-MAX_EVAL_BATCHES=${MAX_EVAL_BATCHES:-0}
-ROTATING_EVAL_EVERY_N_STEPS=${ROTATING_EVAL_EVERY_N_STEPS:-100}
-ROTATING_EVAL_MAX_SAMPLES=${ROTATING_EVAL_MAX_SAMPLES:-256}
-ROTATING_EVAL_SAMPLE_STRATEGY=${ROTATING_EVAL_SAMPLE_STRATEGY:-"stratified_aspect_profile"}
-ROTATING_EVAL_SEED_STRIDE=${ROTATING_EVAL_SEED_STRIDE:-9973}
-MAX_GRAD_NORM=${MAX_GRAD_NORM:-1.0}
-DISTRIBUTED_TIMEOUT_SECONDS=${DISTRIBUTED_TIMEOUT_SECONDS:-7200}
-AUDIT_ONLY=${AUDIT_ONLY:-"False"}
-RUNTIME_STACK=${RUNTIME_STACK:-"custom_ddp"}
-ROLLOUT_EXECUTION_MODE=${ROLLOUT_EXECUTION_MODE:-"per_example_sequential"}
-ROLLOUT_QUERY_BATCH_SIZE=${ROLLOUT_QUERY_BATCH_SIZE:-8}
-ROLLOUT_GROUP_SIZE=${ROLLOUT_GROUP_SIZE:-24}
-TARGET_NUM_NODES=${TARGET_NUM_NODES:-2}
-TARGET_GPUS_PER_NODE=${TARGET_GPUS_PER_NODE:-8}
-WEAVE_TRACE_BUDGET=${WEAVE_TRACE_BUDGET:-128}
-WEAVE_TRACE_FULL_GROUP_COUNT=${WEAVE_TRACE_FULL_GROUP_COUNT:-4}
-WEAVE_TRACE_FULL_ROLLOUTS_PER_GROUP=${WEAVE_TRACE_FULL_ROLLOUTS_PER_GROUP:-24}
-
-LOSS_TYPE=${LOSS_TYPE:-"dr_grpo"}
-STEPS_PER_GENERATION=${STEPS_PER_GENERATION:-2}
-NUM_ITERATIONS=${NUM_ITERATIONS:-1}
-NUM_GENERATIONS=${NUM_GENERATIONS:-24}
-MIN_NEW_TOKENS=${MIN_NEW_TOKENS:-1}
-MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-10000}
+BASE_CHECKPOINT=${BASE_CHECKPOINT:-"${BIOREASON_RL_PAPER_MODEL_REGISTRY_PATH:-}"}
+BASE_CHECKPOINT_DIR=${BASE_CHECKPOINT_DIR:-"data/artifacts/models/bioreason_pro_rl_paper"}
+CAFA5_DATASET=${CAFA5_DATASET:-""}
+DATASET_NAME=${DATASET_NAME:-""}
+REASONING_DATASET_NAME=${REASONING_DATASET_NAME:-""}
+TEMPORAL_SPLIT_ARTIFACT=${TEMPORAL_SPLIT_ARTIFACT:-""}
+DATASET_ARTIFACT=${DATASET_ARTIFACT:-""}
+IA_FILE_PATH=${IA_FILE_PATH:-""}
+GO_OBO_PATH=${GO_OBO_PATH:-"bioreason2/dataset/go-basic.obo"}
+CHECKPOINT_ARTIFACT_NAME=${CHECKPOINT_ARTIFACT_NAME:-"train-rl-output"}
+CHECKPOINT_ARTIFACT_ALIASES=${CHECKPOINT_ARTIFACT_ALIASES:-"latest"}
+OUTPUT_DIR=${OUTPUT_DIR:-"data/artifacts/models/train_rl_output"}
+ROLLOUT_BACKEND=${ROLLOUT_BACKEND:-"subprocess"}
+ROLLOUT_WORKER_START_METHOD=${ROLLOUT_WORKER_START_METHOD:-"spawn"}
+ROLLOUT_LOGPROB_MICROBATCH_SIZE=${ROLLOUT_LOGPROB_MICROBATCH_SIZE:-4}
 MAX_LOSS_COMPLETION_TOKENS=${MAX_LOSS_COMPLETION_TOKENS:-0}
-if [ -z "${ROLLOUT_LOGPROB_MICROBATCH_SIZE+x}" ]; then
-  if [ "${TRAIN_NUM_GPUS:-1}" -gt 1 ]; then
-    ROLLOUT_LOGPROB_MICROBATCH_SIZE=1
-  else
-    ROLLOUT_LOGPROB_MICROBATCH_SIZE=4
-  fi
+VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION:-0.35}
+VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-32768}
+VLLM_MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:-256}
+VLLM_CPU_OFFLOAD_GB=${VLLM_CPU_OFFLOAD_GB:-0}
+VLLM_SWAP_SPACE_GB=${VLLM_SWAP_SPACE_GB:-4}
+VLLM_ENFORCE_EAGER=${VLLM_ENFORCE_EAGER:-true}
+VLLM_ENABLE_SLEEP_MODE=${VLLM_ENABLE_SLEEP_MODE:-true}
+VLLM_SLEEP_LEVEL=${VLLM_SLEEP_LEVEL:-1}
+VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-${BIOREASON_VLLM_ATTENTION_BACKEND:-XFORMERS}}
+VLLM_WORKER_MULTIPROC_METHOD=${VLLM_WORKER_MULTIPROC_METHOD:-${BIOREASON_VLLM_WORKER_MULTIPROC_METHOD:-spawn}}
+VLLM_USE_V1=${VLLM_USE_V1:-${BIOREASON_VLLM_USE_V1:-0}}
+
+export VLLM_ATTENTION_BACKEND
+export VLLM_WORKER_MULTIPROC_METHOD
+export VLLM_USE_V1
+
+NNODES=${NNODES:-2}
+GPUS_PER_NODE=${GPUS_PER_NODE:-4}
+HOSTFILE=${HOSTFILE:-""}
+MASTER_ADDR=${MASTER_ADDR:-""}
+MASTER_PORT=${MASTER_PORT:-""}
+NODE_RANK=${NODE_RANK:-""}
+
+if [ "$NNODES" != "2" ]; then
+  echo "Error: exact production launch requires NNODES=2 (got $NNODES)."
+  exit 1
 fi
-SAMPLING_CONTRACT=${SAMPLING_CONTRACT:-"auto"}
-TEMPERATURE=${TEMPERATURE:-1.0}
-TOP_P=${TOP_P:-0.95}
-TOP_K=${TOP_K:-20}
-MIN_P=${MIN_P:-0}
-REPETITION_PENALTY=${REPETITION_PENALTY:-1.0}
-DO_SAMPLE=${DO_SAMPLE:-"True"}
-EVAL_DO_SAMPLE=${EVAL_DO_SAMPLE:-"False"}
-EVAL_TEMPERATURE=${EVAL_TEMPERATURE:-0.1}
-EVAL_TOP_P=${EVAL_TOP_P:-0.9}
-EVAL_TOP_K=${EVAL_TOP_K:-20}
-CLIP_EPSILON_LOW=${CLIP_EPSILON_LOW:-7e-4}
-CLIP_EPSILON_HIGH=${CLIP_EPSILON_HIGH:-9e-4}
-REWARD_SCALING=${REWARD_SCALING:-"batch"}
-ADVANTAGE_EPSILON_STD=${ADVANTAGE_EPSILON_STD:-1e-6}
-IMPORTANCE_SAMPLING_LEVEL=${IMPORTANCE_SAMPLING_LEVEL:-"sequence"}
-IMPORTANCE_SAMPLING_CAP=${IMPORTANCE_SAMPLING_CAP:-2.0}
-REWARD_FINAL_ANSWER_ONLY=${REWARD_FINAL_ANSWER_ONLY:-"False"}
-REWARD_PREDICTION_SOURCE=${REWARD_PREDICTION_SOURCE:-"auto"}
-KL_BETA=${KL_BETA:-1e-4}
-REWARD_FUNCS=${REWARD_FUNCS:-"ia_weighted_f1"}
-REWARD_WEIGHTS=${REWARD_WEIGHTS:-"1.0"}
-
-if [ "${CHECKPOINT_ARTIFACT_NAME+x}" = "x" ]; then
-  CHECKPOINT_ARTIFACT_NAME="${CHECKPOINT_ARTIFACT_NAME}"
-else
-  CHECKPOINT_ARTIFACT_NAME="train-rl-output"
-fi
-CHECKPOINT_ARTIFACT_ALIASES=${CHECKPOINT_ARTIFACT_ALIASES:-"latest,213.221.225.228"}
-
-PREP_COMMAND=()
-TRAIN_COMMAND=()
-TRAIN_LAUNCH_PREFIX=()
-OPTIONAL_GO_EMBEDDINGS_ARG=()
-PYTHON_BIN=${PYTHON_BIN:-""}
-
-if [ -z "$PYTHON_BIN" ]; then
-  if [ -x "$(pwd)/.venv-gpu/bin/python" ]; then
-    PYTHON_BIN="$(pwd)/.venv-gpu/bin/python"
-  elif [ -x "$(pwd)/.venv/bin/python" ]; then
-    PYTHON_BIN="$(pwd)/.venv/bin/python"
-  elif command -v python >/dev/null 2>&1; then
-    PYTHON_BIN=$(command -v python)
-  elif command -v python3 >/dev/null 2>&1; then
-    PYTHON_BIN=$(command -v python3)
-  else
-    echo "Error: no Python executable found for RL wrapper"
-    exit 1
-  fi
-fi
-
-if [ "$TRAIN_NUM_GPUS" -gt 1 ]; then
-  TRAIN_LAUNCH_PREFIX=(
-    "$PYTHON_BIN"
-    -m
-    torch.distributed.run
-    --standalone
-    --nnodes=1
-    --nproc_per_node "$TRAIN_NUM_GPUS"
-  )
-else
-  TRAIN_LAUNCH_PREFIX=("$PYTHON_BIN")
-fi
-
-if as_bool "$TRAIN_USE_SRUN"; then
-  PREP_COMMAND+=(
-    srun
-    --job-name "${TRAIN_JOB_NAME}-prep"
-    --partition "$TRAIN_PARTITION"
-    --nodes 1
-    --ntasks-per-node 1
-    --gpus "$TRAIN_NUM_GPUS"
-    --cpus-per-task "$TRAIN_CPUS_PER_TASK"
-    --mem "$TRAIN_MEM"
-    --time "$TRAIN_TIME_LIMIT"
-  )
-  TRAIN_COMMAND+=(
-    srun
-    --job-name "$TRAIN_JOB_NAME"
-    --partition "$TRAIN_PARTITION"
-    --nodes 1
-    --ntasks-per-node 1
-    --gpus "$TRAIN_NUM_GPUS"
-    --cpus-per-task "$TRAIN_CPUS_PER_TASK"
-    --mem "$TRAIN_MEM"
-    --time "$TRAIN_TIME_LIMIT"
-  )
-fi
-
-if [ -n "$GO_EMBEDDINGS_PATH" ]; then
-  OPTIONAL_GO_EMBEDDINGS_ARG=(--precomputed_embeddings_path "$GO_EMBEDDINGS_PATH")
-fi
-
-resolve_artifact_dir() {
-  local registry_path="$1"
-  local local_dir="$2"
-
-  "$PYTHON_BIN" "$MODEL_SOURCE_RESOLVER" \
-    --wandb-registry-path "$registry_path" \
-    --local-dir "$local_dir"
-}
-
-resolve_hf_model_dir() {
-  local registry_path="$1"
-  local local_dir="$2"
-
-  "$PYTHON_BIN" "$MODEL_SOURCE_RESOLVER" \
-    --wandb-registry-path "$registry_path" \
-    --local-dir "$local_dir" \
-    --required-path config.json
-}
-
-resolve_existing_dir() {
-  local candidate="$1"
-  if [ -z "$candidate" ]; then
-    return 1
-  fi
-  if [ -d "$candidate" ]; then
-    (
-      cd "$candidate"
-      pwd
-    )
-    return 0
-  fi
-  if [ -d "$(pwd)/$candidate" ]; then
-    (
-      cd "$(pwd)/$candidate"
-      pwd
-    )
-    return 0
-  fi
-  return 1
-}
-
-is_valid_hf_model_dir() {
-  local model_dir="$1"
-  local config_path="$model_dir/config.json"
-
-  [ -f "$config_path" ] || return 1
-
-  "$PYTHON_BIN" - "$config_path" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-config_path = Path(sys.argv[1])
-try:
-    payload = json.loads(config_path.read_text())
-except Exception:
-    sys.exit(1)
-
-if not isinstance(payload, dict):
-    sys.exit(1)
-
-if payload.get("model_type"):
-    sys.exit(0)
-
-architectures = payload.get("architectures")
-if isinstance(architectures, list) and architectures:
-    sys.exit(0)
-
-sys.exit(1)
-PY
-}
-
-PAPER_RL_MODEL_RESOLVED=""
-BASE_CHECKPOINT_REF=""
-RESOLVED_BASE_MODEL_DIR=""
-ABLATION_FROM_PAPER_RL="False"
-RESOLVED_BASE_CHECKPOINT_LOCAL_DIR=""
-
-if [ -n "$BASE_CHECKPOINT_LOCAL_DIR" ]; then
-  if ! RESOLVED_BASE_CHECKPOINT_LOCAL_DIR=$(resolve_existing_dir "$BASE_CHECKPOINT_LOCAL_DIR"); then
-    echo "Error: BASE_CHECKPOINT_LOCAL_DIR does not exist: $BASE_CHECKPOINT_LOCAL_DIR"
-    exit 1
-  fi
-  if ! is_valid_hf_model_dir "$RESOLVED_BASE_CHECKPOINT_LOCAL_DIR"; then
-    echo "Error: BASE_CHECKPOINT_LOCAL_DIR is not a valid HF model directory: $RESOLVED_BASE_CHECKPOINT_LOCAL_DIR"
-    exit 1
-  fi
-  RESOLVED_BASE_MODEL_DIR="$RESOLVED_BASE_CHECKPOINT_LOCAL_DIR"
-  BASE_CHECKPOINT_REF="$RESOLVED_BASE_CHECKPOINT_LOCAL_DIR"
-  echo "--- Using local HF RL init model dir at $RESOLVED_BASE_MODEL_DIR"
-elif [ -n "$PRIMARY_BASE_CHECKPOINT" ]; then
-  echo "--- Resolving canonical RL init checkpoint from train-sft-output artifact"
-  RESOLVED_TRAIN_SFT_DIR=$(resolve_artifact_dir "$PRIMARY_BASE_CHECKPOINT" "$TRAIN_SFT_SOURCE_DIR")
-  if is_valid_hf_model_dir "$RESOLVED_TRAIN_SFT_DIR"; then
-    RESOLVED_BASE_MODEL_DIR="$RESOLVED_TRAIN_SFT_DIR"
-    BASE_CHECKPOINT_REF="$PRIMARY_BASE_CHECKPOINT"
-    echo "--- Using HF-ready train-sft-output artifact at $RESOLVED_BASE_MODEL_DIR"
-  else
-    SFT_CKPT_PATH=$(find "$RESOLVED_TRAIN_SFT_DIR" -maxdepth 2 -type f -name "*best*.ckpt" | sort | tail -n 1)
-    if [ -z "${SFT_CKPT_PATH:-}" ] || [ ! -f "$SFT_CKPT_PATH" ]; then
-      SFT_CKPT_PATH="$RESOLVED_TRAIN_SFT_DIR/last.ckpt"
-    fi
-    if [ ! -f "$SFT_CKPT_PATH" ]; then
-      SFT_CKPT_PATH=$(find "$RESOLVED_TRAIN_SFT_DIR" -maxdepth 2 -type f -name "*.ckpt" | sort | tail -n 1)
-    fi
-
-    if [ -z "${SFT_CKPT_PATH:-}" ] || [ ! -f "$SFT_CKPT_PATH" ]; then
-      echo "Error: train-sft-output artifact does not contain config.json or a .ckpt checkpoint"
-      exit 1
-    fi
-
-    if [ -z "$PAPER_RL_CHECKPOINT" ]; then
-      echo "Error: BIOREASON_RL_PAPER_MODEL_REGISTRY_PATH is required to convert train-sft-output into HF format"
-      exit 1
-    fi
-
-    echo "--- Resolving comparison model needed for SFT checkpoint conversion"
-    PAPER_RL_MODEL_RESOLVED=$(resolve_hf_model_dir "$PAPER_RL_CHECKPOINT" "$PAPER_RL_MODEL_DIR")
-
-    if is_valid_hf_model_dir "$TRAIN_SFT_HF_DIR"; then
-      echo "--- Reusing converted HF train-sft-output at $TRAIN_SFT_HF_DIR"
-    else
-      if [ -e "$TRAIN_SFT_HF_DIR" ]; then
-        echo "--- Removing invalid converted HF train-sft-output at $TRAIN_SFT_HF_DIR"
-        rm -rf "$TRAIN_SFT_HF_DIR"
-      fi
-
-      echo "--- Converting train-sft-output checkpoint to HF format"
-      "${PREP_COMMAND[@]}" "$PYTHON_BIN" "$SFT_TO_HF_CONVERTER" \
-        --checkpoint_path "$SFT_CKPT_PATH" \
-        --save_dir "$TRAIN_SFT_HF_DIR" \
-        --text_model_name "$PAPER_RL_MODEL_RESOLVED" \
-        --protein_model_name "$PROTEIN_MODEL_NAME" \
-        --cache_dir "$CACHE_DIR" \
-        --max_length_text "$MAX_LENGTH_TEXT" \
-        --max_length_protein "$MAX_LENGTH_PROTEIN" \
-        --lora_rank "$SFT_CONVERSION_LORA_RANK" \
-        --lora_alpha "$SFT_CONVERSION_LORA_ALPHA" \
-        --lora_dropout "$SFT_CONVERSION_LORA_DROPOUT" \
-        --protein_embedding_layer "$PROTEIN_EMBEDDING_LAYER" \
-        --go_obo_path "$GO_OBO_PATH" \
-        --go_hidden_dim "$GO_HIDDEN_DIM" \
-        --go_num_gat_layers "$GO_NUM_GAT_LAYERS" \
-        --go_num_heads "$GO_NUM_HEADS" \
-        --go_num_reduced_embeddings "$GO_NUM_REDUCED_EMBEDDINGS" \
-        --go_embedding_dim "$GO_EMBEDDING_DIM" \
-        --unified_go_encoder "$UNIFIED_GO_ENCODER" \
-        --protein_model_finetune "$PROTEIN_MODEL_FINETUNE" \
-        "${OPTIONAL_GO_EMBEDDINGS_ARG[@]}"
-    fi
-
-    RESOLVED_BASE_MODEL_DIR="$TRAIN_SFT_HF_DIR"
-    BASE_CHECKPOINT_REF="$PRIMARY_BASE_CHECKPOINT"
-    echo "--- Using converted HF train-sft-output at $RESOLVED_BASE_MODEL_DIR"
-  fi
-elif as_bool "$ALLOW_PAPER_RL_ABLATION"; then
-  if [ -z "$PAPER_RL_CHECKPOINT" ]; then
-    echo "Error: BIOREASON_RL_PAPER_MODEL_REGISTRY_PATH is required for paper-RL ablation"
-    exit 1
-  fi
-  echo "--- No train-sft-output artifact configured; using paper RL ablation path"
-  PAPER_RL_MODEL_RESOLVED=$(resolve_hf_model_dir "$PAPER_RL_CHECKPOINT" "$PAPER_RL_MODEL_DIR")
-  RESOLVED_BASE_MODEL_DIR="$PAPER_RL_MODEL_RESOLVED"
-  BASE_CHECKPOINT_REF="$PAPER_RL_CHECKPOINT"
-  ABLATION_FROM_PAPER_RL="True"
-else
-  echo "Error: BIOREASON_TRAIN_SFT_MODEL_REGISTRY_PATH is not set. Run SFT first or set ALLOW_PAPER_RL_ABLATION=true."
+if [ "$GPUS_PER_NODE" != "4" ]; then
+  echo "Error: exact production launch requires GPUS_PER_NODE=4 (got $GPUS_PER_NODE)."
   exit 1
 fi
 
-if ! is_valid_hf_model_dir "$RESOLVED_BASE_MODEL_DIR"; then
-  echo "Error: RL init model directory is not a valid HF model directory: $RESOLVED_BASE_MODEL_DIR"
+if [ -z "$BASE_CHECKPOINT" ]; then
+  echo "Error: BASE_CHECKPOINT is not set. Set BIOREASON_RL_PAPER_MODEL_REGISTRY_PATH or BASE_CHECKPOINT."
+  exit 1
+fi
+
+RESOLVED_BASE_MODEL_DIR=$("$PYTHON_BIN" "$MODEL_SOURCE_RESOLVER" \
+  --wandb-registry-path "$BASE_CHECKPOINT" \
+  --local-dir "$BASE_CHECKPOINT_DIR" \
+  --required-path config.json \
+  --required-path tokenizer_config.json \
+  --required-path protein_projection.pt \
+  --required-path protein_model/pytorch_model.bin)
+if [ -z "$RESOLVED_BASE_MODEL_DIR" ]; then
+  echo "Error: failed to resolve base checkpoint from $BASE_CHECKPOINT"
   exit 1
 fi
 
 if [ -z "$CAFA5_DATASET" ]; then
-  echo "--- Resolving reasoning dataset source for RL from W&B Artifact"
   CAFA5_DATASET=$("$PYTHON_BIN" "$DATA_BUNDLE_RESOLVER" \
     --data-manifest-path "$DATA_MANIFEST_PATH" \
     --data-bundle "$DATA_BUNDLE" \
     --asset-key reasoning_dataset \
     --print-field local_dir)
 fi
-if [ -z "$CAFA5_DATASET" ]; then
-  echo "Error: failed to resolve reasoning dataset source for RL"
+if [ -z "$DATASET_NAME" ]; then
+  DATASET_NAME=$("$PYTHON_BIN" "$DATA_BUNDLE_RESOLVER" \
+    --data-manifest-path "$DATA_MANIFEST_PATH" \
+    --data-bundle "$DATA_BUNDLE" \
+    --asset-key reasoning_dataset \
+    --print-field dataset_name)
+fi
+if [ -z "$REASONING_DATASET_NAME" ]; then
+  REASONING_DATASET_NAME="$DATASET_NAME"
+fi
+if [ -z "$TEMPORAL_SPLIT_ARTIFACT" ]; then
+  TEMPORAL_SPLIT_ARTIFACT=$("$PYTHON_BIN" "$DATA_BUNDLE_RESOLVER" \
+    --data-manifest-path "$DATA_MANIFEST_PATH" \
+    --data-bundle "$DATA_BUNDLE" \
+    --asset-key temporal_split_artifact \
+    --print-field wandb_registry_path)
+fi
+if [ -z "$DATASET_ARTIFACT" ]; then
+  DATASET_ARTIFACT=$("$PYTHON_BIN" "$DATA_BUNDLE_RESOLVER" \
+    --data-manifest-path "$DATA_MANIFEST_PATH" \
+    --data-bundle "$DATA_BUNDLE" \
+    --asset-key reasoning_dataset \
+    --print-field wandb_registry_path)
+fi
+if [ -z "$IA_FILE_PATH" ]; then
+  IA_DIR=$("$PYTHON_BIN" "$DATA_BUNDLE_RESOLVER" \
+    --data-manifest-path "$DATA_MANIFEST_PATH" \
+    --data-bundle "$DATA_BUNDLE" \
+    --asset-key ia_file \
+    --print-field local_dir)
+  IA_FILE_PATH="${IA_DIR}/IA.txt"
+fi
+
+if [ ! -d "$CAFA5_DATASET" ]; then
+  echo "Error: CAFA5_DATASET must point to a materialized local dataset directory (got $CAFA5_DATASET)."
   exit 1
 fi
-echo "--- Reasoning dataset materialized at $CAFA5_DATASET"
-
-TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-RL_RUN_FAMILY="rl-sft"
-if as_bool "$ALLOW_PAPER_RL_ABLATION" && [ -z "$PRIMARY_BASE_CHECKPOINT" ]; then
-  RL_RUN_FAMILY="rl-paper"
+if [ ! -f "$IA_FILE_PATH" ]; then
+  echo "Error: IA_FILE_PATH must point to an existing file (got $IA_FILE_PATH)."
+  exit 1
 fi
-WANDB_RUN_NAME=${WANDB_RUN_NAME:-"${RL_RUN_FAMILY}-${TIMESTAMP}"}
-OUTPUT_DIR="${RL_OUTPUT_ROOT}/${WANDB_RUN_NAME}"
-mkdir -p "$RL_OUTPUT_ROOT"
-
-echo "--- RL init checkpoint ref: $BASE_CHECKPOINT_REF"
-echo "--- RL init model dir: $RESOLVED_BASE_MODEL_DIR"
-echo "--- RL output dir: $OUTPUT_DIR"
-
-RESUME_ARGS=()
-if [ -n "$RESUME_FROM_RAW_CHECKPOINT" ]; then
-  RESUME_ARGS=(--resume_from_raw_checkpoint "$RESUME_FROM_RAW_CHECKPOINT")
+if [ ! -f "$GO_OBO_PATH" ]; then
+  echo "Error: GO_OBO_PATH must point to an existing file (got $GO_OBO_PATH)."
+  exit 1
 fi
 
-stdbuf -oL -eL "${TRAIN_COMMAND[@]}" "${TRAIN_LAUNCH_PREFIX[@]}" train_protein_grpo.py \
-  --run_name "$WANDB_RUN_NAME" \
-  --seed "$SEED" \
-  --wandb_project "$BASE_WANDB_PROJECT" \
-  --wandb_entity "$WANDB_ENTITY" \
-  --wandb_mode "$WANDB_MODE" \
-  --weave_project "$WEAVE_PROJECT" \
-  --weave_trace_budget "$WEAVE_TRACE_BUDGET" \
-  --benchmark_version "$BENCHMARK_VERSION" \
-  --temporal_split_artifact "$TEMPORAL_SPLIT_ARTIFACT" \
-  --dataset_config "$DATASET_CONFIG" \
-  --reasoning_dataset_config "$REASONING_DATASET_CONFIG" \
-  --dataset_artifact "$DATASET_ARTIFACT" \
-  --shortlist_query "$SHORTLIST_QUERY" \
-  --shortlist_mode "$SHORTLIST_MODE" \
-  --train_start_release "$TRAIN_START_RELEASE" \
-  --train_end_release "$TRAIN_END_RELEASE" \
-  --dev_end_release "$DEV_END_RELEASE" \
-  --test_end_release "$TEST_END_RELEASE" \
-  --base_checkpoint "$BASE_CHECKPOINT_REF" \
-  --model_artifact "$CHECKPOINT_ARTIFACT_NAME" \
-  --job_time_limit "$JOB_TIME_LIMIT" \
-  --text_model_name "$RESOLVED_BASE_MODEL_DIR" \
-  --protein_model_name "$PROTEIN_MODEL_NAME" \
-  --cache_dir "$CACHE_DIR" \
-  --go_obo_path "$GO_OBO_PATH" \
-  --ia_file_path "$IA_FILE_PATH" \
-  --require_ia_file "$REQUIRE_IA_FILE" \
-  --structure_dir "$STRUCTURE_DIR" \
-  --dataset_cache_dir "$DATASET_CACHE_DIR" \
-  --dataset_type cafa5 \
-  --cafa5_dataset "$CAFA5_DATASET" \
-  --cafa5_dataset_name "$REASONING_DATASET_NAME" \
-  --reasoning_dataset_name "$REASONING_DATASET_NAME" \
-  --interpro_dataset_name "$INTERPRO_DATASET_NAME" \
-  --go_gpt_predictions_column go_pred \
-  --include_ground_truth_in_final_answer False \
-  --add_uniprot_summary "$ADD_UNIPROT_SUMMARY" \
-  --is_swissprot "$IS_SWISSPROT" \
-  --include_go_defs "$INCLUDE_GO_DEFS" \
-  --interpro_in_prompt "$INTERPRO_IN_PROMPT" \
-  --ppi_in_prompt "$PPI_IN_PROMPT" \
-  --predict_interpro "$PREDICT_INTERPRO" \
-  --include_protein_function_summary "$INCLUDE_PROTEIN_FUNCTION_SUMMARY" \
-  --split_go_aspects "$SPLIT_GO_ASPECTS" \
-  --continuation_mode "$CONTINUATION_MODE" \
-  --reasoning_prompt_style "$REASONING_PROMPT_STYLE" \
-  --compact_interpro_limit "$COMPACT_INTERPRO_LIMIT" \
-  --compact_ppi_limit "$COMPACT_PPI_LIMIT" \
-  --compact_go_speculation_limit "$COMPACT_GO_SPECULATION_LIMIT" \
-  --max_length_text "$MAX_LENGTH_TEXT" \
-  --max_length_protein "$MAX_LENGTH_PROTEIN" \
-  --protein_embedding_layer "$PROTEIN_EMBEDDING_LAYER" \
-  --go_hidden_dim "$GO_HIDDEN_DIM" \
-  --go_num_gat_layers "$GO_NUM_GAT_LAYERS" \
-  --go_num_heads "$GO_NUM_HEADS" \
-  --go_num_reduced_embeddings "$GO_NUM_REDUCED_EMBEDDINGS" \
-  --go_embedding_dim "$GO_EMBEDDING_DIM" \
-  --unified_go_encoder "$UNIFIED_GO_ENCODER" \
-  --protein_model_finetune "$PROTEIN_MODEL_FINETUNE" \
-  --train_projector "$TRAIN_PROJECTOR" \
-  --train_go_modules "$TRAIN_GO_MODULES" \
-  --use_qlora "$USE_QLORA" \
-  --bnb_4bit_compute_dtype "$BNB_4BIT_COMPUTE_DTYPE" \
-  --bnb_4bit_quant_type "$BNB_4BIT_QUANT_TYPE" \
-  --bnb_4bit_use_double_quant "$BNB_4BIT_USE_DOUBLE_QUANT" \
-  --lora_rank "$LORA_RANK" \
-  --lora_alpha "$LORA_ALPHA" \
-  --lora_dropout "$LORA_DROPOUT" \
-  --gradient_checkpointing "$GRADIENT_CHECKPOINTING" \
-  --disable_model_dropout "$DISABLE_MODEL_DROPOUT" \
-  --learning_rate "$LEARNING_RATE" \
-  --weight_decay "$WEIGHT_DECAY" \
-  --per_device_train_batch_size "$PER_DEVICE_TRAIN_BATCH_SIZE" \
-  --per_device_eval_batch_size "$PER_DEVICE_EVAL_BATCH_SIZE" \
-  --num_workers "$NUM_WORKERS" \
-  --max_steps "$MAX_STEPS" \
-  --max_epochs "$MAX_EPOCHS" \
-  --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS" \
-  --adam_beta1 "$ADAM_BETA1" \
-  --adam_beta2 "$ADAM_BETA2" \
-  --adam_epsilon "$ADAM_EPSILON" \
-  --lr_scheduler_type "$LR_SCHEDULER_TYPE" \
-  --warmup_ratio "$WARMUP_RATIO" \
-  --max_train_samples "$MAX_TRAIN_SAMPLES" \
-  --max_eval_samples "$MAX_EVAL_SAMPLES" \
-  --eval_sample_strategy "$EVAL_SAMPLE_STRATEGY" \
-  --eval_every_n_steps "$EVAL_EVERY_N_STEPS" \
-  --save_every_n_steps "$SAVE_EVERY_N_STEPS" \
-  --max_eval_batches "$MAX_EVAL_BATCHES" \
-  --rotating_eval_every_n_steps "$ROTATING_EVAL_EVERY_N_STEPS" \
-  --rotating_eval_max_samples "$ROTATING_EVAL_MAX_SAMPLES" \
-  --rotating_eval_sample_strategy "$ROTATING_EVAL_SAMPLE_STRATEGY" \
-  --rotating_eval_seed_stride "$ROTATING_EVAL_SEED_STRIDE" \
-  --max_grad_norm "$MAX_GRAD_NORM" \
-  --distributed_timeout_seconds "$DISTRIBUTED_TIMEOUT_SECONDS" \
-  --audit_only "$AUDIT_ONLY" \
-  --runtime_stack "$RUNTIME_STACK" \
-  --rollout_execution_mode "$ROLLOUT_EXECUTION_MODE" \
-  --rollout_query_batch_size "$ROLLOUT_QUERY_BATCH_SIZE" \
-  --rollout_group_size "$ROLLOUT_GROUP_SIZE" \
-  --target_num_nodes "$TARGET_NUM_NODES" \
-  --target_gpus_per_node "$TARGET_GPUS_PER_NODE" \
-  --weave_trace_full_group_count "$WEAVE_TRACE_FULL_GROUP_COUNT" \
-  --weave_trace_full_rollouts_per_group "$WEAVE_TRACE_FULL_ROLLOUTS_PER_GROUP" \
-  --loss_type "$LOSS_TYPE" \
-  --steps_per_generation "$STEPS_PER_GENERATION" \
-  --num_iterations "$NUM_ITERATIONS" \
-  --num_generations "$NUM_GENERATIONS" \
-  --min_new_tokens "$MIN_NEW_TOKENS" \
-  --max_new_tokens "$MAX_NEW_TOKENS" \
-  --max_loss_completion_tokens "$MAX_LOSS_COMPLETION_TOKENS" \
-  --rollout_logprob_microbatch_size "$ROLLOUT_LOGPROB_MICROBATCH_SIZE" \
-  --sampling_contract "$SAMPLING_CONTRACT" \
-  --temperature "$TEMPERATURE" \
-  --top_p "$TOP_P" \
-  --top_k "$TOP_K" \
-  --min_p "$MIN_P" \
-  --repetition_penalty "$REPETITION_PENALTY" \
-  --do_sample "$DO_SAMPLE" \
-  --eval_do_sample "$EVAL_DO_SAMPLE" \
-  --eval_temperature "$EVAL_TEMPERATURE" \
-  --eval_top_p "$EVAL_TOP_P" \
-  --eval_top_k "$EVAL_TOP_K" \
-  --clip_epsilon_low "$CLIP_EPSILON_LOW" \
-  --clip_epsilon_high "$CLIP_EPSILON_HIGH" \
-  --reward_scaling "$REWARD_SCALING" \
-  --advantage_epsilon_std "$ADVANTAGE_EPSILON_STD" \
-  --importance_sampling_level "$IMPORTANCE_SAMPLING_LEVEL" \
-  --importance_sampling_cap "$IMPORTANCE_SAMPLING_CAP" \
-  --reward_final_answer_only "$REWARD_FINAL_ANSWER_ONLY" \
-  --reward_prediction_source "$REWARD_PREDICTION_SOURCE" \
-  --kl_beta "$KL_BETA" \
-  --reward_funcs "$REWARD_FUNCS" \
-  --reward_weights "$REWARD_WEIGHTS" \
-  --output_dir "$OUTPUT_DIR" \
-  --checkpoint_artifact_name "$CHECKPOINT_ARTIFACT_NAME" \
-  --checkpoint_artifact_aliases "$CHECKPOINT_ARTIFACT_ALIASES" \
-  --ablation_from_paper_rl "$ABLATION_FROM_PAPER_RL" \
-  "${OPTIONAL_GO_EMBEDDINGS_ARG[@]}" \
-  "${RESUME_ARGS[@]}"
+TRAIN_ARGS=(
+  --text_model_name "$RESOLVED_BASE_MODEL_DIR"
+  --base_checkpoint "$BASE_CHECKPOINT"
+  --cafa5_dataset "$CAFA5_DATASET"
+  --dataset_config "$DATASET_NAME"
+  --reasoning_dataset_config "$REASONING_DATASET_NAME"
+  --reasoning_dataset_name "$REASONING_DATASET_NAME"
+  --temporal_split_artifact "$TEMPORAL_SPLIT_ARTIFACT"
+  --dataset_artifact "$DATASET_ARTIFACT"
+  --go_obo_path "$GO_OBO_PATH"
+  --ia_file_path "$IA_FILE_PATH"
+  --benchmark_version "$BENCHMARK_VERSION"
+  --train_start_release "$TRAIN_START_RELEASE"
+  --train_end_release "$TRAIN_END_RELEASE"
+  --dev_end_release "$DEV_END_RELEASE"
+  --test_end_release "$TEST_END_RELEASE"
+  --target_num_nodes "$NNODES"
+  --target_gpus_per_node "$GPUS_PER_NODE"
+  --rollout_backend "$ROLLOUT_BACKEND"
+  --rollout_worker_start_method "$ROLLOUT_WORKER_START_METHOD"
+  --rollout_logprob_microbatch_size "$ROLLOUT_LOGPROB_MICROBATCH_SIZE"
+  --max_loss_completion_tokens "$MAX_LOSS_COMPLETION_TOKENS"
+  --vllm_gpu_memory_utilization "$VLLM_GPU_MEMORY_UTILIZATION"
+  --vllm_max_model_len "$VLLM_MAX_MODEL_LEN"
+  --vllm_max_num_seqs "$VLLM_MAX_NUM_SEQS"
+  --vllm_cpu_offload_gb "$VLLM_CPU_OFFLOAD_GB"
+  --vllm_swap_space_gb "$VLLM_SWAP_SPACE_GB"
+  --vllm_enforce_eager "$VLLM_ENFORCE_EAGER"
+  --vllm_enable_sleep_mode "$VLLM_ENABLE_SLEEP_MODE"
+  --vllm_sleep_level "$VLLM_SLEEP_LEVEL"
+  --vllm_attention_backend "$VLLM_ATTENTION_BACKEND"
+  --vllm_worker_multiproc_method "$VLLM_WORKER_MULTIPROC_METHOD"
+  --vllm_use_v1 "$VLLM_USE_V1"
+  --output_dir "$OUTPUT_DIR"
+  --checkpoint_artifact_name "$CHECKPOINT_ARTIFACT_NAME"
+  --checkpoint_artifact_aliases "$CHECKPOINT_ARTIFACT_ALIASES"
+  --wandb_project "$WANDB_PROJECT"
+)
+
+if [ -n "$WANDB_ENTITY" ]; then
+  TRAIN_ARGS+=(--wandb_entity "$WANDB_ENTITY")
+fi
+if [ -n "${WANDB_RUN_NAME:-}" ]; then
+  TRAIN_ARGS+=(--run_name "$WANDB_RUN_NAME")
+fi
+if [ -n "$WEAVE_PROJECT" ]; then
+  TRAIN_ARGS+=(--weave_project "$WEAVE_PROJECT")
+fi
+
+if has_preflight_only "$@"; then
+  exec "$PYTHON_BIN" train_protein_grpo.py "${TRAIN_ARGS[@]}" "$@"
+fi
+
+if [ -n "$HOSTFILE" ]; then
+  if [ ! -f "$HOSTFILE" ]; then
+    echo "Error: HOSTFILE does not exist: $HOSTFILE"
+    exit 1
+  fi
+  if [ -n "${NODE_RANK:-}" ]; then
+    require_env MASTER_ADDR
+    require_env MASTER_PORT
+    exec "$DEEPSPEED_BIN" \
+      --hostfile "$HOSTFILE" \
+      --no_ssh \
+      --master_addr "$MASTER_ADDR" \
+      --master_port "$MASTER_PORT" \
+      --node_rank "$NODE_RANK" \
+      train_protein_grpo.py \
+      "${TRAIN_ARGS[@]}" \
+      "$@"
+  fi
+  exec "$DEEPSPEED_BIN" \
+    --hostfile "$HOSTFILE" \
+    train_protein_grpo.py \
+    "${TRAIN_ARGS[@]}" \
+    "$@"
+fi
+
+require_env MASTER_ADDR
+require_env MASTER_PORT
+require_env NODE_RANK
+
+exec "$DEEPSPEED_BIN" \
+  --no_ssh \
+  --num_nodes "$NNODES" \
+  --num_gpus "$GPUS_PER_NODE" \
+  --master_addr "$MASTER_ADDR" \
+  --master_port "$MASTER_PORT" \
+  --node_rank "$NODE_RANK" \
+  train_protein_grpo.py \
+  "${TRAIN_ARGS[@]}" \
+  "$@"

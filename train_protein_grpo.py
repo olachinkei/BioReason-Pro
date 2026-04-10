@@ -1,146 +1,57 @@
 #!/usr/bin/env python3
 """
-GRPO-style RL training entry point for ProteinLLM disease benchmarking.
+Specification-first DR-GRPO trainer for BioReason-Pro.
 
-This script follows the high-level structure of BioReason's GRPO training flow,
-but uses a custom multimodal loop so we can keep ProteinLLM's protein encoder,
-GO encoder, and reasoning dataset format intact.
+This is a zero-based rewrite of the RL entry point. It intentionally does not
+reuse the previous trainer's DDP/CoreWeave launcher flow or its
+`model.generate()`-centric control path. Instead it follows the paper-facing
+specification directly:
+
+- rollout generation is owned by a separate vLLM-backed rollout worker
+- scoring / optimization is owned by a DeepSpeed-backed policy engine
+- reward extraction is strict to the <|FINAL_ANSWER|> block
+- the canonical paper batch is 8 proteins x 24 rollouts = 192 trajectories
 """
 
 from __future__ import annotations
 
 import argparse
-from contextlib import nullcontext
-from dataclasses import asdict, dataclass
-from functools import lru_cache
+import copy
+import gc
 import importlib.util
 import json
 import math
+import multiprocessing as mp
 import os
 import random
 import re
+import shutil
 import time
 import traceback
-from datetime import timedelta
+from contextlib import nullcontext
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+try:
+    import torch
+    import torch.nn.functional as F
+except ImportError:  # pragma: no cover - handled at runtime
+    torch = None
+    F = None
 
 try:
     import weave
-except ImportError:  # pragma: no cover - optional dependency at runtime
+except ImportError:  # pragma: no cover - optional dependency
     weave = None
 
 
 GO_ID_PATTERN = re.compile(r"GO:\d{7}")
-THINK_TAG_PATTERN = re.compile(r"<think>\s*(.*?)\s*</think>", re.DOTALL)
-ANSWER_TAG_PATTERN = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.DOTALL)
-STRUCTURAL_TAG_PATTERN = re.compile(r"</?tool_call>")
-GO_ASPECT_PATTERN = re.compile(r"(?im)^\s*(MF|BP|CC)\s*:\s*(.+)$")
-GO_SUMMARY_START = "<|GO_SUMMARY_START|>"
-GO_SUMMARY_END = "<|GO_SUMMARY_END|>"
-FUNCTION_SUMMARY_START = "<|FUNCTION_SUMMARY_START|>"
-FUNCTION_SUMMARY_END = "<|FUNCTION_SUMMARY_END|>"
-GO_ASPECT_ORDER = ("MF", "BP", "CC")
-GO_NAMESPACE_TO_ASPECT = {
-    "molecular_function": "MF",
-    "biological_process": "BP",
-    "cellular_component": "CC",
-}
-CONTINUATION_MODE_PAPER_NATIVE = "paper_native"
-CONTINUATION_MODE_REPO_STRUCTURED = "repo_structured"
-CONTINUATION_MODE_CHOICES = (
-    CONTINUATION_MODE_PAPER_NATIVE,
-    CONTINUATION_MODE_REPO_STRUCTURED,
+FINAL_ANSWER_PATTERN = re.compile(
+    r"<\|FINAL_ANSWER\|>\s*(.*?)\s*<\|/FINAL_ANSWER\|>",
+    re.DOTALL,
 )
-REASONING_PROMPT_STYLE_DEFAULTS = {
-    CONTINUATION_MODE_PAPER_NATIVE: "paper_native",
-    CONTINUATION_MODE_REPO_STRUCTURED: "paper_compact",
-}
-SAMPLING_CONTRACT_DEFAULTS = {
-    CONTINUATION_MODE_PAPER_NATIVE: "checkpoint_native",
-    CONTINUATION_MODE_REPO_STRUCTURED: "explicit",
-}
-TERMINAL_SUMMARY_MARKERS = (
-    GO_SUMMARY_END,
-    "</answer>",
-    "<|im_end|>",
-    "<|endoftext|>",
-)
-DIAGNOSTIC_REWARD_NAMES = (
-    "strict_format",
-    "summary_schema",
-    "go_presence",
-    "go_aspect_coverage",
-    "go_overlap",
-    "truncation_penalty",
-    "structural_noise",
-)
-WANDB_BOOTSTRAP_METRICS = (
-    "loss_train",
-    "reward",
-    "reward_std_dev",
-    "loss_kl_div",
-    "loss_policy_ratio_mean",
-    "loss_policy_ratio_max",
-    "loss_learning_rate",
-    "loss_grad_norm",
-    "eval_reward",
-    "eval_completion_length",
-    "eval_loss_kl_div",
-    "eval_data_step_num_datums",
-    "data_step_num_groups_submitted",
-    "data_step_num_groups_trainable",
-    "data_step_num_trajectories",
-    "data_step_num_datums",
-    "data_step_trainer_tokens",
-    "data_step_num_update_passes",
-    "diagnostic/go_summary_end_rate",
-    "diagnostic/max_new_tokens_hit_rate",
-    "diagnostic/reward_nonzero_rate",
-    "diagnostic/filtered_rollout_rate",
-    "diagnostic/audit_only",
-    "diagnostic/first_go_summary_token_idx_mean",
-    "diagnostic/stop_reason_summary_end_rate",
-    "diagnostic/stop_reason_eos_rate",
-    "diagnostic/stop_reason_max_tokens_rate",
-    "diagnostic/stop_reason_unknown_rate",
-    "train_skipped_update",
-)
-
-_DISTRIBUTED_CONTROL_GROUP: Any = None
-_DISTRIBUTED_TIMEOUT_SECONDS = 600
-DEFAULT_GO_OBO_PATH = str((Path(__file__).resolve().parent / "bioreason2" / "dataset" / "go-basic.obo").resolve())
-REWARD_CONTEXT: Dict[str, Any] = {
-    "go_obo_path": DEFAULT_GO_OBO_PATH if os.path.exists(DEFAULT_GO_OBO_PATH) else "",
-    "ia_file_path": "",
-    "reward_final_answer_only": False,
-    "reward_prediction_source": "reasoning_trace",
-    "continuation_mode": CONTINUATION_MODE_PAPER_NATIVE,
-}
-
-
-@dataclass(frozen=True)
-class RolloutStepSemantics:
-    per_device_train_batch_size: int
-    per_device_eval_batch_size: int
-    world_size: int
-    actual_global_unique_proteins_per_step: int
-    actual_global_num_trajectories_per_step: int
-    actual_rollout_group_size: int
-    rollout_query_batch_size_target: int
-    rollout_group_size_target: int
-    rollout_total_trajectories_target: int
-    global_unique_proteins_target: int
-    target_num_nodes: int
-    target_gpus_per_node: int
-    target_global_world_size: int
-    runtime_stack: str
-    rollout_execution_mode: str
-    paper_faithful_batch_shape: bool
-    paper_faithful_hardware_shape: bool
-    paper_faithful_runtime_stack: bool
-    paper_faithful_execution_mode: bool
-    paper_faithful_ready: bool
+ROLLOUT_TRACE_SAMPLE_META_KEYS = ("protein_id", "split")
 
 
 def normalize_text(value: Any) -> str:
@@ -153,833 +64,176 @@ def normalize_text(value: Any) -> str:
     return str(value)
 
 
-def resolve_continuation_mode_name(raw: Any) -> str:
-    normalized = normalize_text(raw).strip().lower()
-    if normalized in CONTINUATION_MODE_CHOICES:
-        return normalized
-    return CONTINUATION_MODE_PAPER_NATIVE
+def resolve_weave_project(args: Any) -> str:
+    explicit = normalize_text(getattr(args, "weave_project", None)).strip()
+    if explicit:
+        return explicit
+    entity = normalize_text(getattr(args, "wandb_entity", None)).strip()
+    project = normalize_text(getattr(args, "wandb_project", None)).strip()
+    if entity and project:
+        return f"{entity}/{project}"
+    return ""
 
 
-def default_reasoning_prompt_style(continuation_mode: str) -> str:
-    return REASONING_PROMPT_STYLE_DEFAULTS.get(
-        resolve_continuation_mode_name(continuation_mode),
-        "paper_native",
-    )
+def ensure_weave_server_cache_dir(output_dir: Path) -> str:
+    configured_dir = normalize_text(os.getenv("WEAVE_SERVER_CACHE_DIR")).strip()
+    if configured_dir:
+        cache_dir = Path(configured_dir).expanduser()
+    else:
+        cache_dir = (output_dir / "weave_server_cache").resolve()
+        os.environ["WEAVE_SERVER_CACHE_DIR"] = str(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return str(cache_dir.resolve())
 
 
-def default_sampling_contract(continuation_mode: str) -> str:
-    return SAMPLING_CONTRACT_DEFAULTS.get(
-        resolve_continuation_mode_name(continuation_mode),
-        "checkpoint_native",
-    )
+def traceable_sample_meta(sample_meta: Mapping[str, Any], *, allowed_keys: Sequence[str]) -> Dict[str, str]:
+    payload: Dict[str, str] = {}
+    for key in allowed_keys:
+        normalized = normalize_text(sample_meta.get(key)).strip()
+        if normalized:
+            payload[str(key)] = normalized
+    return payload
 
 
-def default_reward_prediction_source(continuation_mode: str, reward_final_answer_only: bool) -> str:
-    resolved_mode = resolve_continuation_mode_name(continuation_mode)
-    if resolved_mode == CONTINUATION_MODE_PAPER_NATIVE:
-        return "reasoning_trace"
-    return "structured_go_summary" if reward_final_answer_only else "final_answer"
+def parse_bool(raw: Any) -> bool:
+    return normalize_text(raw).strip().lower() in {"1", "true", "t", "yes", "y"}
 
 
-def resolve_attn_implementation(preferred: str) -> str:
-    normalized = normalize_text(preferred).strip() or "sdpa"
-    if normalized != "flash_attention_2":
-        return normalized
-    if importlib.util.find_spec("flash_attn") is not None:
-        return normalized
-    print("flash_attn is unavailable; falling back to attn_implementation=sdpa for RL")
-    return "sdpa"
+def env_int(name: str, default: int) -> int:
+    raw = normalize_text(os.environ.get(name)).strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
 
 
-def maybe_parse_list(value: Any) -> List[str]:
-    if value is None:
-        return []
-    if isinstance(value, list):
-        return [normalize_text(item).strip() for item in value if normalize_text(item).strip()]
-    if isinstance(value, tuple):
-        return [normalize_text(item).strip() for item in value if normalize_text(item).strip()]
+def require_torch() -> None:
+    if torch is None or F is None:
+        raise RuntimeError("train_protein_grpo.py requires torch to be installed.")
+
+
+def require_module(module_name: str, install_hint: Optional[str] = None) -> None:
+    if importlib.util.find_spec(module_name) is not None:
+        return
+    hint = f" Install {install_hint}." if install_hint else ""
+    raise RuntimeError(f"Missing required dependency: {module_name}.{hint}")
+
+
+def module_is_available(module_name: str) -> bool:
+    return importlib.util.find_spec(module_name) is not None
+
+
+def is_probably_local_path(value: Any) -> bool:
     text = normalize_text(value).strip()
     if not text:
-        return []
-    if text.startswith("[") and text.endswith("]"):
-        try:
-            parsed = json.loads(text)
-            if isinstance(parsed, list):
-                return [normalize_text(item).strip() for item in parsed if normalize_text(item).strip()]
-        except json.JSONDecodeError:
-            pass
-        try:
-            import ast
-
-            parsed = ast.literal_eval(text)
-            if isinstance(parsed, list):
-                return [normalize_text(item).strip() for item in parsed if normalize_text(item).strip()]
-        except Exception:
-            pass
-    return [part.strip() for part in text.split(",") if part.strip()]
-
-
-def extract_go_ids(text: Any) -> List[str]:
-    seen = set()
-    ordered: List[str] = []
-    for match in GO_ID_PATTERN.findall(normalize_text(text)):
-        if match not in seen:
-            seen.add(match)
-            ordered.append(match)
-    return ordered
-
-
-def extract_tagged_block(text: Any, start_marker: str, end_marker: str) -> str:
-    raw = normalize_text(text)
-    if not raw:
-        return ""
-    start_idx = raw.find(start_marker)
-    if start_idx < 0:
-        return ""
-    end_idx = raw.find(end_marker, start_idx + len(start_marker))
-    if end_idx < 0:
-        return ""
-    return raw[start_idx + len(start_marker) : end_idx].strip()
-
-
-def extract_go_aspect_map(text: Any) -> Dict[str, List[str]]:
-    aspect_map: Dict[str, List[str]] = {}
-    for match in GO_ASPECT_PATTERN.finditer(normalize_text(text)):
-        aspect = match.group(1).upper()
-        go_ids = extract_go_ids(match.group(2))
-        if go_ids:
-            aspect_map[aspect] = go_ids
-    return aspect_map
-
-
-def extract_reasoning_and_answer(text: Any) -> Dict[str, str]:
-    raw = normalize_text(text).strip()
-    if not raw:
-        return {"reasoning": "", "final_answer": ""}
-
-    reasoning = ""
-    final_answer = raw
-
-    think_match = THINK_TAG_PATTERN.search(raw)
-    if think_match:
-        reasoning = think_match.group(1).strip()
-
-    answer_match = ANSWER_TAG_PATTERN.search(raw)
-    if answer_match:
-        final_answer = answer_match.group(1).strip()
-    elif think_match:
-        final_answer = THINK_TAG_PATTERN.sub("", raw).strip()
-
-    for marker in ("<|im_end|>", "<|endoftext|>"):
-        if marker in final_answer:
-            final_answer = final_answer.split(marker, 1)[0].strip()
-
-    structured_final_answer = extract_structured_final_answer(raw)
-    if structured_final_answer:
-        final_answer = structured_final_answer
-
-    return {"reasoning": reasoning, "final_answer": final_answer}
-
-
-def extract_structured_final_answer(text: Any) -> str:
-    raw = normalize_text(text).strip()
-    if not raw:
-        return ""
-
-    answer_match = ANSWER_TAG_PATTERN.search(raw)
-    if answer_match:
-        answer_scope = answer_match.group(1).strip()
-    elif "</think>" in raw:
-        answer_scope = raw.split("</think>", 1)[1].strip()
-    else:
-        answer_scope = raw
-
-    go_summary = extract_tagged_block(answer_scope, GO_SUMMARY_START, GO_SUMMARY_END)
-    function_summary = extract_tagged_block(answer_scope, FUNCTION_SUMMARY_START, FUNCTION_SUMMARY_END)
-
-    structured_blocks: List[str] = []
-    if go_summary:
-        structured_blocks.append(f"{GO_SUMMARY_START}\n{go_summary}\n{GO_SUMMARY_END}")
-    if function_summary:
-        structured_blocks.append(f"{FUNCTION_SUMMARY_START}\n{function_summary}\n{FUNCTION_SUMMARY_END}")
-    if structured_blocks:
-        return "\n\n".join(structured_blocks).strip()
-    return ""
-
-
-def extract_reward_prediction_text(text: Any) -> str:
-    raw = normalize_text(text).strip()
-    if not raw:
-        return ""
-    reward_context = resolve_reward_context()
-    prediction_source = normalize_text(reward_context.get("reward_prediction_source")).strip().lower()
-    if not prediction_source:
-        prediction_source = default_reward_prediction_source(
-            normalize_text(reward_context.get("continuation_mode")).strip().lower(),
-            bool(reward_context.get("reward_final_answer_only", False)),
-        )
-
-    if prediction_source == "reasoning_trace":
-        # The paper describes regex extraction from the generated reasoning trace.
-        # In our formatting variants that means the whole generated completion,
-        # not only the text inside <think> tags.
-        return raw
-    if prediction_source == "final_answer":
-        sections = extract_reasoning_and_answer(raw)
-        final_answer = sections.get("final_answer", "").strip()
-        if final_answer:
-            return final_answer
-        answer_match = ANSWER_TAG_PATTERN.search(raw)
-        if answer_match:
-            return answer_match.group(1).strip()
-        return ""
-
-    structured_final_answer = extract_structured_final_answer(raw)
-    if not structured_final_answer:
-        return ""
-    return extract_tagged_block(structured_final_answer, GO_SUMMARY_START, GO_SUMMARY_END)
-
-
-def require_training_ia_file(args: argparse.Namespace, reward_names: Sequence[str]) -> str:
-    if "ia_weighted_f1" not in reward_names:
-        return ""
-    ia_file_path = normalize_text(getattr(args, "ia_file_path", None)).strip()
-    require_ia_file = bool(getattr(args, "require_ia_file", True))
-    if ia_file_path and os.path.exists(ia_file_path):
-        return ia_file_path
-    if require_ia_file:
-        raise FileNotFoundError(
-            "IA-weighted RL reward requires a valid --ia_file_path. "
-            f"Resolved path: {ia_file_path or '<empty>'}"
-        )
-    return ""
-
-
-def count_structural_noise_tokens(text: Any) -> int:
-    return len(STRUCTURAL_TAG_PATTERN.findall(normalize_text(text)))
-
-
-def has_meaningful_text(text: Any) -> bool:
-    return bool(re.search(r"[A-Za-z0-9]", normalize_text(text)))
-
-
-def count_words(text: Any) -> int:
-    return len(normalize_text(text).split())
-
-
-def has_terminal_summary_marker(text: Any) -> bool:
-    raw = normalize_text(text)
-    return any(marker in raw for marker in TERMINAL_SUMMARY_MARKERS)
-
-
-def build_requested_go_aspects(sample_meta: Mapping[str, Any]) -> List[str]:
-    requested = normalize_text(sample_meta.get("go_aspect")).strip().lower()
-    if requested in {"mf", "bp", "cc"}:
-        return [requested.upper()]
-
-    target_aspects: List[str] = []
-    for aspect, field_name in (("MF", "go_mf"), ("BP", "go_bp"), ("CC", "go_cc")):
-        if extract_go_ids(sample_meta.get(field_name)):
-            target_aspects.append(aspect)
-    return target_aspects or list(GO_ASPECT_ORDER)
-
-
-def configure_reward_context(args: argparse.Namespace) -> None:
-    REWARD_CONTEXT["go_obo_path"] = normalize_text(getattr(args, "go_obo_path", None)).strip() or (
-        DEFAULT_GO_OBO_PATH if os.path.exists(DEFAULT_GO_OBO_PATH) else ""
-    )
-    REWARD_CONTEXT["ia_file_path"] = normalize_text(getattr(args, "ia_file_path", None)).strip()
-    REWARD_CONTEXT["continuation_mode"] = resolve_continuation_mode_name(getattr(args, "continuation_mode", None))
-    REWARD_CONTEXT["reward_final_answer_only"] = bool(getattr(args, "reward_final_answer_only", False))
-    REWARD_CONTEXT["reward_prediction_source"] = (
-        normalize_text(getattr(args, "reward_prediction_source", None)).strip().lower()
-        or default_reward_prediction_source(
-            REWARD_CONTEXT["continuation_mode"],
-            REWARD_CONTEXT["reward_final_answer_only"],
-        )
-    )
-    inspect_completion_text.cache_clear()
-
-
-def resolve_reward_context() -> Dict[str, Any]:
-    return dict(REWARD_CONTEXT)
-
-
-@lru_cache(maxsize=2)
-def load_go_term_metadata(obo_path: str) -> Dict[str, Dict[str, Any]]:
-    resolved_path = normalize_text(obo_path).strip()
-    if not resolved_path or not os.path.exists(resolved_path):
-        return {}
-
-    metadata: Dict[str, Dict[str, Any]] = {}
-    current_id = ""
-    current_namespace = ""
-    current_parents: List[str] = []
-    current_obsolete = False
-    in_term = False
-
-    def finalize_term() -> None:
-        nonlocal current_id, current_namespace, current_parents, current_obsolete
-        if current_id and not current_obsolete:
-            ordered_parents: List[str] = []
-            seen = set()
-            for parent in current_parents:
-                if parent and parent not in seen:
-                    seen.add(parent)
-                    ordered_parents.append(parent)
-            metadata[current_id] = {
-                "aspect": GO_NAMESPACE_TO_ASPECT.get(current_namespace, ""),
-                "parents": tuple(ordered_parents),
-            }
-        current_id = ""
-        current_namespace = ""
-        current_parents = []
-        current_obsolete = False
-
-    with open(resolved_path, "r", encoding="utf-8") as handle:
-        for raw_line in handle:
-            line = raw_line.strip()
-            if line == "[Term]":
-                finalize_term()
-                in_term = True
-                continue
-            if line.startswith("[") and line != "[Term]":
-                finalize_term()
-                in_term = False
-                continue
-            if not in_term or not line:
-                continue
-            if line.startswith("id: "):
-                match = GO_ID_PATTERN.search(line)
-                if match:
-                    current_id = match.group(0)
-            elif line.startswith("namespace: "):
-                current_namespace = line.split(":", 1)[1].strip()
-            elif line.startswith("is_obsolete: "):
-                current_obsolete = line.split(":", 1)[1].strip().lower() == "true"
-            elif line.startswith("is_a: "):
-                match = GO_ID_PATTERN.search(line)
-                if match:
-                    current_parents.append(match.group(0))
-            elif line.startswith("relationship: part_of "):
-                match = GO_ID_PATTERN.search(line)
-                if match:
-                    current_parents.append(match.group(0))
-    finalize_term()
-    return metadata
-
-
-@lru_cache(maxsize=131072)
-def get_go_ancestors(go_id: str, obo_path: str) -> Tuple[str, ...]:
-    metadata = load_go_term_metadata(obo_path)
-    if not go_id:
-        return tuple()
-    if go_id not in metadata:
-        return (go_id,)
-
-    ordered: List[str] = []
-    seen = set()
-
-    def visit(term_id: str) -> None:
-        if term_id in seen:
-            return
-        seen.add(term_id)
-        ordered.append(term_id)
-        for parent_id in metadata.get(term_id, {}).get("parents", ()):
-            visit(parent_id)
-
-    visit(go_id)
-    return tuple(ordered)
-
-
-def resolve_go_aspect(go_id: str, obo_path: str) -> str:
-    return normalize_text(load_go_term_metadata(obo_path).get(go_id, {}).get("aspect")).strip().upper()
-
-
-def propagate_go_ids(go_ids: Iterable[str], obo_path: str, allowed_aspects: Optional[Iterable[str]] = None) -> List[str]:
-    allowed = {normalize_text(aspect).strip().upper() for aspect in (allowed_aspects or []) if normalize_text(aspect).strip()}
-    ordered: List[str] = []
-    seen = set()
-    for go_id in go_ids:
-        for ancestor_id in get_go_ancestors(go_id, obo_path):
-            if allowed:
-                aspect = resolve_go_aspect(ancestor_id, obo_path)
-                if aspect and aspect not in allowed:
-                    continue
-            if ancestor_id not in seen:
-                seen.add(ancestor_id)
-                ordered.append(ancestor_id)
-    return ordered
-
-
-@lru_cache(maxsize=2)
-def load_ia_weights(ia_file_path: str) -> Dict[str, float]:
-    resolved_path = normalize_text(ia_file_path).strip()
-    if not resolved_path or not os.path.exists(resolved_path):
-        return {}
-
-    weights: Dict[str, float] = {}
-    with open(resolved_path, "r", encoding="utf-8") as handle:
-        for raw_line in handle:
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = re.split(r"\s+", line)
-            if len(parts) < 2 or not GO_ID_PATTERN.fullmatch(parts[0]):
-                continue
-            try:
-                weights[parts[0]] = float(parts[1])
-            except ValueError:
-                continue
-    return weights
-
-
-def compute_weighted_go_f1(
-    predicted_go_ids: Iterable[str],
-    target_go_ids: Iterable[str],
-    *,
-    ia_weights: Optional[Mapping[str, float]] = None,
-) -> float:
-    predicted = list(predicted_go_ids)
-    target = list(target_go_ids)
-    if not predicted or not target:
-        return 0.0
-
-    weight_lookup = ia_weights or {}
-    predicted_set = set(predicted)
-    target_set = set(target)
-    intersection = predicted_set & target_set
-    if not intersection:
-        return 0.0
-
-    def _weight(go_id: str) -> float:
-        return float(weight_lookup.get(go_id, 1.0))
-
-    precision_numerator = sum(_weight(go_id) for go_id in intersection)
-    precision_denominator = sum(_weight(go_id) for go_id in predicted_set)
-    recall_denominator = sum(_weight(go_id) for go_id in target_set)
-    if precision_denominator <= 0.0 or recall_denominator <= 0.0:
-        return 0.0
-    precision = precision_numerator / precision_denominator
-    recall = precision_numerator / recall_denominator
-    if precision + recall <= 0.0:
-        return 0.0
-    return 2.0 * precision * recall / (precision + recall)
-
-
-@lru_cache(maxsize=8192)
-def inspect_completion_text(raw_completion: str) -> Dict[str, Any]:
-    sections = extract_reasoning_and_answer(raw_completion)
-    final_answer = sections["final_answer"].strip()
-    reward_prediction_text = extract_reward_prediction_text(raw_completion)
-    reward_context = resolve_reward_context()
-    reward_prediction_source = normalize_text(reward_context.get("reward_prediction_source")).strip().lower()
-    go_summary = extract_tagged_block(final_answer, GO_SUMMARY_START, GO_SUMMARY_END)
-    function_summary = extract_tagged_block(final_answer, FUNCTION_SUMMARY_START, FUNCTION_SUMMARY_END)
-    go_summary_aspects = extract_go_aspect_map(go_summary)
-    final_answer_aspects = extract_go_aspect_map(final_answer)
-    structural_noise_count = count_structural_noise_tokens(final_answer)
-    final_answer_clean = bool(final_answer) and structural_noise_count == 0 and has_meaningful_text(final_answer)
-    reward_prediction_aspects = extract_go_aspect_map(reward_prediction_text)
-    has_closed_reasoning = "</think>" in raw_completion
-    has_answer_tag = bool(ANSWER_TAG_PATTERN.search(raw_completion))
-
-    prediction_source = "none"
-    if has_meaningful_text(reward_prediction_text):
-        if reward_prediction_source == "reasoning_trace":
-            prediction_source = "reasoning_trace"
-        elif reward_prediction_source == "final_answer":
-            prediction_source = "final_answer"
-        elif go_summary:
-            prediction_source = "structured_final_answer"
-        elif has_answer_tag:
-            prediction_source = "answer_tag"
-        elif has_closed_reasoning:
-            prediction_source = "post_think"
-
-    return {
-        "reasoning": sections["reasoning"],
-        "final_answer": final_answer,
-        "reward_prediction_text": reward_prediction_text,
-        "go_summary": go_summary,
-        "function_summary": function_summary,
-        "go_summary_aspects": go_summary_aspects,
-        "go_summary_aspect_labels": list(go_summary_aspects.keys()),
-        "final_answer_aspects": final_answer_aspects,
-        "final_answer_aspect_labels": list(final_answer_aspects.keys()),
-        "reward_prediction_aspects": reward_prediction_aspects,
-        "reward_prediction_aspect_labels": list(reward_prediction_aspects.keys()),
-        "has_go_summary": bool(go_summary),
-        "has_function_summary": bool(function_summary),
-        # We keep GO_SUMMARY schema checks even when reward is extracted from the
-        # reasoning trace, because the paper still expects a structured GO output.
-        "has_complete_summary_schema": bool(go_summary and go_summary_aspects),
-        "has_closed_reasoning": has_closed_reasoning,
-        "has_answer_tag": has_answer_tag,
-        "final_answer_clean": final_answer_clean,
-        "final_answer_has_text": has_meaningful_text(final_answer),
-        "structural_noise_count": structural_noise_count,
-        "prediction_source": prediction_source,
-        "prediction_text": reward_prediction_text,
-        "predicted_go_ids": extract_go_ids(reward_prediction_text),
-        "go_summary_go_ids": extract_go_ids(go_summary),
-        "final_answer_go_ids": extract_go_ids(final_answer),
-        "completion_go_ids": extract_go_ids(raw_completion),
-    }
-
-
-def inspect_completion(completion: Any) -> Dict[str, Any]:
-    return dict(inspect_completion_text(normalize_text(completion).strip()))
-
-
-def build_target_go_ids(sample_meta: Mapping[str, Any]) -> List[str]:
-    targets: List[str] = []
-    for key in ("go_bp", "go_mf", "go_cc", "ground_truth_go_terms"):
-        targets.extend(extract_go_ids(sample_meta.get(key)))
-
-    seen = set()
-    ordered: List[str] = []
-    for go_id in targets:
-        if go_id not in seen:
-            seen.add(go_id)
-            ordered.append(go_id)
-    return ordered
-
-
-def strict_format_reward(completion: str, _: Mapping[str, Any]) -> float:
-    meta = inspect_completion(completion)
-    if meta["has_closed_reasoning"] and meta["final_answer_clean"]:
-        return 1.0
-    if meta["has_closed_reasoning"] and meta["predicted_go_ids"]:
-        return 0.5
-    return 0.0
-
-
-def reasoning_presence_reward(completion: str, _: Mapping[str, Any]) -> float:
-    return 1.0 if inspect_completion(completion)["reasoning"] else 0.0
-
-
-def concise_reasoning_reward(completion: str, _: Mapping[str, Any]) -> float:
-    reasoning = inspect_completion(completion)["reasoning"]
-    if not reasoning:
-        return 0.0
-    length = len(reasoning.split())
-    if 32 <= length <= 384:
-        return 1.0
-    if 16 <= length <= 512:
-        return 0.5
-    return 0.0
-
-
-def answer_nonempty_reward(completion: str, _: Mapping[str, Any]) -> float:
-    return 1.0 if inspect_completion(completion)["final_answer_clean"] else 0.0
-
-
-def summary_schema_reward(completion: str, sample_meta: Mapping[str, Any]) -> float:
-    meta = inspect_completion(completion)
-    requested_aspects = set(build_requested_go_aspects(sample_meta))
-    predicted_aspects = set(meta["go_summary_aspect_labels"])
-    matched_aspects = predicted_aspects & requested_aspects
-    if meta["has_complete_summary_schema"] and meta["go_summary_go_ids"] and matched_aspects == requested_aspects:
-        return 1.0
-    if meta["has_complete_summary_schema"] and meta["go_summary_go_ids"] and matched_aspects:
-        return 0.5
-    if meta["has_go_summary"] and meta["go_summary_go_ids"] and matched_aspects:
-        return 0.25
-    return 0.0
-
-
-def structural_noise_reward(completion: str, _: Mapping[str, Any]) -> float:
-    noise_count = inspect_completion(completion)["structural_noise_count"]
-    if noise_count <= 0:
-        return 0.0
-    return -min(1.0, 0.25 * float(noise_count))
-
-
-def go_presence_reward(completion: str, sample_meta: Mapping[str, Any]) -> float:
-    meta = inspect_completion(completion)
-    predicted_go_ids = meta["predicted_go_ids"]
-    if predicted_go_ids:
-        if meta["has_complete_summary_schema"]:
-            return 1.0
-        if meta["has_go_summary"] or meta["has_closed_reasoning"]:
-            return 0.75
-        return 0.5
-
-    if not build_target_go_ids(sample_meta):
-        return 0.0
-    if meta["prediction_text"]:
-        return -1.0
-    return -0.5
-
-
-def go_aspect_coverage_reward(completion: str, sample_meta: Mapping[str, Any]) -> float:
-    meta = inspect_completion(completion)
-    requested_aspects = set(build_requested_go_aspects(sample_meta))
-    if not requested_aspects or not meta["predicted_go_ids"]:
-        return 0.0
-
-    predicted_go_ids = set(meta["predicted_go_ids"])
-    covered_aspects = set()
-    for aspect, field_name in (("MF", "go_mf"), ("BP", "go_bp"), ("CC", "go_cc")):
-        if aspect not in requested_aspects:
-            continue
-        target_ids = set(extract_go_ids(sample_meta.get(field_name)))
-        if target_ids and predicted_go_ids & target_ids:
-            covered_aspects.add(aspect)
-    if not covered_aspects:
-        return 0.0
-    return len(covered_aspects) / len(requested_aspects)
-
-
-def ia_weighted_f1_reward(completion: str, sample_meta: Mapping[str, Any]) -> float:
-    meta = inspect_completion(completion)
-    predicted = set(meta["predicted_go_ids"])
-    target = set(build_target_go_ids(sample_meta))
-    if not predicted or not target:
-        return 0.0
-
-    reward_context = resolve_reward_context()
-    go_obo_path = normalize_text(reward_context.get("go_obo_path")).strip()
-    ia_file_path = normalize_text(reward_context.get("ia_file_path")).strip()
-    requested_aspects = set(build_requested_go_aspects(sample_meta))
-
-    if go_obo_path and os.path.exists(go_obo_path):
-        predicted = set(propagate_go_ids(predicted, go_obo_path, requested_aspects))
-        target = set(propagate_go_ids(target, go_obo_path, requested_aspects))
-
-    ia_weights = load_ia_weights(ia_file_path) if ia_file_path else {}
-    return compute_weighted_go_f1(predicted, target, ia_weights=ia_weights)
-
-
-def go_overlap_reward(completion: str, sample_meta: Mapping[str, Any]) -> float:
-    meta = inspect_completion(completion)
-    predicted = set(meta["predicted_go_ids"])
-    target = set(build_target_go_ids(sample_meta))
-    if not predicted or not target:
-        return 0.0
-
-    true_positive = len(predicted & target)
-    precision = true_positive / len(predicted) if predicted else 0.0
-    recall = true_positive / len(target) if target else 0.0
-    if precision + recall == 0:
-        return 0.0
-    return 2 * precision * recall / (precision + recall)
-
-
-def exact_go_set_reward(completion: str, sample_meta: Mapping[str, Any]) -> float:
-    predicted = set(inspect_completion(completion)["predicted_go_ids"])
-    target = set(build_target_go_ids(sample_meta))
-    return 1.0 if predicted and predicted == target else 0.0
-
-
-def truncation_penalty_reward(completion: str, _: Mapping[str, Any]) -> float:
-    text = normalize_text(completion)
-    word_count = count_words(text)
-    predicted_go_ids = inspect_completion(completion)["predicted_go_ids"]
-    if has_terminal_summary_marker(text):
-        if word_count <= 192:
-            return 0.5
-        if word_count <= 320:
-            return 0.25
-        return 0.0
-    if predicted_go_ids:
-        if word_count <= 256:
-            return 0.25
-        if word_count >= 480:
-            return -0.25
-        return 0.0
-    if word_count >= 320:
-        return -1.0
-    if word_count >= 220:
-        return -0.5
-    return 0.0
-
-
-def build_reward_registry() -> Dict[str, Any]:
-    return {
-        "ia_weighted_f1": ia_weighted_f1_reward,
-        "strict_format": strict_format_reward,
-        "reasoning_presence": reasoning_presence_reward,
-        "concise_reasoning": concise_reasoning_reward,
-        "answer_nonempty": answer_nonempty_reward,
-        "summary_schema": summary_schema_reward,
-        "go_presence": go_presence_reward,
-        "go_aspect_coverage": go_aspect_coverage_reward,
-        "structural_noise": structural_noise_reward,
-        "go_overlap": go_overlap_reward,
-        "exact_go_set": exact_go_set_reward,
-        "truncation_penalty": truncation_penalty_reward,
-    }
-
-
-def parse_csv_items(raw: str) -> List[str]:
-    return [item.strip() for item in normalize_text(raw).split(",") if item.strip()]
-
-
-def parse_reward_weights(raw: str, count: int) -> List[float]:
-    if not normalize_text(raw).strip():
-        return [1.0] * count
-    values = [float(item) for item in parse_csv_items(raw)]
-    if len(values) != count:
-        raise ValueError(f"Expected {count} reward weights, got {len(values)}")
-    return values
-
-
-def standardize_group_rewards(rewards: Sequence[float]) -> List[float]:
-    if not rewards:
-        return []
-    mean = sum(rewards) / len(rewards)
-    variance = sum((reward - mean) ** 2 for reward in rewards) / len(rewards)
-    std = math.sqrt(max(variance, 0.0))
-    if std < 1e-8:
-        return [0.0 for _ in rewards]
-    return [(reward - mean) / (std + 1e-8) for reward in rewards]
-
-
-def compute_batch_relative_advantages(
-    grouped_rewards: Sequence[Sequence[float]],
-    *,
-    epsilon_std: float = 1e-6,
-    reward_scaling: str = "batch",
-    distributed_device: Any = None,
-) -> Tuple[List[List[float]], float]:
-    if not grouped_rewards:
-        return [], 0.0
-
-    if reward_scaling != "batch":
-        return [standardize_group_rewards(group_rewards) for group_rewards in grouped_rewards], 0.0
-
-    flat_rewards = [float(reward) for group_rewards in grouped_rewards for reward in group_rewards]
-    if not flat_rewards:
-        return [[] for _ in grouped_rewards], 0.0
-
-    flat_sum = float(sum(flat_rewards))
-    flat_sq_sum = float(sum(reward * reward for reward in flat_rewards))
-    flat_count = float(len(flat_rewards))
-
-    if distributed_device is not None and is_distributed_enabled():
-        import torch
-
-        stats = torch.tensor(
-            [flat_sum, flat_sq_sum, flat_count],
-            device=distributed_device,
-            dtype=torch.float64,
-        )
-        distributed_reduce_tensor(stats, op="sum")
-        flat_sum = float(stats[0].item())
-        flat_sq_sum = float(stats[1].item())
-        flat_count = float(stats[2].item())
-
-    flat_mean = flat_sum / flat_count
-    variance = (flat_sq_sum / flat_count) - (flat_mean * flat_mean)
-    global_std = math.sqrt(max(variance, 0.0))
-    if global_std < epsilon_std:
-        return [[0.0 for _ in group_rewards] for group_rewards in grouped_rewards], global_std
-
-    normalized_groups: List[List[float]] = []
-    denominator = global_std + epsilon_std
-    for group_rewards in grouped_rewards:
-        if not group_rewards:
-            normalized_groups.append([])
-            continue
-        group_mean = sum(group_rewards) / len(group_rewards)
-        normalized_groups.append([(float(reward) - group_mean) / denominator for reward in group_rewards])
-    return normalized_groups, global_std
-
-
-def build_generation_stopping_criteria(tokenizer: Any, *, continuation_mode: str) -> Any:
-    if resolve_continuation_mode_name(continuation_mode) == CONTINUATION_MODE_PAPER_NATIVE:
-        return None
-    encode = getattr(tokenizer, "encode", None)
-    if encode is None:
-        return None
-    try:
-        from transformers import StoppingCriteria, StoppingCriteriaList
-    except ImportError:
-        return None
-
-    stop_sequences: List[List[int]] = []
-    for marker in TERMINAL_SUMMARY_MARKERS:
-        token_ids = encode(marker, add_special_tokens=False)
-        if token_ids:
-            stop_sequences.append(token_ids)
-    if not stop_sequences:
-        return None
-
-    class StopOnTokenSequences(StoppingCriteria):
-        def __init__(self, sequences: Sequence[Sequence[int]]):
-            self.sequences = [list(sequence) for sequence in sequences if sequence]
-
-        def __call__(self, input_ids: Any, scores: Any, **kwargs: Any) -> Any:
-            import torch
-
-            done = torch.zeros((input_ids.shape[0],), dtype=torch.bool, device=input_ids.device)
-            for sequence in self.sequences:
-                sequence_tensor = torch.tensor(sequence, dtype=input_ids.dtype, device=input_ids.device)
-                if input_ids.shape[1] < sequence_tensor.numel():
-                    continue
-                done |= (input_ids[:, -sequence_tensor.numel() :] == sequence_tensor).all(dim=1)
-            return done
-
-    return StoppingCriteriaList([StopOnTokenSequences(stop_sequences)])
-
-
-def build_generation_kwargs(
-    args: argparse.Namespace,
-    tokenizer: Any,
-    *,
-    for_eval: bool,
-) -> Dict[str, Any]:
-    continuation_mode = resolve_continuation_mode_name(getattr(args, "continuation_mode", None))
-    sampling_contract = normalize_text(getattr(args, "sampling_contract", None)).strip().lower() or "explicit"
-    use_checkpoint_native_sampling = (not for_eval) and sampling_contract == "checkpoint_native"
-    do_sample = args.eval_do_sample if for_eval else args.do_sample
-    generation_kwargs = {
-        "min_new_tokens": args.min_new_tokens,
-        "max_new_tokens": args.max_new_tokens,
-        "pad_token_id": tokenizer.pad_token_id,
-        "eos_token_id": tokenizer.eos_token_id,
-        "remove_invalid_values": True,
-        "renormalize_logits": True,
-    }
-    if not use_checkpoint_native_sampling:
-        generation_kwargs["do_sample"] = do_sample
-        generation_kwargs["repetition_penalty"] = args.repetition_penalty
-    if not use_checkpoint_native_sampling and do_sample:
-        temperature = args.eval_temperature if for_eval else args.temperature
-        top_p = args.eval_top_p if for_eval else args.top_p
-        top_k = args.eval_top_k if for_eval else args.top_k
-        if temperature is not None:
-            generation_kwargs["temperature"] = temperature
-        if top_p is not None:
-            generation_kwargs["top_p"] = top_p
-        if top_k is not None:
-            generation_kwargs["top_k"] = top_k
-    if not use_checkpoint_native_sampling and do_sample and getattr(args, "min_p", 0.0) > 0.0:
-        generation_kwargs["min_p"] = args.min_p
-    stopping_criteria = build_generation_stopping_criteria(
-        tokenizer,
-        continuation_mode=continuation_mode,
-    )
-    if stopping_criteria is not None:
-        generation_kwargs["stopping_criteria"] = stopping_criteria
-    return generation_kwargs
+        return False
+    return text.startswith(("/", ".", "~"))
+
+
+@dataclass(frozen=True)
+class AlgorithmSpec:
+    queries_per_step: int = 8
+    rollouts_per_query: int = 24
+    steps_per_generation: int = 2
+    num_iterations: int = 1
+    clip_epsilon_low: float = 7e-4
+    clip_epsilon_high: float = 9e-4
+    importance_sampling_cap: float = 2.0
+    kl_beta: float = 1e-4
+    max_new_tokens: int = 10_000
+    reward_std_epsilon: float = 1e-6
+
+    @property
+    def total_trajectories(self) -> int:
+        return self.queries_per_step * self.rollouts_per_query
+
+    @property
+    def policy_denominator(self) -> float:
+        return float(self.total_trajectories * self.max_new_tokens)
+
+    @property
+    def kl_denominator(self) -> float:
+        return float(self.total_trajectories)
+
+
+@dataclass(frozen=True)
+class RuntimeSpec:
+    optimizer_micro_batch_size_per_gpu: int = 6
+    gradient_accumulation_steps: int = 4
+    target_num_nodes: int = 2
+    target_gpus_per_node: int = 4
+    zero_stage: int = 2
+    bf16: bool = True
+    runtime_stack: str = "deepspeed_vllm_colocate"
+
+    @property
+    def target_world_size(self) -> int:
+        return self.target_num_nodes * self.target_gpus_per_node
+
+    @property
+    def local_trajectories_per_rank(self) -> int:
+        return self.optimizer_micro_batch_size_per_gpu * self.gradient_accumulation_steps
+
+
+@dataclass(frozen=True)
+class SamplingSpec:
+    temperature: float = 1.0
+    top_k: int = 20
+    top_p: float = 0.95
+    min_p: float = 0.0
+    repetition_penalty: float = 1.0
+    max_new_tokens: int = 10_000
+
+
+@dataclass(frozen=True)
+class EvalSpec:
+    validation_num_proteins: int = 200
+    validation_every_n_steps: int = 50
+    save_every_n_steps: int = 50
+
+
+@dataclass
+class DistributedRuntime:
+    enabled: bool
+    rank: int
+    world_size: int
+    local_rank: int
+    device: Any
+
+
+@dataclass
+class PreparedQuery:
+    input_ids: Any
+    attention_mask: Any
+    protein_sequences: List[str]
+    batch_idx_map: List[int]
+    structure_coords: Optional[Any]
+    go_aspects: List[str]
+    sample_meta: Dict[str, str]
+    prompt_text: str
+    multimodal_cache: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class RolloutGroup:
+    query: PreparedQuery
+    completions: List[str]
+    completion_ids: List[Any]
+    rewards: List[float]
+    selected_completion_ids: Optional[List[Any]] = None
+    filtered_rollouts: float = 0.0
+    advantages: Optional[Any] = None
+    old_log_probs: Optional[Any] = None
+    ref_log_probs: Optional[Any] = None
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--wandb_project", type=str, default=os.environ.get("WANDB_PROJECT", "bioreasoning-pro"))
-    parser.add_argument("--wandb_entity", type=str, default=None)
-    parser.add_argument("--wandb_mode", type=str, default=None)
     parser.add_argument("--wandb_job_type", type=str, default="train_rl", choices=["train_rl"])
-    parser.add_argument("--weave_project", type=str, default=None)
-    parser.add_argument("--weave_trace_budget", type=int, default=64)
-    parser.add_argument("--weave_trace_full_group_count", type=int, default=4)
-    parser.add_argument("--weave_trace_full_rollouts_per_group", type=int, default=24)
-
     parser.add_argument("--benchmark_version", type=str, default="213 -> 221 -> 225 -> 228")
     parser.add_argument("--temporal_split_artifact", type=str, default=None)
     parser.add_argument("--dataset_config", type=str, default="disease_temporal_hc_reasoning_v1")
@@ -995,46 +249,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model_artifact", type=str, default="train-rl-output")
     parser.add_argument("--job_time_limit", type=str, default="12:00:00")
 
-    parser.add_argument("--text_model_name", type=str, required=True, help="Local HF model directory used to initialize RL.")
+    parser.add_argument("--text_model_name", type=str, required=True, help="HF checkpoint used as the SFT RL init policy.")
     parser.add_argument("--protein_model_name", type=str, default="esm3_sm_open_v1")
+    parser.add_argument("--attn_implementation", type=str, default=os.environ.get("BIOREASON_ATTN_IMPLEMENTATION", "auto"))
     parser.add_argument("--cache_dir", type=str, default=os.path.expanduser("~/.cache/huggingface/hub"))
-    parser.add_argument("--go_obo_path", type=str, default=None)
+    parser.add_argument("--go_obo_path", type=str, default="bioreason2/dataset/go-basic.obo")
     parser.add_argument("--ia_file_path", type=str, default=os.environ.get("BIOREASON_IA_FILE_PATH", ""))
-    parser.add_argument("--require_ia_file", type=str, default="true")
     parser.add_argument("--precomputed_embeddings_path", type=str, default=None)
-    parser.add_argument("--structure_dir", type=str, default=None)
-    parser.add_argument("--dataset_cache_dir", type=str, default=None)
 
-    parser.add_argument("--dataset_type", type=str, default="cafa5", choices=["cafa5"])
     parser.add_argument("--cafa5_dataset", type=str, default="wanglab/cafa5")
-    parser.add_argument("--cafa5_dataset_name", type=str, default="disease_temporal_hc_reasoning_v1")
     parser.add_argument("--reasoning_dataset_name", type=str, default="disease_temporal_hc_reasoning_v1")
     parser.add_argument("--interpro_dataset_name", type=str, default="interpro_metadata")
+    parser.add_argument("--dataset_cache_dir", type=str, default=None)
+    parser.add_argument("--structure_dir", type=str, default=None)
     parser.add_argument("--go_gpt_predictions_column", type=str, default="go_pred")
-    parser.add_argument("--include_ground_truth_in_final_answer", type=str, default="false")
-    parser.add_argument("--add_uniprot_summary", type=str, default="false")
-    parser.add_argument("--is_swissprot", type=str, default="false")
-    parser.add_argument("--include_go_defs", type=str, default="false")
-    parser.add_argument("--interpro_in_prompt", type=str, default="true")
-    parser.add_argument("--ppi_in_prompt", type=str, default="true")
-    parser.add_argument("--predict_interpro", type=str, default="false")
-    parser.add_argument("--include_protein_function_summary", type=str, default="true")
-    parser.add_argument("--split_go_aspects", type=str, default="false")
-    parser.add_argument(
-        "--continuation_mode",
-        type=str,
-        default=CONTINUATION_MODE_PAPER_NATIVE,
-        choices=list(CONTINUATION_MODE_CHOICES),
-    )
-    parser.add_argument(
-        "--reasoning_prompt_style",
-        type=str,
-        default="auto",
-        choices=["auto", "verbose", "paper_native", "paper_compact"],
-    )
-    parser.add_argument("--compact_interpro_limit", type=int, default=12)
-    parser.add_argument("--compact_ppi_limit", type=int, default=10)
-    parser.add_argument("--compact_go_speculation_limit", type=int, default=8)
+    parser.add_argument("--dataset_num_proc", type=int, default=env_int("BIOREASON_DATASET_NUM_PROC", 4))
 
     parser.add_argument("--max_length_text", type=int, default=512)
     parser.add_argument("--max_length_protein", type=int, default=2000)
@@ -1045,1239 +274,508 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--go_num_reduced_embeddings", type=int, default=200)
     parser.add_argument("--go_embedding_dim", type=int, default=2560)
     parser.add_argument("--unified_go_encoder", type=str, default="true")
-    parser.add_argument("--protein_model_finetune", type=str, default="false")
-    parser.add_argument("--train_projector", type=str, default="false")
-    parser.add_argument("--train_go_modules", type=str, default="false")
 
-    parser.add_argument("--use_qlora", type=str, default="false")
-    parser.add_argument("--bnb_4bit_compute_dtype", type=str, default="bfloat16")
-    parser.add_argument("--bnb_4bit_quant_type", type=str, default="nf4")
-    parser.add_argument("--bnb_4bit_use_double_quant", type=str, default="true")
+    parser.add_argument("--queries_per_step", type=int, default=8)
+    parser.add_argument("--rollouts_per_query", type=int, default=24)
+    parser.add_argument("--steps_per_generation", type=int, default=2)
+    parser.add_argument("--num_iterations", type=int, default=1)
+    parser.add_argument("--max_steps", type=int, default=1200)
+
+    parser.add_argument("--learning_rate", type=float, default=3e-5)
+    parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--adam_beta1", type=float, default=0.9)
+    parser.add_argument("--adam_beta2", type=float, default=0.999)
+    parser.add_argument("--adam_epsilon", type=float, default=1e-8)
+    parser.add_argument("--warmup_ratio", type=float, default=0.03)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
+
+    parser.add_argument("--optimizer_micro_batch_size_per_gpu", type=int, default=6)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    parser.add_argument("--target_num_nodes", type=int, default=2)
+    parser.add_argument("--target_gpus_per_node", type=int, default=4)
+    parser.add_argument("--zero_stage", type=int, default=2)
+    parser.add_argument("--runtime_stack", type=str, default="deepspeed_vllm_colocate")
+
     parser.add_argument("--lora_rank", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
     parser.add_argument("--gradient_checkpointing", type=str, default="true")
     parser.add_argument("--disable_model_dropout", type=str, default="true")
 
-    parser.add_argument("--learning_rate", type=float, default=3e-5)
-    parser.add_argument("--weight_decay", type=float, default=0.0)
-    parser.add_argument(
-        "--train_batch_size",
-        "--per_device_train_batch_size",
-        dest="train_batch_size",
-        type=int,
-        default=1,
-    )
-    parser.add_argument(
-        "--eval_batch_size",
-        "--per_device_eval_batch_size",
-        dest="eval_batch_size",
-        type=int,
-        default=4,
-    )
-    parser.add_argument("--num_workers", type=int, default=0)
-    parser.add_argument("--max_steps", type=int, default=300)
-    parser.add_argument("--max_epochs", type=int, default=1)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
-    parser.add_argument("--adam_beta1", type=float, default=0.9)
-    parser.add_argument("--adam_beta2", type=float, default=0.999)
-    parser.add_argument("--adam_epsilon", type=float, default=1e-8)
-    parser.add_argument("--lr_scheduler_type", type=str, default="cosine", choices=["constant", "cosine"])
-    parser.add_argument("--warmup_ratio", type=float, default=0.03)
-    parser.add_argument("--max_train_samples", type=int, default=-1)
-    parser.add_argument("--max_eval_samples", type=int, default=200)
-    parser.add_argument(
-        "--eval_sample_strategy",
-        type=str,
-        default="stratified_aspect_profile",
-        choices=["stratified_aspect_profile", "shuffled_prefix"],
-    )
-    parser.add_argument("--eval_every_n_steps", type=int, default=50)
-    parser.add_argument("--save_every_n_steps", type=int, default=50)
-    parser.add_argument("--max_eval_batches", type=int, default=0)
-    parser.add_argument("--rotating_eval_every_n_steps", type=int, default=100)
-    parser.add_argument("--rotating_eval_max_samples", type=int, default=256)
-    parser.add_argument(
-        "--rotating_eval_sample_strategy",
-        type=str,
-        default="stratified_aspect_profile",
-        choices=["stratified_aspect_profile", "shuffled_prefix"],
-    )
-    parser.add_argument("--rotating_eval_seed_stride", type=int, default=9973)
-    parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    parser.add_argument("--distributed_timeout_seconds", type=int, default=7200)
-    parser.add_argument("--audit_only", type=str, default="false")
-    parser.add_argument(
-        "--runtime_stack",
-        type=str,
-        default="custom_ddp",
-        choices=["deepspeed_vllm_colocate", "ddp_sequential", "ddp_batched", "custom_ddp"],
-    )
-    parser.add_argument(
-        "--rollout_execution_mode",
-        type=str,
-        default="per_example_sequential",
-        choices=["batch_first", "per_example_batched", "per_example_sequential"],
-    )
-    parser.add_argument("--rollout_query_batch_size", type=int, default=8)
-    parser.add_argument("--rollout_group_size", type=int, default=24)
-    parser.add_argument("--target_num_nodes", type=int, default=2)
-    parser.add_argument("--target_gpus_per_node", type=int, default=8)
-
-    parser.add_argument("--loss_type", type=str, default="dr_grpo", choices=["dr_grpo"])
-    parser.add_argument("--steps_per_generation", type=int, default=2)
-    parser.add_argument("--num_iterations", type=int, default=1)
-    parser.add_argument("--num_generations", type=int, default=24)
-    parser.add_argument("--min_new_tokens", type=int, default=1)
-    parser.add_argument("--max_new_tokens", type=int, default=10000)
-    parser.add_argument("--max_loss_completion_tokens", type=int, default=0)
-    parser.add_argument("--rollout_logprob_microbatch_size", type=int, default=4)
-    parser.add_argument(
-        "--sampling_contract",
-        type=str,
-        default="auto",
-        choices=["auto", "explicit", "checkpoint_native"],
-    )
     parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--top_k", type=int, default=20)
+    parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--min_p", type=float, default=0.0)
     parser.add_argument("--repetition_penalty", type=float, default=1.0)
-    parser.add_argument("--do_sample", type=str, default="true")
-    parser.add_argument("--eval_do_sample", type=str, default="false")
-    parser.add_argument("--eval_temperature", type=float, default=0.1)
-    parser.add_argument("--eval_top_p", type=float, default=0.9)
-    parser.add_argument("--eval_top_k", type=int, default=20)
+    parser.add_argument("--max_new_tokens", type=int, default=10_000)
+    parser.add_argument("--max_loss_completion_tokens", type=int, default=0)
+    parser.add_argument("--rollout_logprob_microbatch_size", type=int, default=4)
     parser.add_argument("--clip_epsilon_low", type=float, default=7e-4)
     parser.add_argument("--clip_epsilon_high", type=float, default=9e-4)
-    parser.add_argument("--reward_scaling", type=str, default="batch", choices=["batch", "group"])
-    parser.add_argument("--advantage_epsilon_std", type=float, default=1e-6)
-    parser.add_argument("--importance_sampling_level", type=str, default="sequence", choices=["sequence"])
     parser.add_argument("--importance_sampling_cap", type=float, default=2.0)
-    parser.add_argument("--reward_final_answer_only", type=str, default="false")
-    parser.add_argument(
-        "--reward_prediction_source",
-        type=str,
-        default="auto",
-        choices=["auto", "reasoning_trace", "final_answer", "structured_go_summary"],
-    )
     parser.add_argument("--kl_beta", type=float, default=1e-4)
-    parser.add_argument(
-        "--reward_funcs",
-        type=str,
-        default="ia_weighted_f1",
-        help="Comma-separated reward function names.",
-    )
-    parser.add_argument(
-        "--reward_weights",
-        type=str,
-        default="1.0",
-        help="Optional comma-separated reward weights aligned with --reward_funcs.",
-    )
+    parser.add_argument("--reward_std_epsilon", type=float, default=1e-6)
 
-    parser.add_argument("--resume_from_raw_checkpoint", type=str, default=None)
+    parser.add_argument("--validation_num_proteins", type=int, default=200)
+    parser.add_argument("--validation_every_n_steps", type=int, default=50)
+    parser.add_argument("--save_every_n_steps", type=int, default=50)
+
     parser.add_argument("--output_dir", type=str, default="data/artifacts/models/train_rl_output")
     parser.add_argument("--checkpoint_artifact_name", type=str, default="train-rl-output")
     parser.add_argument("--checkpoint_artifact_aliases", type=str, default="latest")
-    parser.add_argument("--ablation_from_paper_rl", type=str, default="false")
+
+    parser.add_argument("--wandb_project", type=str, default=os.environ.get("WANDB_PROJECT", "bioreasoning-pro"))
+    parser.add_argument("--wandb_entity", type=str, default=None)
+    parser.add_argument("--wandb_mode", type=str, default=None)
+    parser.add_argument("--weave_project", type=str, default=None)
+    parser.add_argument("--trace_rollouts_to_weave", type=str, default="true")
+    parser.add_argument("--trace_jsonl_name", type=str, default="rollout_traces.jsonl")
+    parser.add_argument("--weave_trace_budget", type=int, default=64)
+    parser.add_argument("--weave_trace_full_group_count", type=int, default=4)
+    parser.add_argument("--weave_trace_full_rollouts_per_group", type=int, default=24)
+
+    parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.35)
+    parser.add_argument("--vllm_max_model_len", type=int, default=32768)
+    parser.add_argument("--vllm_max_num_seqs", type=int, default=256)
+    parser.add_argument("--vllm_cpu_offload_gb", type=float, default=0.0)
+    parser.add_argument("--vllm_swap_space_gb", type=float, default=4.0)
+    parser.add_argument("--vllm_enforce_eager", type=str, default="true")
+    parser.add_argument("--vllm_enable_sleep_mode", type=str, default="true")
+    parser.add_argument("--vllm_sleep_level", type=int, default=1)
+    parser.add_argument(
+        "--vllm_attention_backend",
+        type=str,
+        default=os.environ.get("BIOREASON_VLLM_ATTENTION_BACKEND", os.environ.get("VLLM_ATTENTION_BACKEND", "XFORMERS")),
+    )
+    parser.add_argument(
+        "--vllm_worker_multiproc_method",
+        type=str,
+        default=os.environ.get(
+            "BIOREASON_VLLM_WORKER_MULTIPROC_METHOD",
+            os.environ.get("VLLM_WORKER_MULTIPROC_METHOD", "spawn"),
+        ),
+        choices=["spawn", "forkserver", "fork"],
+    )
+    parser.add_argument(
+        "--vllm_use_v1",
+        type=str,
+        default=os.environ.get("BIOREASON_VLLM_USE_V1", os.environ.get("VLLM_USE_V1", "false")),
+    )
+    parser.add_argument("--rollout_backend", type=str, default="subprocess", choices=["subprocess", "inprocess"])
+    parser.add_argument("--rollout_worker_start_method", type=str, default="spawn", choices=["spawn", "forkserver", "fork"])
+
+    # DeepSpeed injects this flag into worker processes; accept it even though the
+    # runtime primarily reads LOCAL_RANK from the environment.
+    parser.add_argument("--local_rank", type=int, default=int(os.environ.get("LOCAL_RANK", "0")))
+    parser.add_argument("--debug_single_process", type=str, default="false")
+    parser.add_argument("--preflight_only", type=str, default="false")
     return parser
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    parser = build_arg_parser()
-    args = parser.parse_args(argv)
-    bool_fields = [
-        "include_ground_truth_in_final_answer",
-        "add_uniprot_summary",
-        "is_swissprot",
-        "include_go_defs",
-        "interpro_in_prompt",
-        "ppi_in_prompt",
-        "predict_interpro",
-        "include_protein_function_summary",
-        "split_go_aspects",
+    args = build_arg_parser().parse_args(argv)
+    for name in (
         "unified_go_encoder",
-        "protein_model_finetune",
-        "train_projector",
-        "train_go_modules",
-        "use_qlora",
-        "bnb_4bit_use_double_quant",
         "gradient_checkpointing",
         "disable_model_dropout",
-        "do_sample",
-        "eval_do_sample",
-        "reward_final_answer_only",
-        "require_ia_file",
-        "ablation_from_paper_rl",
-        "audit_only",
-    ]
-
-    def _str2bool(raw: Any) -> bool:
-        value = normalize_text(raw).strip().lower()
-        return value in {"1", "true", "t", "yes", "y"}
-
-    for field_name in bool_fields:
-        setattr(args, field_name, _str2bool(getattr(args, field_name)))
-
-    args.continuation_mode = resolve_continuation_mode_name(getattr(args, "continuation_mode", None))
-
-    reasoning_prompt_style = normalize_text(getattr(args, "reasoning_prompt_style", None)).strip().lower()
-    if reasoning_prompt_style in {"", "auto"}:
-        reasoning_prompt_style = default_reasoning_prompt_style(args.continuation_mode)
-    args.reasoning_prompt_style = reasoning_prompt_style
-
-    reward_prediction_source = normalize_text(getattr(args, "reward_prediction_source", None)).strip().lower()
-    if reward_prediction_source in {"", "auto"}:
-        reward_prediction_source = default_reward_prediction_source(
-            args.continuation_mode,
-            bool(getattr(args, "reward_final_answer_only", False)),
-        )
-    args.reward_prediction_source = reward_prediction_source
-
-    sampling_contract = normalize_text(getattr(args, "sampling_contract", None)).strip().lower()
-    if sampling_contract in {"", "auto"}:
-        sampling_contract = default_sampling_contract(args.continuation_mode)
-    args.sampling_contract = sampling_contract
-
+        "trace_rollouts_to_weave",
+        "vllm_enforce_eager",
+        "vllm_enable_sleep_mode",
+        "vllm_use_v1",
+        "debug_single_process",
+        "preflight_only",
+    ):
+        setattr(args, name, parse_bool(getattr(args, name)))
     return args
 
 
-def can_cache_multimodal_prefix(args: argparse.Namespace) -> bool:
-    return not any(
-        (
-            getattr(args, "protein_model_finetune", False),
-            getattr(args, "train_projector", False),
-            getattr(args, "train_go_modules", False),
-        )
+def build_algorithm_spec(args: argparse.Namespace) -> AlgorithmSpec:
+    return AlgorithmSpec(
+        queries_per_step=int(args.queries_per_step),
+        rollouts_per_query=int(args.rollouts_per_query),
+        steps_per_generation=int(args.steps_per_generation),
+        num_iterations=int(args.num_iterations),
+        clip_epsilon_low=float(args.clip_epsilon_low),
+        clip_epsilon_high=float(args.clip_epsilon_high),
+        importance_sampling_cap=float(args.importance_sampling_cap),
+        kl_beta=float(args.kl_beta),
+        max_new_tokens=int(args.max_new_tokens),
+        reward_std_epsilon=float(args.reward_std_epsilon),
     )
 
 
-def build_batch_semantics(args: argparse.Namespace, world_size: int) -> Dict[str, float]:
-    per_device_train_batch_size = max(int(getattr(args, "train_batch_size", 1)), 1)
-    per_device_eval_batch_size = max(int(getattr(args, "eval_batch_size", 1)), 1)
-    actual_rollout_group_size = max(int(getattr(args, "num_generations", 1)), 1)
-    runtime_world_size = max(int(world_size), 1)
-    actual_global_unique_proteins_per_step = int(per_device_train_batch_size * runtime_world_size)
-    actual_global_num_trajectories_per_step = actual_global_unique_proteins_per_step * actual_rollout_group_size
-
-    rollout_query_batch_size_target = max(int(getattr(args, "rollout_query_batch_size", 8)), 1)
-    rollout_group_size_target = max(int(getattr(args, "rollout_group_size", 24)), 1)
-    target_total_trajectories = rollout_query_batch_size_target * rollout_group_size_target
-    target_num_nodes = max(int(getattr(args, "target_num_nodes", 2)), 1)
-    target_gpus_per_node = max(int(getattr(args, "target_gpus_per_node", 8)), 1)
-    target_global_world_size = target_num_nodes * target_gpus_per_node
-    runtime_stack = normalize_text(getattr(args, "runtime_stack", "custom_ddp")).strip() or "custom_ddp"
-    rollout_execution_mode = (
-        normalize_text(getattr(args, "rollout_execution_mode", "per_example_sequential")).strip()
-        or "per_example_sequential"
+def build_runtime_spec(args: argparse.Namespace) -> RuntimeSpec:
+    return RuntimeSpec(
+        optimizer_micro_batch_size_per_gpu=int(args.optimizer_micro_batch_size_per_gpu),
+        gradient_accumulation_steps=int(args.gradient_accumulation_steps),
+        target_num_nodes=int(args.target_num_nodes),
+        target_gpus_per_node=int(args.target_gpus_per_node),
+        zero_stage=int(args.zero_stage),
+        runtime_stack=normalize_text(args.runtime_stack).strip() or "deepspeed_vllm_colocate",
     )
 
-    semantics = RolloutStepSemantics(
-        per_device_train_batch_size=per_device_train_batch_size,
-        per_device_eval_batch_size=per_device_eval_batch_size,
-        world_size=runtime_world_size,
-        actual_global_unique_proteins_per_step=actual_global_unique_proteins_per_step,
-        actual_global_num_trajectories_per_step=actual_global_num_trajectories_per_step,
-        actual_rollout_group_size=actual_rollout_group_size,
-        rollout_query_batch_size_target=rollout_query_batch_size_target,
-        rollout_group_size_target=rollout_group_size_target,
-        rollout_total_trajectories_target=target_total_trajectories,
-        global_unique_proteins_target=rollout_query_batch_size_target,
-        target_num_nodes=target_num_nodes,
-        target_gpus_per_node=target_gpus_per_node,
-        target_global_world_size=target_global_world_size,
-        runtime_stack=runtime_stack,
-        rollout_execution_mode=rollout_execution_mode,
-        paper_faithful_batch_shape=(
-            actual_global_unique_proteins_per_step == rollout_query_batch_size_target
-            and actual_rollout_group_size == rollout_group_size_target
-            and actual_global_num_trajectories_per_step == target_total_trajectories
-        ),
-        paper_faithful_hardware_shape=(runtime_world_size == target_global_world_size),
-        paper_faithful_runtime_stack=(runtime_stack == "deepspeed_vllm_colocate"),
-        paper_faithful_execution_mode=(rollout_execution_mode == "batch_first"),
-        paper_faithful_ready=False,
+
+def build_sampling_spec(args: argparse.Namespace) -> SamplingSpec:
+    return SamplingSpec(
+        temperature=float(args.temperature),
+        top_k=int(args.top_k),
+        top_p=float(args.top_p),
+        min_p=float(args.min_p),
+        repetition_penalty=float(args.repetition_penalty),
+        max_new_tokens=int(args.max_new_tokens),
     )
-    semantics_dict = asdict(semantics)
-    semantics_dict["global_unique_proteins_per_step"] = semantics.actual_global_unique_proteins_per_step
-    semantics_dict["global_num_trajectories_per_step"] = semantics.actual_global_num_trajectories_per_step
-    semantics_dict["paper_faithful_ready"] = float(
-        semantics.paper_faithful_batch_shape
-        and semantics.paper_faithful_runtime_stack
-        and semantics.paper_faithful_execution_mode
+
+
+def build_eval_spec(args: argparse.Namespace) -> EvalSpec:
+    return EvalSpec(
+        validation_num_proteins=int(args.validation_num_proteins),
+        validation_every_n_steps=int(args.validation_every_n_steps),
+        save_every_n_steps=int(args.save_every_n_steps),
     )
-    return semantics_dict
 
 
-def maybe_log_rollout_semantics(batch_semantics: Mapping[str, Any]) -> None:
-    summary = (
-        "RL rollout semantics: "
-        f"actual={int(batch_semantics['actual_global_unique_proteins_per_step'])} proteins x "
-        f"{int(batch_semantics['actual_rollout_group_size'])} rollouts = "
-        f"{int(batch_semantics['actual_global_num_trajectories_per_step'])} trajectories; "
-        f"target={int(batch_semantics['rollout_query_batch_size_target'])} x "
-        f"{int(batch_semantics['rollout_group_size_target'])} = "
-        f"{int(batch_semantics['rollout_total_trajectories_target'])}; "
-        f"runtime_stack={batch_semantics['runtime_stack']}; "
-        f"rollout_execution_mode={batch_semantics['rollout_execution_mode']}"
-    )
-    print(summary)
-    if not bool(batch_semantics.get("paper_faithful_batch_shape", False)):
-        print(
-            "⚠️  Current runtime batch shape does not match the paper target "
-            f"({int(batch_semantics['rollout_query_batch_size_target'])} proteins x "
-            f"{int(batch_semantics['rollout_group_size_target'])} rollouts)."
-        )
-    if not bool(batch_semantics.get("paper_faithful_runtime_stack", False)):
-        print(
-            "⚠️  Current runtime stack is not paper-faithful. "
-            "Expected runtime_stack=deepspeed_vllm_colocate."
-        )
-    if not bool(batch_semantics.get("paper_faithful_execution_mode", False)):
-        print(
-            "⚠️  Current rollout execution mode is not batch_first. "
-            "This is a runtime deviation from the paper's intended backend."
-        )
-
-
-def unwrap_model(model: Any) -> Any:
-    return model.module if hasattr(model, "module") else model
-
-
-def is_distributed_enabled() -> bool:
+def resolve_dataset_num_proc(value: Any) -> Optional[int]:
     try:
-        import torch.distributed as dist
-    except ImportError:
-        return False
-    return dist.is_available() and dist.is_initialized()
+        resolved = int(value)
+    except (TypeError, ValueError):
+        return None
+    return resolved if resolved > 0 else None
 
 
-def get_distributed_rank() -> int:
-    if not is_distributed_enabled():
-        return 0
-    import torch.distributed as dist
+def validate_spec_inputs(args: argparse.Namespace) -> None:
+    text_model_name = normalize_text(args.text_model_name).strip()
+    if not text_model_name:
+        raise ValueError("Spec-first DR-GRPO requires text_model_name to point to a resolved local model bundle.")
+    text_model_path = Path(text_model_name).expanduser()
+    if not text_model_path.exists():
+        raise ValueError(f"text_model_name points to a missing local path: {text_model_name}")
+    if not text_model_path.is_dir():
+        raise ValueError(f"text_model_name must point to a local model directory: {text_model_name}")
+    validate_model_bundle_dir(text_model_path)
 
-    return int(dist.get_rank())
+    dataset_path = normalize_text(args.cafa5_dataset).strip()
+    if not dataset_path:
+        raise ValueError("Spec-first DR-GRPO requires cafa5_dataset to point to a materialized local dataset directory.")
+    resolved_dataset_path = Path(dataset_path).expanduser()
+    if not resolved_dataset_path.exists() or not resolved_dataset_path.is_dir():
+        raise ValueError(
+            "Spec-first DR-GRPO requires cafa5_dataset to point to a materialized local dataset directory. "
+            f"Got cafa5_dataset={args.cafa5_dataset!r}."
+        )
 
-
-def get_distributed_world_size() -> int:
-    if not is_distributed_enabled():
-        return 1
-    import torch.distributed as dist
-
-    return int(dist.get_world_size())
-
-
-def is_main_process() -> bool:
-    return get_distributed_rank() == 0
-
-
-def distributed_barrier() -> None:
-    if not is_distributed_enabled():
-        return
-    import torch.distributed as dist
-
-    if _DISTRIBUTED_CONTROL_GROUP is not None:
-        dist.barrier(group=_DISTRIBUTED_CONTROL_GROUP)
-    else:
-        dist.barrier()
-
-
-def distributed_reduce_tensor(tensor: Any, *, op: str = "sum") -> Any:
-    if not is_distributed_enabled():
-        return tensor
-    import torch
-    import torch.distributed as dist
-
-    if op == "sum":
-        reduce_op = dist.ReduceOp.SUM
-    elif op == "max":
-        reduce_op = dist.ReduceOp.MAX
-    else:
-        raise ValueError(f"Unsupported distributed reduce op: {op}")
-    if _DISTRIBUTED_CONTROL_GROUP is not None:
-        reduced = tensor.detach().to(device=torch.device("cpu"), dtype=tensor.dtype)
-        dist.all_reduce(reduced, op=reduce_op, group=_DISTRIBUTED_CONTROL_GROUP)
-        tensor.copy_(reduced.to(device=tensor.device, dtype=tensor.dtype))
-    else:
-        dist.all_reduce(tensor, op=reduce_op)
-    return tensor
+    ia_path = normalize_text(args.ia_file_path).strip()
+    if not ia_path or not os.path.exists(ia_path):
+        raise ValueError(
+            "Spec-first DR-GRPO requires a valid IA file because the reward is IA-weighted F1. "
+            f"Got ia_file_path={args.ia_file_path!r}."
+        )
+    go_obo_path = normalize_text(args.go_obo_path).strip()
+    if not go_obo_path or not os.path.exists(go_obo_path):
+        raise ValueError(
+            "Spec-first DR-GRPO requires a valid GO ontology OBO file for ancestor propagation. "
+            f"Got go_obo_path={args.go_obo_path!r}."
+        )
 
 
-def distributed_sum_scalar(value: float, device: Any) -> float:
-    import torch
-
-    tensor_device = torch.device("cpu") if _DISTRIBUTED_CONTROL_GROUP is not None else device
-    tensor = torch.tensor(float(value), device=tensor_device, dtype=torch.float64)
-    distributed_reduce_tensor(tensor, op="sum")
-    return float(tensor.item())
-
-
-def distributed_max_scalar(value: float, device: Any) -> float:
-    import torch
-
-    tensor_device = torch.device("cpu") if _DISTRIBUTED_CONTROL_GROUP is not None else device
-    tensor = torch.tensor(float(value), device=tensor_device, dtype=torch.float64)
-    distributed_reduce_tensor(tensor, op="max")
-    return float(tensor.item())
+def validate_runtime_dependencies() -> None:
+    require_module("torch", install_hint="torch")
+    require_module("deepspeed", install_hint="deepspeed")
+    require_module("peft", install_hint="peft")
+    require_module("transformers", install_hint="transformers")
+    require_module("vllm", install_hint="vllm")
 
 
-def init_distributed_runtime(timeout_seconds: int = 600) -> Dict[str, Any]:
-    import torch
-    global _DISTRIBUTED_CONTROL_GROUP, _DISTRIBUTED_TIMEOUT_SECONDS
+def validate_model_bundle_dir(model_dir: Path) -> None:
+    required_files = (
+        "config.json",
+        "tokenizer_config.json",
+        "protein_projection.pt",
+        "protein_model/pytorch_model.bin",
+    )
+    missing = [relative_path for relative_path in required_files if not (model_dir / relative_path).exists()]
+    if missing:
+        raise ValueError(
+            "Spec-first DR-GRPO requires a materialized local model bundle with the expected files. "
+            f"Missing from {model_dir}: {', '.join(missing)}"
+        )
 
-    if not torch.cuda.is_available():
-        raise RuntimeError("train_protein_grpo.py requires CUDA. Run it on the CoreWeave GPU cluster.")
+    tokenizer_candidates = (
+        "tokenizer.json",
+        "tokenizer.model",
+        "spiece.model",
+        "vocab.json",
+    )
+    if not any((model_dir / candidate).exists() for candidate in tokenizer_candidates):
+        raise ValueError(
+            "Spec-first DR-GRPO requires tokenizer files in the resolved model bundle. "
+            f"Expected one of {', '.join(tokenizer_candidates)} under {model_dir}."
+        )
+
+
+def collect_runtime_dependency_statuses() -> Dict[str, bool]:
+    return {
+        "torch": module_is_available("torch"),
+        "deepspeed": module_is_available("deepspeed"),
+        "peft": module_is_available("peft"),
+        "transformers": module_is_available("transformers"),
+        "vllm": module_is_available("vllm"),
+    }
+
+
+def run_preflight(args: argparse.Namespace) -> bool:
+    algorithm = build_algorithm_spec(args)
+    runtime_spec = build_runtime_spec(args)
+    dependency_statuses = collect_runtime_dependency_statuses()
+    missing_dependencies = [name for name, present in dependency_statuses.items() if not present]
+    failures: List[str] = []
+    warnings: List[str] = []
+
+    try:
+        validate_algorithm_runtime_contract(algorithm, runtime_spec)
+    except Exception as exc:
+        failures.append(str(exc))
+
+    try:
+        validate_spec_inputs(args)
+    except Exception as exc:
+        failures.append(str(exc))
+
+    if runtime_spec.target_world_size > 1 and normalize_text(getattr(args, "rollout_backend", "subprocess")).strip() != "subprocess":
+        failures.append(
+            "Spec-first distributed launches require rollout_backend=subprocess for the colocated vLLM worker."
+        )
+
+    if missing_dependencies:
+        failures.append(
+            "Missing runtime dependencies: " + ", ".join(missing_dependencies)
+        )
+
+    text_model_name = normalize_text(args.text_model_name).strip()
+    resolved_text_model_path = str(Path(text_model_name).expanduser()) if text_model_name else ""
+    dataset_path = normalize_text(args.cafa5_dataset).strip()
+    resolved_dataset_path = str(Path(dataset_path).expanduser()) if dataset_path else ""
+    ia_path = normalize_text(args.ia_file_path).strip()
+    resolved_ia_path = str(Path(ia_path).expanduser()) if ia_path else ""
+    go_obo_path = normalize_text(args.go_obo_path).strip()
+    resolved_go_obo_path = str(Path(go_obo_path).expanduser()) if go_obo_path else ""
+
+    base_checkpoint = normalize_text(args.base_checkpoint).strip()
+    if base_checkpoint and is_probably_local_path(base_checkpoint) and not Path(base_checkpoint).expanduser().exists():
+        failures.append(f"base_checkpoint points to a missing local path: {base_checkpoint}")
+
+    env_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if env_world_size > 1 and env_world_size != algorithm.queries_per_step:
+        failures.append(
+            "Current WORLD_SIZE does not match the paper-faithful rollout shape: "
+            f"WORLD_SIZE={env_world_size}, required={algorithm.queries_per_step}."
+        )
+    if env_world_size == 1 and not args.debug_single_process:
+        warnings.append(
+            "WORLD_SIZE is not set for a distributed launch in this shell. "
+            "That is fine for preflight, but the real run should use deepspeed with 8 ranks."
+        )
+
+    preflight_plan = {
+        "run_name": normalize_text(args.run_name).strip() or "<auto>",
+        "text_model_name": text_model_name,
+        "base_checkpoint": base_checkpoint or text_model_name,
+        "queries_per_step": algorithm.queries_per_step,
+        "rollouts_per_query": algorithm.rollouts_per_query,
+        "total_trajectories": algorithm.total_trajectories,
+        "steps_per_generation": algorithm.steps_per_generation,
+        "target_world_size": runtime_spec.target_world_size,
+        "runtime_stack": runtime_spec.runtime_stack,
+        "rollout_backend": normalize_text(args.rollout_backend).strip(),
+        "attn_implementation": normalize_text(args.attn_implementation).strip() or "auto",
+        "dataset_num_proc": resolve_dataset_num_proc(args.dataset_num_proc),
+        "vllm_attention_backend": normalize_text(args.vllm_attention_backend).strip() or "<auto>",
+        "vllm_worker_multiproc_method": normalize_text(args.vllm_worker_multiproc_method).strip() or "spawn",
+        "vllm_use_v1": bool(args.vllm_use_v1),
+        "debug_single_process": bool(args.debug_single_process),
+        "dependencies": dependency_statuses,
+    }
+    resolved_paths = {
+        "text_model_name": resolved_text_model_path,
+        "cafa5_dataset": resolved_dataset_path,
+        "ia_file_path": resolved_ia_path,
+        "go_obo_path": resolved_go_obo_path,
+    }
+    artifact_refs = {
+        "base_checkpoint": base_checkpoint or text_model_name,
+        "temporal_split_artifact": normalize_text(args.temporal_split_artifact).strip(),
+        "dataset_artifact": normalize_text(args.dataset_artifact).strip(),
+    }
+    launch_contract = {
+        "runtime_stack": runtime_spec.runtime_stack,
+        "target_num_nodes": runtime_spec.target_num_nodes,
+        "target_gpus_per_node": runtime_spec.target_gpus_per_node,
+        "target_world_size": runtime_spec.target_world_size,
+        "queries_per_step": algorithm.queries_per_step,
+        "rollouts_per_query": algorithm.rollouts_per_query,
+        "local_trajectories_per_rank": runtime_spec.local_trajectories_per_rank,
+        "optimizer_micro_batch_size_per_gpu": runtime_spec.optimizer_micro_batch_size_per_gpu,
+        "gradient_accumulation_steps": runtime_spec.gradient_accumulation_steps,
+        "rollout_logprob_microbatch_size": int(args.rollout_logprob_microbatch_size),
+        "max_loss_completion_tokens": int(args.max_loss_completion_tokens),
+        "attn_implementation": normalize_text(args.attn_implementation).strip() or "auto",
+        "dataset_num_proc": resolve_dataset_num_proc(args.dataset_num_proc),
+        "vllm_attention_backend": normalize_text(args.vllm_attention_backend).strip() or "<auto>",
+        "vllm_worker_multiproc_method": normalize_text(args.vllm_worker_multiproc_method).strip() or "spawn",
+        "vllm_use_v1": bool(args.vllm_use_v1),
+        "vllm_enable_sleep_mode": bool(args.vllm_enable_sleep_mode),
+        "world_size_env": env_world_size,
+    }
+    print(
+        json.dumps(
+            {
+                "artifact_refs": artifact_refs,
+                "failures": failures,
+                "launch_contract": launch_contract,
+                "preflight": preflight_plan,
+                "resolved_paths": resolved_paths,
+                "warnings": warnings,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return not failures
+
+
+def is_distributed_initialized() -> bool:
+    require_torch()
+    return torch.distributed.is_available() and torch.distributed.is_initialized()
+
+
+def initialize_runtime(args: argparse.Namespace) -> DistributedRuntime:
+    require_torch()
 
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
-    local_rank_env = os.environ.get("LOCAL_RANK")
-    local_rank = int(local_rank_env) if local_rank_env is not None else 0
+    local_rank = int(os.environ.get("LOCAL_RANK", str(getattr(args, "local_rank", 0))))
+    enabled = world_size > 1
 
-    runtime = {
-        "enabled": world_size > 1,
-        "rank": rank,
-        "world_size": world_size,
-        "local_rank": local_rank,
-        "backend": None,
-    }
+    if enabled:
+        import deepspeed
 
-    if world_size > 1:
-        import torch.distributed as dist
-
+        deepspeed.init_distributed(dist_backend="nccl")
         torch.cuda.set_device(local_rank)
-        timeout = timedelta(seconds=max(int(timeout_seconds), 600))
-        dist.init_process_group(backend="nccl", init_method="env://", timeout=timeout)
-        _DISTRIBUTED_CONTROL_GROUP = dist.new_group(backend="gloo", timeout=timeout)
-        _DISTRIBUTED_TIMEOUT_SECONDS = int(timeout.total_seconds())
-        runtime["backend"] = "nccl"
-        runtime["control_backend"] = "gloo"
-        runtime["timeout_seconds"] = _DISTRIBUTED_TIMEOUT_SECONDS
-        runtime["device"] = torch.device("cuda", local_rank)
+        device = torch.device("cuda", local_rank)
     else:
+        if not torch.cuda.is_available():
+            raise RuntimeError("Spec-first DR-GRPO training requires CUDA.")
         torch.cuda.set_device(0)
-        runtime["control_backend"] = None
-        runtime["timeout_seconds"] = int(timeout_seconds)
-        runtime["device"] = torch.device("cuda", 0)
+        device = torch.device("cuda", 0)
 
-    return runtime
+    return DistributedRuntime(
+        enabled=enabled,
+        rank=rank,
+        world_size=world_size,
+        local_rank=local_rank,
+        device=device,
+    )
 
 
-def cleanup_distributed_runtime() -> None:
-    if not is_distributed_enabled():
+def rank0_print(runtime: DistributedRuntime, message: str) -> None:
+    if runtime.rank == 0:
+        print(message, flush=True)
+
+
+def rank_print(runtime: DistributedRuntime, message: str) -> None:
+    print(f"[rank {runtime.rank}] {message}", flush=True)
+
+
+def destroy_torch_distributed_process_group(log_prefix: Optional[str] = None) -> None:
+    if torch is None:
         return
-    import torch.distributed as dist
-    global _DISTRIBUTED_CONTROL_GROUP
-
-    if _DISTRIBUTED_CONTROL_GROUP is not None:
-        try:
-            dist.destroy_process_group(_DISTRIBUTED_CONTROL_GROUP)
-        except Exception:
-            pass
-        _DISTRIBUTED_CONTROL_GROUP = None
-    dist.destroy_process_group()
-
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
+    if not torch.distributed.is_available():
+        return
+    if not torch.distributed.is_initialized():
+        return
     try:
-        import numpy as np
-
-        np.random.seed(seed)
-    except Exception:
-        pass
-
-    import torch
-
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+        if log_prefix:
+            print(f"{log_prefix} destroying torch.distributed process group", flush=True)
+        torch.distributed.destroy_process_group()
+    except Exception as exc:
+        if log_prefix:
+            print(f"{log_prefix} destroy_process_group failed: {exc}", flush=True)
 
 
-def load_auxiliary_checkpoint_components(model: Any, checkpoint_dir: str) -> None:
-    import torch
-
-    checkpoint_path = Path(checkpoint_dir)
-    optional_components = [
-        (checkpoint_path / "protein_projection.pt", getattr(model, "protein_projection", None), "protein projection"),
-        (checkpoint_path / "go_projection.pt", getattr(model, "go_projection", None), "GO projection"),
-        (checkpoint_path / "go_encoder.pt", getattr(model, "go_encoder", None), "GO encoder"),
-        (checkpoint_path / "protein_model" / "pytorch_model.bin", getattr(model, "protein_model", None), "protein model"),
-    ]
-
-    for weight_path, module, label in optional_components:
-        if module is None or not weight_path.exists():
-            continue
-        state_dict = torch.load(weight_path, map_location="cpu", weights_only=False)
-        if isinstance(state_dict, Mapping):
-            module.load_state_dict(state_dict, strict=False)
-            print(f"Loaded {label} weights from {weight_path}")
-
-
-def configure_trainable_modules(model: Any, args: argparse.Namespace) -> None:
-    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-
-    from bioreason2.models.protein_llm import _get_target_modules
-
-    for param in model.parameters():
-        param.requires_grad = False
-
-    if args.train_projector and getattr(model, "protein_projection", None) is not None:
-        model.protein_projection.train()
-        for param in model.protein_projection.parameters():
-            param.requires_grad = True
-
-    if args.train_go_modules:
-        if getattr(model, "go_projection", None) is not None:
-            model.go_projection.train()
-            for param in model.go_projection.parameters():
-                param.requires_grad = True
-        if getattr(model, "go_encoder", None) is not None:
-            model.go_encoder.train()
-            for param in model.go_encoder.parameters():
-                param.requires_grad = True
-
-    target_modules = _get_target_modules(model)
-    lora_config = LoraConfig(
-        r=args.lora_rank,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        target_modules=target_modules,
-        init_lora_weights="gaussian",
-        bias="none",
-        task_type="CAUSAL_LM",
-    )
-
-    if args.use_qlora:
-        model.text_model = prepare_model_for_kbit_training(model.text_model)
-    model.text_model = get_peft_model(model.text_model, lora_config)
-    model.text_model.train()
-
-
-def disable_model_dropout_modules(module: Any) -> None:
-    import torch
-
-    for child in module.modules():
-        if isinstance(child, torch.nn.Dropout):
-            child.p = 0.0
-
-
-def maybe_enable_gradient_checkpointing(model: Any, args: argparse.Namespace) -> None:
-    if not getattr(args, "gradient_checkpointing", False):
+def shutdown_runtime(runtime: DistributedRuntime) -> None:
+    if torch is None or not runtime.enabled:
         return
-
-    enable_input_require_grads = getattr(model.text_model, "enable_input_require_grads", None)
-    if callable(enable_input_require_grads):
-        enable_input_require_grads()
-
-    gradient_checkpointing_enable = getattr(model.text_model, "gradient_checkpointing_enable", None)
-    if callable(gradient_checkpointing_enable):
-        try:
-            gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-        except TypeError:
-            gradient_checkpointing_enable()
-
-    config = getattr(model.text_model, "config", None)
-    if config is not None and hasattr(config, "use_cache"):
-        config.use_cache = False
-
-
-def build_quantization_config(args: argparse.Namespace) -> Optional[Any]:
-    if not args.use_qlora:
-        return None
-
-    import torch
-    from transformers import BitsAndBytesConfig
-
-    dtype = getattr(torch, args.bnb_4bit_compute_dtype)
-    return BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type=args.bnb_4bit_quant_type,
-        bnb_4bit_compute_dtype=dtype,
-        bnb_4bit_use_double_quant=args.bnb_4bit_use_double_quant,
-    )
-
-
-def instantiate_model(args: argparse.Namespace, trainable: bool) -> Any:
-    from bioreason2.models.protein_llm import ProteinLLMModel
-
-    quantization_config = build_quantization_config(args) if trainable else None
-    attn_implementation = resolve_attn_implementation("flash_attention_2")
-    precomputed_embeddings_source = args.precomputed_embeddings_path
-    precomputed_go_embedding_cache_path = None
-    if precomputed_embeddings_source:
-        candidate = Path(precomputed_embeddings_source).expanduser()
-        if candidate.is_file():
-            precomputed_go_embedding_cache_path = str(candidate)
-            precomputed_embeddings_source = None
-    model = ProteinLLMModel(
-        text_model_name=args.text_model_name,
-        protein_model_name=args.protein_model_name,
-        cache_dir=args.cache_dir,
-        max_length_protein=args.max_length_protein,
-        max_length_text=args.max_length_text,
-        text_model_finetune=True,
-        protein_model_finetune=args.protein_model_finetune,
-        protein_embedding_layer=args.protein_embedding_layer,
-        go_model_finetune=args.train_go_modules,
-        attn_implementation=attn_implementation,
-        go_obo_path=args.go_obo_path,
-        precomputed_embeddings_path=precomputed_embeddings_source,
-        go_hidden_dim=args.go_hidden_dim,
-        go_num_gat_layers=args.go_num_gat_layers,
-        go_num_heads=args.go_num_heads,
-        go_num_reduced_embeddings=args.go_num_reduced_embeddings,
-        go_embedding_dim=args.go_embedding_dim,
-        quantization_config=quantization_config,
-        load_in_4bit=args.use_qlora if trainable else False,
-        unified_go_encoder=args.unified_go_encoder,
-        use_unsloth=False,
-    )
-    if precomputed_go_embedding_cache_path:
-        model.load_precomputed_go_embedding_cache(precomputed_go_embedding_cache_path, aspect="all")
-    load_auxiliary_checkpoint_components(model, args.text_model_name)
-    if trainable:
-        configure_trainable_modules(model, args)
-        if getattr(args, "disable_model_dropout", False):
-            disable_model_dropout_modules(model.text_model)
-        maybe_enable_gradient_checkpointing(model, args)
-    else:
-        for param in model.parameters():
-            param.requires_grad = False
-        model.eval()
-    return model
-
-
-def limit_dataset(dataset: Any, max_samples: int) -> Any:
-    if max_samples is None or max_samples < 0 or len(dataset) <= max_samples:
-        return dataset
-    return dataset.select(range(max_samples))
-
-
-def select_validation_subset(
-    dataset: Any,
-    *,
-    max_samples: int,
-    seed: int,
-    strategy: str,
-    label: str,
-) -> Tuple[Any, Dict[str, Any]]:
-    from bioreason2.dataset.cafa5.subset import select_dataset_subset
-
-    subset, subset_summary = select_dataset_subset(
-        dataset,
-        max_samples=max_samples,
-        seed=seed,
-        strategy=strategy,
-    )
-    print(
-        f"Using RL {label} validation subset: "
-        f"strategy={subset_summary['strategy']}, "
-        f"seed={seed}, "
-        f"requested={subset_summary['requested_samples']}, "
-        f"selected={subset_summary['selected_samples']}"
-    )
-    if subset_summary.get("group_counts"):
-        print(f"RL {label} validation group counts: {subset_summary['group_counts']}")
-    if subset_summary.get("aspect_coverage"):
-        print(f"RL {label} validation aspect coverage: {subset_summary['aspect_coverage']}")
-    return subset, subset_summary
-
-
-def load_rl_datasets(args: argparse.Namespace) -> Tuple[Any, Any, Any]:
-    from bioreason2.dataset.cafa5.load import load_cafa5_dataset
-
-    train_dataset, full_val_dataset, _ = load_cafa5_dataset(
-        dataset=args.cafa5_dataset,
-        dataset_name=args.cafa5_dataset_name,
-        max_length=args.max_length_protein,
-        val_split_ratio=0.1,
-        seed=args.seed,
-        cache_dir=args.dataset_cache_dir,
-        structure_dir=args.structure_dir,
-        debug=False,
-        include_go_defs=args.include_go_defs,
-        interpro_dataset_name=args.interpro_dataset_name,
-        split_go_aspects=args.split_go_aspects,
-        include_protein_function_summary=args.include_protein_function_summary,
-        interpro_in_prompt=args.interpro_in_prompt,
-        ppi_in_prompt=args.ppi_in_prompt,
-        predict_interpro=args.predict_interpro,
-        reasoning_dataset_name=args.reasoning_dataset_name,
-        go_gpt_predictions_column=args.go_gpt_predictions_column,
-        include_ground_truth_in_final_answer=args.include_ground_truth_in_final_answer,
-        add_uniprot_summary=args.add_uniprot_summary,
-        is_swissprot=args.is_swissprot,
-        reasoning_prompt_style=args.reasoning_prompt_style,
-        compact_interpro_limit=args.compact_interpro_limit,
-        compact_ppi_limit=args.compact_ppi_limit,
-        compact_go_speculation_limit=args.compact_go_speculation_limit,
-        return_as_chat_template=True,
-    )
-    train_dataset = limit_dataset(train_dataset, args.max_train_samples)
-    fixed_val_dataset, _ = select_validation_subset(
-        full_val_dataset,
-        max_samples=args.max_eval_samples,
-        seed=args.seed,
-        strategy=args.eval_sample_strategy,
-        label="fixed",
-    )
-    return train_dataset, fixed_val_dataset, full_val_dataset
-
-
-def build_dataloader(
-    dataset: Any,
-    model: Any,
-    batch_size: int,
-    num_workers: int,
-    shuffle: bool,
-    *,
-    distributed: bool = False,
-    seed: int = 42,
-) -> Any:
-    from functools import partial
-
-    from torch.utils.data import DataLoader
-    from torch.utils.data.distributed import DistributedSampler
-
-    from bioreason2.dataset.cafa5.collate import qwen_protein_collate_fn
-
-    base_model = unwrap_model(model)
-    collate_fn = partial(
-        qwen_protein_collate_fn,
-        processor=base_model.processor,
-        max_length_text=base_model.max_length_text,
-        max_length_protein=base_model.max_length_protein,
-        return_answer_in_batch=False,
-        inference_mode=True,
-    )
-    sampler = None
-    if distributed:
-        sampler = DistributedSampler(
-            dataset,
-            num_replicas=get_distributed_world_size(),
-            rank=get_distributed_rank(),
-            shuffle=shuffle,
-            seed=seed,
-            drop_last=False,
-        )
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle if sampler is None else False,
-        sampler=sampler,
-        num_workers=num_workers,
-        collate_fn=collate_fn,
-    )
-
-
-def extract_sample_meta_from_batch(batch: Mapping[str, Any], example_idx: int) -> Dict[str, str]:
-    return {
-        "protein_id": batch.get("protein_ids", [""])[example_idx] if example_idx < len(batch.get("protein_ids", [])) else "",
-        "split": batch.get("sample_splits", [""])[example_idx] if example_idx < len(batch.get("sample_splits", [])) else "",
-        "go_bp": batch.get("go_bp_targets", [""])[example_idx] if example_idx < len(batch.get("go_bp_targets", [])) else "",
-        "go_mf": batch.get("go_mf_targets", [""])[example_idx] if example_idx < len(batch.get("go_mf_targets", [])) else "",
-        "go_cc": batch.get("go_cc_targets", [""])[example_idx] if example_idx < len(batch.get("go_cc_targets", [])) else "",
-        "reasoning": batch.get("reasoning_targets", [""])[example_idx]
-        if example_idx < len(batch.get("reasoning_targets", []))
-        else "",
-        "final_answer": batch.get("final_answers", [""])[example_idx]
-        if example_idx < len(batch.get("final_answers", []))
-        else "",
-        "prompt_preview": batch.get("prompt", [""])[example_idx] if example_idx < len(batch.get("prompt", [])) else "",
-    }
-
-
-def extract_example_from_batch(batch: Mapping[str, Any], example_idx: int, device: Any) -> Dict[str, Any]:
-    import torch
-
-    batch_idx_map = list(batch.get("batch_idx_map") or [])
-    protein_sequences = list(batch.get("protein_sequences") or [])
-    protein_indices = [i for i, mapped_idx in enumerate(batch_idx_map) if mapped_idx == example_idx]
-    example_sequences = [protein_sequences[i] for i in protein_indices]
-
-    structure_coords = batch.get("structure_coords")
-    example_structure = None
-    if isinstance(structure_coords, torch.Tensor):
-        example_structure = structure_coords[example_idx : example_idx + 1].to(device)
-
-    go_aspects = batch.get("batch_go_aspects") or []
-    example_go_aspect = None
-    if example_idx < len(go_aspects):
-        example_go_aspect = go_aspects[example_idx]
-
-    return {
-        "input_ids": batch["input_ids"][example_idx : example_idx + 1].to(device),
-        "attention_mask": batch["attention_mask"][example_idx : example_idx + 1].to(device),
-        "protein_sequences": example_sequences,
-        "batch_idx_map": [0] * len(example_sequences),
-        "structure_coords": example_structure,
-        "go_aspects": [example_go_aspect if example_go_aspect is not None else "all"],
-        "sample_meta": extract_sample_meta_from_batch(batch, example_idx),
-    }
-
-
-def maybe_build_batch_multimodal_cache(
-    model: Any,
-    batch: Mapping[str, Any],
-    args: argparse.Namespace,
-    device: Any,
-) -> Optional[Dict[str, Any]]:
-    import torch
-
-    if not can_cache_multimodal_prefix(args):
-        return None
-    base_model = unwrap_model(model)
-    build_cache = getattr(base_model, "build_multimodal_cache", None)
-    if not callable(build_cache):
-        return None
-
-    structure_coords = batch.get("structure_coords")
-    if isinstance(structure_coords, torch.Tensor):
-        structure_coords = structure_coords.to(device)
-
-    return build_cache(
-        protein_sequences=list(batch.get("protein_sequences") or []),
-        batch_idx_map=list(batch.get("batch_idx_map") or []),
-        batch_size=int(batch["input_ids"].shape[0]),
-        structure_coords=structure_coords,
-        go_aspects=list(batch.get("batch_go_aspects") or []),
-    )
-
-
-def expand_batch_multimodal_cache(
-    cache: Optional[Dict[str, Any]],
-    repeat_count: int,
-) -> Optional[Dict[str, Any]]:
-    if cache is None:
-        return None
-    if repeat_count <= 0:
-        raise ValueError(f"repeat_count must be positive, got {repeat_count}")
-
-    expanded_cache: Dict[str, Any] = {
-        "batch_size": int(cache.get("batch_size", 0)) * repeat_count,
-        "protein_embeddings": None,
-        "go_embeddings": None,
-    }
-    protein_embeddings = cache.get("protein_embeddings")
-    if isinstance(protein_embeddings, list):
-        expanded_cache["protein_embeddings"] = [
-            embedding
-            for embedding in protein_embeddings
-            for _ in range(repeat_count)
-        ]
-    go_embeddings = cache.get("go_embeddings")
-    if isinstance(go_embeddings, list):
-        expanded_cache["go_embeddings"] = [
-            embedding
-            for embedding in go_embeddings
-            for _ in range(repeat_count)
-        ]
-    return expanded_cache
-
-
-def expand_batch_for_rollouts(
-    batch: Mapping[str, Any],
-    rollout_count: int,
-    device: Any,
-) -> Dict[str, Any]:
-    import torch
-
-    if rollout_count <= 0:
-        raise ValueError(f"rollout_count must be positive, got {rollout_count}")
-
-    input_ids = batch["input_ids"].to(device).repeat_interleave(rollout_count, dim=0)
-    attention_mask = batch["attention_mask"].to(device).repeat_interleave(rollout_count, dim=0)
-    batch_size = int(batch["input_ids"].shape[0])
-
-    structure_coords = batch.get("structure_coords")
-    if isinstance(structure_coords, torch.Tensor):
-        structure_coords = structure_coords.to(device).repeat_interleave(rollout_count, dim=0)
-
-    original_batch_idx_map = list(batch.get("batch_idx_map") or [])
-    original_protein_sequences = list(batch.get("protein_sequences") or [])
-    proteins_by_example: List[List[str]] = [[] for _ in range(batch_size)]
-    for protein_idx, mapped_idx in enumerate(original_batch_idx_map):
-        if 0 <= int(mapped_idx) < batch_size:
-            proteins_by_example[int(mapped_idx)].append(original_protein_sequences[protein_idx])
-
-    protein_sequences: List[str] = []
-    batch_idx_map: List[int] = []
-    row_to_example_idx: List[int] = []
-    for example_idx in range(batch_size):
-        for rollout_idx in range(rollout_count):
-            row_idx = example_idx * rollout_count + rollout_idx
-            row_to_example_idx.append(example_idx)
-            sequences = proteins_by_example[example_idx]
-            protein_sequences.extend(sequences)
-            batch_idx_map.extend([row_idx] * len(sequences))
-
-    base_go_aspects = list(batch.get("batch_go_aspects") or [])
-    go_aspects: List[str] = []
-    for example_idx in range(batch_size):
-        aspect = base_go_aspects[example_idx] if example_idx < len(base_go_aspects) else "all"
-        go_aspects.extend([aspect if aspect is not None else "all"] * rollout_count)
-
-    return {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "protein_sequences": protein_sequences,
-        "batch_idx_map": batch_idx_map,
-        "structure_coords": structure_coords,
-        "go_aspects": go_aspects,
-        "batch_size": batch_size,
-        "rollout_count": rollout_count,
-        "row_to_example_idx": row_to_example_idx,
-    }
-
-
-def expand_example_for_rollouts(example: Mapping[str, Any], rollout_count: int) -> Dict[str, Any]:
-    import torch
-
-    if rollout_count <= 0:
-        raise ValueError(f"rollout_count must be positive, got {rollout_count}")
-
-    input_ids = example["input_ids"].repeat(rollout_count, 1)
-    attention_mask = example["attention_mask"].repeat(rollout_count, 1)
-
-    structure_coords = example.get("structure_coords")
-    if isinstance(structure_coords, torch.Tensor):
-        repeat_dims = [rollout_count] + [1] * max(structure_coords.dim() - 1, 0)
-        structure_coords = structure_coords.repeat(*repeat_dims)
-
-    base_sequences = list(example.get("protein_sequences") or [])
-    protein_sequences: List[str] = []
-    batch_idx_map: List[int] = []
-    for rollout_idx in range(rollout_count):
-        protein_sequences.extend(base_sequences)
-        batch_idx_map.extend([rollout_idx] * len(base_sequences))
-
-    base_go_aspects = list(example.get("go_aspects") or [])
-    rollout_go_aspect = base_go_aspects[0] if base_go_aspects else "all"
-
-    return {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "protein_sequences": protein_sequences,
-        "batch_idx_map": batch_idx_map,
-        "structure_coords": structure_coords,
-        "go_aspects": [rollout_go_aspect] * rollout_count,
-    }
-
-
-def expand_single_example_multimodal_cache(model: Any, cache: Optional[Dict[str, Any]], rollout_count: int) -> Optional[Dict[str, Any]]:
-    if cache is None:
-        return None
-    expand = getattr(model, "expand_multimodal_cache", None)
-    if not callable(expand):
-        return None
-    return expand(cache, rollout_count)
-
-
-def decode_completion(tokenizer: Any, completion_ids: Any) -> str:
-    text = tokenizer.decode(completion_ids, skip_special_tokens=False).strip()
-    for marker in ("<|im_end|>", "<|endoftext|>"):
-        if marker in text:
-            text = text.split(marker, 1)[0].strip()
-    return text
-
-
-def find_token_subsequence_index(token_ids: Sequence[int], subsequence: Sequence[int]) -> int:
-    if not token_ids or not subsequence or len(subsequence) > len(token_ids):
-        return -1
-    last_start = len(token_ids) - len(subsequence)
-    for start_idx in range(last_start + 1):
-        if list(token_ids[start_idx : start_idx + len(subsequence)]) == list(subsequence):
-            return start_idx
-    return -1
-
-
-def find_marker_token_index(tokenizer: Any, completion_ids: Any, marker: str) -> int:
-    marker_ids = tokenizer.encode(marker, add_special_tokens=False)
-    if not marker_ids:
-        return -1
-    token_list = [int(token_id) for token_id in completion_ids.detach().cpu().tolist()]
-    return find_token_subsequence_index(token_list, [int(token_id) for token_id in marker_ids])
-
-
-def infer_rollout_stop_reason(
-    tokenizer: Any,
-    completion_ids: Any,
-    completion_text: str,
-    *,
-    max_new_tokens: int,
-) -> str:
-    if GO_SUMMARY_END in completion_text:
-        return "summary_end"
-    eos_token_id = getattr(tokenizer, "eos_token_id", None)
-    if eos_token_id is not None and completion_ids.numel() > 0 and int(completion_ids[-1].item()) == int(eos_token_id):
-        return "eos"
-    if completion_ids.numel() >= max(int(max_new_tokens), 0):
-        return "max_tokens"
-    return "unknown"
-
-
-def build_rollout_observability(
-    tokenizer: Any,
-    completion_ids: Any,
-    completion_text: str,
-    *,
-    total_reward: Optional[float] = None,
-    max_new_tokens: int,
-) -> Dict[str, Any]:
-    stop_reason = infer_rollout_stop_reason(
-        tokenizer,
-        completion_ids,
-        completion_text,
-        max_new_tokens=max_new_tokens,
-    )
-    first_go_summary_token_idx = find_marker_token_index(tokenizer, completion_ids, GO_SUMMARY_START)
-    return {
-        "completion_token_count": int(completion_ids.numel()),
-        "stop_reason": stop_reason,
-        "max_new_tokens_hit": bool(stop_reason == "max_tokens"),
-        "has_go_summary_end": bool(GO_SUMMARY_END in completion_text),
-        "first_go_summary_token_idx": int(first_go_summary_token_idx),
-        "reward_nonzero": bool(total_reward is not None and float(total_reward) != 0.0),
-    }
-
-
-def extract_completion_ids(generated_ids: Any, prompt_input_ids: Any) -> Any:
-    """Handle both prompt-inclusive and completion-only outputs from generate()."""
-    import torch
-
-    if generated_ids.dim() != 2:
-        raise ValueError(f"Expected rank-2 generated ids, got shape {tuple(generated_ids.shape)}")
-    if generated_ids.shape[0] != 1:
-        raise ValueError(f"Expected batch size 1 during RL rollout extraction, got {generated_ids.shape[0]}")
-
-    if prompt_input_ids.dim() == 2:
-        if prompt_input_ids.shape[0] != 1:
+    destroy_torch_distributed_process_group(log_prefix=f"[rank {runtime.rank}]")
+
+
+def all_reduce_sum_scalar(value: float, runtime: DistributedRuntime) -> float:
+    if torch is None:
+        if runtime.enabled:
+            raise RuntimeError("Distributed scalar reduction requires torch.")
+        return float(value)
+    tensor = torch.tensor(float(value), device=runtime.device, dtype=torch.float64)
+    if runtime.enabled:
+        torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
+    return float(tensor.item())
+
+
+def all_reduce_max_scalar(value: float, runtime: DistributedRuntime) -> float:
+    if torch is None:
+        if runtime.enabled:
+            raise RuntimeError("Distributed scalar reduction requires torch.")
+        return float(value)
+    tensor = torch.tensor(float(value), device=runtime.device, dtype=torch.float64)
+    if runtime.enabled:
+        torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MAX)
+    return float(tensor.item())
+
+
+def barrier(runtime: DistributedRuntime) -> None:
+    if runtime.enabled and is_distributed_initialized():
+        torch.distributed.barrier()
+
+
+def broadcast_indices(indices: List[int], runtime: DistributedRuntime) -> List[int]:
+    require_torch()
+    tensor = torch.tensor(indices if runtime.rank == 0 else [0] * len(indices), device=runtime.device, dtype=torch.long)
+    if runtime.enabled:
+        torch.distributed.broadcast(tensor, src=0)
+    return [int(item) for item in tensor.cpu().tolist()]
+
+
+def sample_query_indices(dataset_length: int, queries_per_step: int, seed: int, step: int, runtime: DistributedRuntime) -> List[int]:
+    if runtime.rank == 0:
+        rng = random.Random(seed + step)
+        if dataset_length < queries_per_step:
             raise ValueError(
-                f"Expected batch size 1 for prompt ids during RL rollout extraction, got {prompt_input_ids.shape[0]}"
+                f"Train dataset has only {dataset_length} items, but the specification requires {queries_per_step} queries per step."
             )
-        prompt_tokens = prompt_input_ids[0]
+        indices = rng.sample(range(dataset_length), queries_per_step)
     else:
-        prompt_tokens = prompt_input_ids
-
-    prompt_tokens = prompt_tokens.detach().to(device=generated_ids.device, dtype=generated_ids.dtype)
-    generated_tokens = generated_ids[0]
-    prompt_len = int(prompt_tokens.shape[0])
-
-    if generated_tokens.shape[0] >= prompt_len and torch.equal(generated_tokens[:prompt_len], prompt_tokens):
-        return generated_tokens[prompt_len:].detach()
-    return generated_tokens.detach()
+        indices = [0] * queries_per_step
+    return broadcast_indices(indices, runtime)
 
 
-def extract_completion_ids_batch(generated_ids: Any, prompt_input_ids: Any) -> List[Any]:
-    import torch
+def partition_queries_for_rank(global_indices: Sequence[int], rank: int, world_size: int) -> List[int]:
+    if world_size <= 0:
+        raise ValueError(f"world_size must be positive, got {world_size}")
+    return [int(global_indices[idx]) for idx in range(rank, len(global_indices), world_size)]
 
-    if generated_ids.dim() != 2:
-        raise ValueError(f"Expected rank-2 generated ids, got shape {tuple(generated_ids.shape)}")
-    if prompt_input_ids.dim() != 2:
-        raise ValueError(f"Expected rank-2 prompt ids for batched extraction, got shape {tuple(prompt_input_ids.shape)}")
-    if generated_ids.shape[0] != prompt_input_ids.shape[0]:
+
+def resolve_local_cuda_visible_device(local_rank: int, cuda_visible_devices: Optional[str] = None) -> str:
+    visible = normalize_text(cuda_visible_devices if cuda_visible_devices is not None else os.environ.get("CUDA_VISIBLE_DEVICES")).strip()
+    if not visible:
+        return str(local_rank)
+    device_tokens = [token.strip() for token in visible.split(",") if token.strip()]
+    if not device_tokens:
+        return str(local_rank)
+    if len(device_tokens) == 1:
+        return device_tokens[0]
+    if local_rank < 0 or local_rank >= len(device_tokens):
         raise ValueError(
-            "Generated ids and prompt ids must have the same batch size for batched extraction: "
-            f"{generated_ids.shape[0]} != {prompt_input_ids.shape[0]}"
+            "local_rank is out of range for CUDA_VISIBLE_DEVICES. "
+            f"Got local_rank={local_rank}, CUDA_VISIBLE_DEVICES={visible!r}."
         )
-
-    completions: List[Any] = []
-    for row_idx in range(generated_ids.shape[0]):
-        prompt_tokens = prompt_input_ids[row_idx].detach().to(device=generated_ids.device, dtype=generated_ids.dtype)
-        generated_tokens = generated_ids[row_idx]
-        prompt_len = int(prompt_tokens.shape[0])
-        if generated_tokens.shape[0] >= prompt_len and torch.equal(generated_tokens[:prompt_len], prompt_tokens):
-            completions.append(generated_tokens[prompt_len:].detach())
-        else:
-            completions.append(generated_tokens.detach())
-    return completions
-
-
-def build_rollout_group_inputs(
-    example: Mapping[str, Any],
-    completion_ids_list: Sequence[Any],
-    pad_token_id: int,
-    *,
-    multimodal_cache: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    import torch
-
-    rollout_count = len(completion_ids_list)
-    if rollout_count <= 0:
-        raise ValueError("completion_ids_list must not be empty")
-
-    expanded_example = expand_example_for_rollouts(example, rollout_count)
-    prompt_input_ids = expanded_example["input_ids"]
-    prompt_attention_mask = expanded_example["attention_mask"]
-    max_completion_len = max((int(completion_ids.numel()) for completion_ids in completion_ids_list), default=0)
-    completion_batch = torch.full(
-        (rollout_count, max_completion_len),
-        int(pad_token_id),
-        dtype=prompt_input_ids.dtype,
-        device=prompt_input_ids.device,
-    )
-    completion_attention = torch.zeros(
-        (rollout_count, max_completion_len),
-        dtype=prompt_attention_mask.dtype,
-        device=prompt_attention_mask.device,
-    )
-
-    for rollout_idx, completion_ids in enumerate(completion_ids_list):
-        completion_len = int(completion_ids.numel())
-        if completion_len <= 0:
-            continue
-        completion_tensor = completion_ids.to(device=prompt_input_ids.device, dtype=prompt_input_ids.dtype)
-        completion_batch[rollout_idx, :completion_len] = completion_tensor
-        completion_attention[rollout_idx, :completion_len] = 1
-
-    combined_input_ids = torch.cat([prompt_input_ids, completion_batch], dim=1)
-    combined_attention_mask = torch.cat([prompt_attention_mask, completion_attention], dim=1)
-    return {
-        "combined_input_ids": combined_input_ids,
-        "combined_attention_mask": combined_attention_mask,
-        "completion_attention": completion_attention,
-        "prompt_token_len": prompt_input_ids.shape[1],
-        "protein_sequences": expanded_example["protein_sequences"],
-        "batch_idx_map": expanded_example["batch_idx_map"],
-        "structure_coords": expanded_example["structure_coords"],
-        "go_aspects": expanded_example["go_aspects"],
-        "multimodal_cache": multimodal_cache,
-    }
-
-
-def slice_rollout_group(
-    rollout_group: Mapping[str, Any],
-    start_idx: int,
-    end_idx: int,
-) -> Dict[str, Any]:
-    total_rollouts = int(rollout_group["combined_input_ids"].shape[0])
-    if start_idx < 0 or end_idx > total_rollouts or start_idx >= end_idx:
-        raise ValueError(f"Invalid rollout slice [{start_idx}, {end_idx}) for {total_rollouts} rollouts")
-
-    protein_sequences = list(rollout_group.get("protein_sequences") or [])
-    batch_idx_map = list(rollout_group.get("batch_idx_map") or [])
-    proteins_per_rollout = 0
-    if total_rollouts > 0 and protein_sequences:
-        if len(protein_sequences) % total_rollouts != 0:
-            raise ValueError("protein_sequences length must divide evenly across rollout count")
-        proteins_per_rollout = len(protein_sequences) // total_rollouts
-    elif total_rollouts > 0 and batch_idx_map:
-        if len(batch_idx_map) % total_rollouts != 0:
-            raise ValueError("batch_idx_map length must divide evenly across rollout count")
-        proteins_per_rollout = len(batch_idx_map) // total_rollouts
-
-    protein_start = start_idx * proteins_per_rollout
-    protein_end = end_idx * proteins_per_rollout
-    sliced_sequences = protein_sequences[protein_start:protein_end]
-    sliced_batch_idx_map: List[int] = []
-    if proteins_per_rollout > 0:
-        for local_idx in range(end_idx - start_idx):
-            sliced_batch_idx_map.extend([local_idx] * proteins_per_rollout)
-
-    structure_coords = rollout_group.get("structure_coords")
-    if hasattr(structure_coords, "shape") and getattr(structure_coords, "shape", None):
-        if int(structure_coords.shape[0]) == total_rollouts:
-            structure_coords = structure_coords[start_idx:end_idx]
-    elif isinstance(structure_coords, list) and len(structure_coords) == total_rollouts:
-        structure_coords = structure_coords[start_idx:end_idx]
-
-    multimodal_cache = rollout_group.get("multimodal_cache")
-    sliced_multimodal_cache = None
-    if isinstance(multimodal_cache, Mapping):
-        sliced_multimodal_cache = {
-            "batch_size": end_idx - start_idx,
-            "protein_embeddings": None,
-            "go_embeddings": None,
-        }
-        protein_embeddings = multimodal_cache.get("protein_embeddings")
-        if isinstance(protein_embeddings, list):
-            sliced_multimodal_cache["protein_embeddings"] = protein_embeddings[start_idx:end_idx]
-        go_embeddings = multimodal_cache.get("go_embeddings")
-        if isinstance(go_embeddings, list):
-            sliced_multimodal_cache["go_embeddings"] = go_embeddings[start_idx:end_idx]
-
-    return {
-        "combined_input_ids": rollout_group["combined_input_ids"][start_idx:end_idx],
-        "combined_attention_mask": rollout_group["combined_attention_mask"][start_idx:end_idx],
-        "completion_attention": rollout_group["completion_attention"][start_idx:end_idx],
-        "prompt_token_len": rollout_group["prompt_token_len"],
-        "protein_sequences": sliced_sequences,
-        "batch_idx_map": sliced_batch_idx_map,
-        "structure_coords": structure_coords,
-        "go_aspects": list(rollout_group["go_aspects"][start_idx:end_idx]),
-        "multimodal_cache": sliced_multimodal_cache,
-    }
-
-
-def index_rollout_group(
-    rollout_group: Mapping[str, Any],
-    rollout_indices: Sequence[int],
-) -> Dict[str, Any]:
-    import torch
-
-    indices = [int(idx) for idx in rollout_indices]
-    total_rollouts = int(rollout_group["combined_input_ids"].shape[0])
-    if not indices:
-        raise ValueError("rollout_indices must not be empty")
-    if min(indices) < 0 or max(indices) >= total_rollouts:
-        raise ValueError(f"Invalid rollout indices {indices} for {total_rollouts} rollouts")
-
-    protein_sequences = list(rollout_group.get("protein_sequences") or [])
-    batch_idx_map = list(rollout_group.get("batch_idx_map") or [])
-    proteins_per_rollout = 0
-    if total_rollouts > 0 and protein_sequences:
-        if len(protein_sequences) % total_rollouts != 0:
-            raise ValueError("protein_sequences length must divide evenly across rollout count")
-        proteins_per_rollout = len(protein_sequences) // total_rollouts
-    elif total_rollouts > 0 and batch_idx_map:
-        if len(batch_idx_map) % total_rollouts != 0:
-            raise ValueError("batch_idx_map length must divide evenly across rollout count")
-        proteins_per_rollout = len(batch_idx_map) // total_rollouts
-
-    indexed_sequences: List[str] = []
-    indexed_batch_idx_map: List[int] = []
-    if proteins_per_rollout > 0:
-        for local_idx, rollout_idx in enumerate(indices):
-            protein_start = rollout_idx * proteins_per_rollout
-            protein_end = protein_start + proteins_per_rollout
-            indexed_sequences.extend(protein_sequences[protein_start:protein_end])
-            indexed_batch_idx_map.extend([local_idx] * proteins_per_rollout)
-
-    structure_coords = rollout_group.get("structure_coords")
-    index_tensor = torch.tensor(indices, device=rollout_group["combined_input_ids"].device, dtype=torch.long)
-    if hasattr(structure_coords, "shape") and getattr(structure_coords, "shape", None):
-        if int(structure_coords.shape[0]) == total_rollouts:
-            structure_coords = structure_coords.index_select(0, index_tensor.to(structure_coords.device))
-    elif isinstance(structure_coords, list) and len(structure_coords) == total_rollouts:
-        structure_coords = [structure_coords[idx] for idx in indices]
-
-    multimodal_cache = rollout_group.get("multimodal_cache")
-    indexed_multimodal_cache = None
-    if isinstance(multimodal_cache, Mapping):
-        indexed_multimodal_cache = {
-            "batch_size": len(indices),
-            "protein_embeddings": None,
-            "go_embeddings": None,
-        }
-        protein_embeddings = multimodal_cache.get("protein_embeddings")
-        if isinstance(protein_embeddings, list):
-            indexed_multimodal_cache["protein_embeddings"] = [protein_embeddings[idx] for idx in indices]
-        go_embeddings = multimodal_cache.get("go_embeddings")
-        if isinstance(go_embeddings, list):
-            indexed_multimodal_cache["go_embeddings"] = [go_embeddings[idx] for idx in indices]
-
-    return {
-        "combined_input_ids": rollout_group["combined_input_ids"].index_select(0, index_tensor),
-        "combined_attention_mask": rollout_group["combined_attention_mask"].index_select(0, index_tensor),
-        "completion_attention": rollout_group["completion_attention"].index_select(0, index_tensor),
-        "prompt_token_len": rollout_group["prompt_token_len"],
-        "protein_sequences": indexed_sequences,
-        "batch_idx_map": indexed_batch_idx_map,
-        "structure_coords": structure_coords,
-        "go_aspects": [rollout_group["go_aspects"][idx] for idx in indices],
-        "multimodal_cache": indexed_multimodal_cache,
-    }
+    return device_tokens[local_rank]
 
 
 def select_rollout_indices_for_loss(
@@ -2294,2093 +792,1960 @@ def select_rollout_indices_for_loss(
     return selected_indices
 
 
-def build_combined_inputs(prompt_input_ids: Any, prompt_attention_mask: Any, completion_ids: Any) -> Tuple[Any, Any, int]:
-    import torch
-
-    if completion_ids.dim() == 1:
-        completion_ids = completion_ids.unsqueeze(0)
-    prompt_len = prompt_input_ids.shape[1]
-    completion_attention = torch.ones_like(completion_ids, dtype=prompt_attention_mask.dtype)
-    combined_input_ids = torch.cat([prompt_input_ids, completion_ids], dim=1)
-    combined_attention_mask = torch.cat([prompt_attention_mask, completion_attention], dim=1)
-    return combined_input_ids, combined_attention_mask, prompt_len
-
-
-def maybe_build_example_multimodal_cache(
-    model: Any,
-    example: Mapping[str, Any],
+def validate_runtime_shape(
+    runtime: DistributedRuntime,
+    algorithm: AlgorithmSpec,
+    runtime_spec: RuntimeSpec,
     args: argparse.Namespace,
-) -> Optional[Dict[str, Any]]:
-    if not can_cache_multimodal_prefix(args):
+) -> None:
+    validate_algorithm_runtime_contract(algorithm, runtime_spec)
+    if runtime.enabled and runtime.world_size != algorithm.queries_per_step:
+        raise ValueError(
+            "Spec-first distributed training requires world_size == queries_per_step so each rank owns one protein group. "
+            f"Got world_size={runtime.world_size}, queries_per_step={algorithm.queries_per_step}."
+        )
+    if (not runtime.enabled) and (not args.debug_single_process):
+        raise ValueError(
+            "Spec-first trainer expects a distributed DeepSpeed launch. "
+            "Use deepspeed to launch 8 ranks, or pass --debug_single_process true for a non-paper-faithful debug run."
+        )
+    if runtime.enabled and normalize_text(getattr(args, "rollout_backend", "subprocess")).strip() != "subprocess":
+        raise ValueError(
+            "Distributed spec-first training requires rollout_backend=subprocess so the vLLM worker runs in a clean "
+            "single-GPU subprocess per rank."
+        )
+
+
+def validate_algorithm_runtime_contract(
+    algorithm: AlgorithmSpec,
+    runtime_spec: RuntimeSpec,
+) -> None:
+    if runtime_spec.runtime_stack != "deepspeed_vllm_colocate":
+        raise ValueError(
+            f"Spec-first trainer only supports runtime_stack=deepspeed_vllm_colocate, got {runtime_spec.runtime_stack!r}."
+        )
+    if runtime_spec.local_trajectories_per_rank != algorithm.rollouts_per_query:
+        raise ValueError(
+            "The specification requires one query-owner rank to process exactly one 24-rollout group. "
+            f"Got optimizer_micro_batch_size_per_gpu={runtime_spec.optimizer_micro_batch_size_per_gpu}, "
+            f"gradient_accumulation_steps={runtime_spec.gradient_accumulation_steps}, "
+            f"which yields {runtime_spec.local_trajectories_per_rank} local trajectories."
+        )
+    if runtime_spec.target_world_size != algorithm.queries_per_step:
+        raise ValueError(
+            "The paper-faithful runtime shape requires target_num_nodes * target_gpus_per_node == queries_per_step. "
+            f"Got target_world_size={runtime_spec.target_world_size}, queries_per_step={algorithm.queries_per_step}."
+        )
+
+
+def extract_go_terms_from_final_answer(text: str) -> Optional[List[str]]:
+    match = FINAL_ANSWER_PATTERN.search(normalize_text(text))
+    if match is None:
         return None
-    base_model = unwrap_model(model)
-    build_cache = getattr(base_model, "build_multimodal_cache", None)
-    if not callable(build_cache):
-        return None
-    return build_cache(
-        protein_sequences=list(example.get("protein_sequences") or []),
-        batch_idx_map=list(example.get("batch_idx_map") or []),
-        batch_size=int(example["input_ids"].shape[0]),
-        structure_coords=example.get("structure_coords"),
-        go_aspects=list(example.get("go_aspects") or []),
+    seen = set()
+    ordered: List[str] = []
+    for go_id in GO_ID_PATTERN.findall(match.group(1)):
+        if go_id not in seen:
+            seen.add(go_id)
+            ordered.append(go_id)
+    return ordered
+
+
+def build_query_sample_meta(batch: Mapping[str, Any]) -> Dict[str, str]:
+    return {
+        "protein_id": normalize_text((batch.get("protein_ids") or [""])[0]),
+        "split": normalize_text((batch.get("sample_splits") or [""])[0]),
+        "go_bp": normalize_text((batch.get("go_bp_targets") or [""])[0]),
+        "go_mf": normalize_text((batch.get("go_mf_targets") or [""])[0]),
+        "go_cc": normalize_text((batch.get("go_cc_targets") or [""])[0]),
+    }
+
+
+def build_target_go_ids(sample_meta: Mapping[str, Any]) -> List[str]:
+    seen = set()
+    ordered: List[str] = []
+    for key in ("go_bp", "go_mf", "go_cc"):
+        for go_id in GO_ID_PATTERN.findall(normalize_text(sample_meta.get(key))):
+            if go_id not in seen:
+                seen.add(go_id)
+                ordered.append(go_id)
+    return ordered
+
+
+def load_go_term_graph(go_obo_path: str) -> Dict[str, Tuple[str, ...]]:
+    if not go_obo_path or not os.path.exists(go_obo_path):
+        return {}
+    parents: Dict[str, List[str]] = {}
+    current_id = ""
+    current_parents: List[str] = []
+    current_obsolete = False
+    in_term = False
+
+    def finalize() -> None:
+        nonlocal current_id, current_parents, current_obsolete
+        if current_id and not current_obsolete:
+            parents[current_id] = list(dict.fromkeys(parent for parent in current_parents if parent))
+        current_id = ""
+        current_parents = []
+        current_obsolete = False
+
+    with open(go_obo_path, "r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if line == "[Term]":
+                finalize()
+                in_term = True
+                continue
+            if line.startswith("[") and line != "[Term]":
+                finalize()
+                in_term = False
+                continue
+            if not in_term or not line:
+                continue
+            if line.startswith("id: "):
+                current_id = normalize_text(line.split(":", 1)[1]).strip()
+            elif line.startswith("is_a: "):
+                parent = line.split("!", 1)[0].split()[1].strip()
+                if GO_ID_PATTERN.fullmatch(parent):
+                    current_parents.append(parent)
+            elif line.startswith("relationship: part_of "):
+                candidate = line.split("relationship: part_of ", 1)[1].split()[0].strip()
+                if GO_ID_PATTERN.fullmatch(candidate):
+                    current_parents.append(candidate)
+            elif line.startswith("is_obsolete: "):
+                current_obsolete = line.split(":", 1)[1].strip().lower() == "true"
+    finalize()
+    return {key: tuple(value) for key, value in parents.items()}
+
+
+def propagate_go_ids(go_ids: Iterable[str], graph: Mapping[str, Tuple[str, ...]]) -> List[str]:
+    seen = set()
+    ordered: List[str] = []
+
+    def visit(go_id: str) -> None:
+        if go_id in seen:
+            return
+        seen.add(go_id)
+        ordered.append(go_id)
+        for parent_id in graph.get(go_id, ()):
+            visit(parent_id)
+
+    for go_id in go_ids:
+        visit(go_id)
+    return ordered
+
+
+def load_ia_weights(ia_file_path: str) -> Dict[str, float]:
+    if not ia_file_path or not os.path.exists(ia_file_path):
+        return {}
+    weights: Dict[str, float] = {}
+    with open(ia_file_path, "r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = re.split(r"\s+", line)
+            if len(parts) < 2 or not GO_ID_PATTERN.fullmatch(parts[0]):
+                continue
+            try:
+                weights[parts[0]] = float(parts[1])
+            except ValueError:
+                continue
+    return weights
+
+
+def compute_weighted_f1(predicted: Iterable[str], target: Iterable[str], ia_weights: Mapping[str, float]) -> float:
+    predicted_set = set(predicted)
+    target_set = set(target)
+    if not predicted_set or not target_set:
+        return 0.0
+    intersection = predicted_set & target_set
+    if not intersection:
+        return 0.0
+
+    def weight(go_id: str) -> float:
+        return float(ia_weights.get(go_id, 1.0))
+
+    precision_num = sum(weight(go_id) for go_id in intersection)
+    precision_den = sum(weight(go_id) for go_id in predicted_set)
+    recall_den = sum(weight(go_id) for go_id in target_set)
+    if precision_den <= 0.0 or recall_den <= 0.0:
+        return 0.0
+    precision = precision_num / precision_den
+    recall = precision_num / recall_den
+    if precision + recall <= 0.0:
+        return 0.0
+    return 2.0 * precision * recall / (precision + recall)
+
+
+def compute_group_rewards(
+    completions: Sequence[str],
+    sample_meta: Mapping[str, Any],
+    go_graph: Mapping[str, Tuple[str, ...]],
+    ia_weights: Mapping[str, float],
+) -> List[float]:
+    target_go_ids = build_target_go_ids(sample_meta)
+    propagated_target = propagate_go_ids(target_go_ids, go_graph) if go_graph else target_go_ids
+    rewards: List[float] = []
+    for completion in completions:
+        predicted_go_ids = extract_go_terms_from_final_answer(completion)
+        if predicted_go_ids is None:
+            rewards.append(0.0)
+            continue
+        propagated_pred = propagate_go_ids(predicted_go_ids, go_graph) if go_graph else predicted_go_ids
+        rewards.append(compute_weighted_f1(propagated_pred, propagated_target, ia_weights))
+    return rewards
+
+
+def compute_global_reward_std(local_group_rewards: Sequence[Sequence[float]], runtime: DistributedRuntime, epsilon: float) -> float:
+    flat_rewards = [float(reward) for group in local_group_rewards for reward in group]
+    local_sum = sum(flat_rewards)
+    local_sq_sum = sum(reward * reward for reward in flat_rewards)
+    local_count = float(len(flat_rewards))
+
+    total_sum = all_reduce_sum_scalar(local_sum, runtime)
+    total_sq_sum = all_reduce_sum_scalar(local_sq_sum, runtime)
+    total_count = all_reduce_sum_scalar(local_count, runtime)
+    if total_count <= 0:
+        return epsilon
+
+    mean = total_sum / total_count
+    variance = max((total_sq_sum / total_count) - (mean * mean), 0.0)
+    return math.sqrt(variance) + epsilon
+
+
+def compute_group_advantages(group_rewards: Sequence[float], global_std: float) -> List[float]:
+    if not group_rewards:
+        return []
+    group_mean = sum(group_rewards) / len(group_rewards)
+    return [(float(reward) - group_mean) / global_std for reward in group_rewards]
+
+
+def build_tracking_config(
+    args: argparse.Namespace,
+    algorithm: AlgorithmSpec,
+    runtime_spec: RuntimeSpec,
+    runtime: DistributedRuntime,
+    run_name: str,
+) -> Dict[str, Any]:
+    from bioreason2.utils.tracking import build_training_tracking_config
+
+    tracking_args = argparse.Namespace(**vars(args))
+    tracking_args.run_name = run_name
+    tracking_args.dataset_config = normalize_text(args.dataset_config).strip() or args.reasoning_dataset_name
+    tracking_args.reasoning_dataset_config = (
+        normalize_text(args.reasoning_dataset_config).strip() or args.reasoning_dataset_name
+    )
+    tracking_args.base_checkpoint = normalize_text(args.base_checkpoint).strip() or args.text_model_name
+    tracking_args.model_artifact = normalize_text(args.model_artifact).strip() or args.checkpoint_artifact_name
+    tracking_args.batch_size = algorithm.total_trajectories
+    tracking_args.train_batch_size = algorithm.total_trajectories
+    tracking_args.eval_batch_size = 1
+    tracking_args.per_device_train_batch_size = runtime_spec.optimizer_micro_batch_size_per_gpu
+    tracking_args.per_device_eval_batch_size = 1
+    tracking_args.max_epochs = None
+    tracking_args.eval_every_n_steps = args.validation_every_n_steps
+    tracking_args.save_every_n_steps = args.save_every_n_steps
+    tracking_args.rollout_execution_mode = "batch_first"
+    tracking_args.rollout_query_batch_size = algorithm.queries_per_step
+    tracking_args.rollout_group_size = algorithm.rollouts_per_query
+    tracking_args.rollout_total_trajectories_target = algorithm.total_trajectories
+    tracking_args.target_global_world_size = runtime_spec.target_world_size
+    tracking_args.actual_rollout_group_size = algorithm.rollouts_per_query
+    tracking_args.actual_global_unique_proteins_per_step = algorithm.queries_per_step
+    tracking_args.actual_global_num_trajectories_per_step = algorithm.total_trajectories
+    tracking_args.global_unique_proteins_per_step = algorithm.queries_per_step
+    tracking_args.global_num_trajectories_per_step = algorithm.total_trajectories
+    tracking_args.paper_faithful_batch_shape = algorithm.total_trajectories == 192
+    tracking_args.paper_faithful_hardware_shape = runtime_spec.target_world_size == 8
+    tracking_args.paper_faithful_runtime_stack = runtime_spec.runtime_stack == "deepspeed_vllm_colocate"
+    tracking_args.paper_faithful_execution_mode = True
+    tracking_args.paper_faithful_ready = float(
+        tracking_args.paper_faithful_batch_shape
+        and tracking_args.paper_faithful_hardware_shape
+        and tracking_args.paper_faithful_runtime_stack
+        and tracking_args.paper_faithful_execution_mode
+    )
+    tracking_args.loss_type = "dr_grpo"
+    tracking_args.num_generations = algorithm.rollouts_per_query
+    tracking_args.reward_funcs = "ia_weighted_f1"
+    tracking_args.reward_weights = "1.0"
+    tracking_args.reward_scaling = "batch"
+    tracking_args.reward_final_answer_only = True
+    tracking_args.reward_prediction_source = "final_answer_block"
+    tracking_args.require_ia_file = False
+    tracking_args.advantage_epsilon_std = algorithm.reward_std_epsilon
+    tracking_args.importance_sampling_level = "sequence"
+    tracking_args.max_eval_samples = args.validation_num_proteins
+    tracking_args.eval_sample_strategy = "full_validation_split"
+    tracking_args.distributed_enabled = runtime.enabled
+    tracking_args.distributed_strategy = "deepspeed" if runtime.enabled else "single_gpu_debug"
+    tracking_args.multimodal_cache_enabled = True
+    tracking_args.ref_logprob_cache_enabled = True
+    tracking_args.max_steps = args.max_steps
+    tracking_args.rollout_backend = args.rollout_backend
+    tracking_args.rollout_logprob_microbatch_size = int(args.rollout_logprob_microbatch_size)
+    tracking_args.max_loss_completion_tokens = int(args.max_loss_completion_tokens)
+    tracking_args.vllm_enable_sleep_mode = bool(args.vllm_enable_sleep_mode)
+    tracking_args.vllm_sleep_level = int(args.vllm_sleep_level)
+    tracking_args.vllm_attention_backend = normalize_text(args.vllm_attention_backend).strip() or ""
+    tracking_args.vllm_worker_multiproc_method = normalize_text(args.vllm_worker_multiproc_method).strip() or "spawn"
+    tracking_args.vllm_use_v1 = bool(args.vllm_use_v1)
+
+    config = build_training_tracking_config(tracking_args, run_name=run_name, job_type="train_rl")
+    config.update(
+        {
+            "algorithm": "DR-GRPO",
+            "queries_per_step": algorithm.queries_per_step,
+            "rollouts_per_query": algorithm.rollouts_per_query,
+            "total_trajectories_per_step": algorithm.total_trajectories,
+            "steps_per_generation": algorithm.steps_per_generation,
+            "num_iterations": algorithm.num_iterations,
+            "clip_epsilon_low": algorithm.clip_epsilon_low,
+            "clip_epsilon_high": algorithm.clip_epsilon_high,
+            "importance_sampling_cap": algorithm.importance_sampling_cap,
+            "kl_beta": algorithm.kl_beta,
+            "max_new_tokens": algorithm.max_new_tokens,
+            "optimizer_micro_batch_size_per_gpu": runtime_spec.optimizer_micro_batch_size_per_gpu,
+            "target_world_size": runtime_spec.target_world_size,
+            "world_size": runtime.world_size,
+            "zero_stage": runtime_spec.zero_stage,
+            "reward_extraction": "final_answer_block_only",
+            "wandb_project": args.wandb_project,
+            "weave_project": args.weave_project,
+            "rollout_backend": args.rollout_backend,
+            "rollout_logprob_microbatch_size": int(args.rollout_logprob_microbatch_size),
+            "max_loss_completion_tokens": int(args.max_loss_completion_tokens),
+            "vllm_enable_sleep_mode": bool(args.vllm_enable_sleep_mode),
+            "vllm_sleep_level": int(args.vllm_sleep_level),
+            "vllm_cpu_offload_gb": float(args.vllm_cpu_offload_gb),
+            "vllm_swap_space_gb": float(args.vllm_swap_space_gb),
+            "vllm_enforce_eager": bool(args.vllm_enforce_eager),
+            "vllm_attention_backend": normalize_text(args.vllm_attention_backend).strip() or "<auto>",
+            "vllm_worker_multiproc_method": normalize_text(args.vllm_worker_multiproc_method).strip() or "spawn",
+            "vllm_use_v1": bool(args.vllm_use_v1),
+        }
+    )
+    return config
+
+
+def build_trace_path(output_dir: Path, trace_jsonl_name: str, runtime: DistributedRuntime) -> Path:
+    trace_name = normalize_text(trace_jsonl_name).strip() or "rollout_traces.jsonl"
+    base = Path(trace_name)
+    if runtime.world_size <= 1:
+        return output_dir / base
+    stem = base.stem or "rollout_traces"
+    suffix = base.suffix or ".jsonl"
+    return output_dir / f"{stem}.rank{runtime.rank:02d}{suffix}"
+
+
+class RunTracker:
+    def __init__(self, args: argparse.Namespace, config: Mapping[str, Any], output_dir: Path, runtime: DistributedRuntime) -> None:
+        self.args = args
+        self.config = dict(config)
+        self.output_dir = output_dir
+        self.runtime = runtime
+        self.trace_path = build_trace_path(output_dir, args.trace_jsonl_name, runtime)
+        self.trace_path.parent.mkdir(parents=True, exist_ok=True)
+        self.wandb_run = None
+        self.weave_client = None
+        self.weave_project = ""
+        self.weave_trace_fn = None
+        self.weave_reward_trace_fn = None
+        self.weave_scoring_trace_fn = None
+        self.weave_update_trace_fn = None
+        self._weave_stage_callbacks: Dict[str, Any] = {}
+        self.weave_remaining_budget = max(int(getattr(args, "weave_trace_budget", 0)), 0)
+        self.weave_full_group_budget = max(int(getattr(args, "weave_trace_full_group_count", 0)), 0)
+        self.weave_full_group_rollouts = max(int(getattr(args, "weave_trace_full_rollouts_per_group", 0)), 0)
+        self.weave_groups_logged = 0
+        self.weave_rollouts_logged = 0
+
+        self.trace_path.write_text("", encoding="utf-8")
+        self._configure_weave_cache_dir()
+
+        if runtime.rank == 0:
+            self.wandb_run = self._maybe_init_wandb(config)
+            if self.wandb_run is not None:
+                self._maybe_register_input_artifacts()
+        self.weave_trace_fn = self._maybe_init_weave()
+
+    def _configure_weave_cache_dir(self) -> Optional[str]:
+        project = resolve_weave_project(self.args)
+        if not project:
+            return None
+        cache_dir = Path(ensure_weave_server_cache_dir(self.output_dir))
+        if self.runtime.world_size > 1:
+            cache_dir = cache_dir / f"rank{self.runtime.rank:02d}"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            os.environ["WEAVE_SERVER_CACHE_DIR"] = str(cache_dir.resolve())
+        return str(cache_dir.resolve())
+
+    def _maybe_init_wandb(self, config: Mapping[str, Any]) -> Any:
+        try:
+            import wandb
+        except ImportError:
+            return None
+
+        init_kwargs = {
+            "project": self.args.wandb_project,
+            "entity": self.args.wandb_entity,
+            "config": dict(config),
+            "name": self.args.run_name,
+            "job_type": "train_rl",
+        }
+        if normalize_text(self.args.wandb_mode).strip():
+            init_kwargs["mode"] = self.args.wandb_mode
+        return wandb.init(**init_kwargs)
+
+    def _maybe_init_weave(self) -> Any:
+        if weave is None or not self.args.trace_rollouts_to_weave:
+            return None
+        if self.runtime.rank != 0:
+            return None
+        project = resolve_weave_project(self.args)
+        if not project:
+            return None
+        try:
+            self._configure_weave_cache_dir()
+            global_attributes = {
+                "job_type": "train_rl",
+                "run_name": normalize_text(self.args.run_name).strip() or "<auto>",
+                "rank": int(self.runtime.rank),
+                "world_size": int(self.runtime.world_size),
+            }
+            self.weave_project = project
+            self.weave_client = weave.init(project, global_attributes=global_attributes)
+
+            def invoke_stage(stage_name: str) -> Any:
+                callback = self._weave_stage_callbacks.get(stage_name)
+                if not callable(callback):
+                    raise RuntimeError(f"Weave stage tracing expected an active callback for stage={stage_name!r}.")
+                return callback()
+
+            @weave.op(name="train_rl_rollout_generate")
+            def trace_generation(payload: Dict[str, Any]) -> Dict[str, Any]:
+                outputs = [normalize_text(output).strip() for output in invoke_stage("rollout")]
+                return {
+                    "run_name": payload.get("run_name"),
+                    "job_type": "train_rl",
+                    "stage": "rollout",
+                    "step": payload.get("step"),
+                    "rank": payload.get("rank"),
+                    "split": payload.get("split"),
+                    "protein_id": payload.get("protein_id"),
+                    "repeat_count": payload.get("repeat_count"),
+                    "query": payload.get("query"),
+                    "sampling": payload.get("sampling"),
+                    "outputs": outputs,
+                }
+
+            @weave.op(name="train_rl_reward_score")
+            def trace_reward(payload: Dict[str, Any]) -> Dict[str, Any]:
+                rewards = [float(item) for item in invoke_stage("reward")]
+                return {
+                    "run_name": payload.get("run_name"),
+                    "job_type": "train_rl",
+                    "stage": "reward",
+                    "step": payload.get("step"),
+                    "rank": payload.get("rank"),
+                    "split": payload.get("split"),
+                    "protein_id": payload.get("protein_id"),
+                    "target_go_ids": list(payload.get("target_go_ids") or []),
+                    "completions": list(payload.get("completions") or []),
+                    "rewards": rewards,
+                }
+
+            @weave.op(name="train_rl_old_ref_score")
+            def trace_scoring(payload: Dict[str, Any]) -> Dict[str, Any]:
+                summary = dict(invoke_stage("scoring") or {})
+                return {
+                    "run_name": payload.get("run_name"),
+                    "job_type": "train_rl",
+                    "stage": "old_ref_scoring",
+                    "step": payload.get("step"),
+                    "rank": payload.get("rank"),
+                    "split": payload.get("split"),
+                    "protein_id": payload.get("protein_id"),
+                    **summary,
+                }
+
+            @weave.op(name="train_rl_policy_update")
+            def trace_update(payload: Dict[str, Any]) -> Dict[str, Any]:
+                summary = dict(invoke_stage("policy_update") or {})
+                return {
+                    "run_name": payload.get("run_name"),
+                    "job_type": "train_rl",
+                    "stage": "policy_update",
+                    "step": payload.get("step"),
+                    "rank": payload.get("rank"),
+                    "split": payload.get("split"),
+                    **summary,
+                }
+
+            self.weave_reward_trace_fn = trace_reward
+            self.weave_scoring_trace_fn = trace_scoring
+            self.weave_update_trace_fn = trace_update
+            return trace_generation
+        except Exception as exc:
+            print(f"⚠️  Weave init failed for RL tracing: {exc}")
+            self.weave_client = None
+            self.weave_project = ""
+            return None
+
+    def _maybe_register_input_artifacts(self) -> None:
+        from bioreason2.utils.tracking import maybe_use_artifact_refs
+
+        maybe_use_artifact_refs(
+            self.wandb_run,
+            {
+                "temporal_split_artifact": self.args.temporal_split_artifact,
+                "dataset_artifact": self.args.dataset_artifact,
+                "base_checkpoint": normalize_text(self.args.base_checkpoint).strip() or self.args.text_model_name,
+            },
+        )
+
+    def log_metrics(self, metrics: Mapping[str, Any], step: int) -> None:
+        if self.runtime.rank != 0:
+            return
+        if self.wandb_run is not None:
+            self.wandb_run.log(dict(metrics), step=step)
+
+    def claim_full_group_trace(self) -> bool:
+        if not callable(self.weave_trace_fn) or self.weave_remaining_budget <= 0 or self.weave_full_group_budget <= 0:
+            return False
+        self.weave_full_group_budget -= 1
+        self.weave_groups_logged += 1
+        return True
+
+    def _build_weave_attributes(
+        self,
+        *,
+        stage: str,
+        step: int,
+        split: str,
+        protein_id: str,
+    ) -> Dict[str, Any]:
+        return {
+            "job_type": "train_rl",
+            "stage": normalize_text(stage).strip(),
+            "run_name": normalize_text(self.args.run_name).strip() or "<auto>",
+            "step": int(step),
+            "rank": int(self.runtime.rank),
+            "split": normalize_text(split).strip() or "train",
+            "protein_id": normalize_text(protein_id).strip(),
+        }
+
+    def _trace_weave_stage(
+        self,
+        *,
+        stage_name: str,
+        weave_fn: Any,
+        payload: Mapping[str, Any],
+        callback: Any,
+        attributes: Mapping[str, Any],
+        decrement_rollout_budget: bool = False,
+    ) -> Any:
+        if not callable(weave_fn) or (decrement_rollout_budget and self.weave_remaining_budget <= 0):
+            return callback()
+        weave_attributes = getattr(weave, "attributes", None)
+        attribute_context = weave_attributes(dict(attributes)) if callable(weave_attributes) else nullcontext()
+        self._weave_stage_callbacks[stage_name] = callback
+        try:
+            with attribute_context:
+                result = weave_fn(dict(payload))
+        finally:
+            self._weave_stage_callbacks.pop(stage_name, None)
+        if decrement_rollout_budget:
+            self.weave_remaining_budget -= 1
+            self.weave_rollouts_logged += 1
+        return result
+
+    def trace_rollout_call(
+        self,
+        *,
+        step: int,
+        split: str,
+        query: PreparedQuery,
+        repeat_count: int,
+        sampling: SamplingSpec,
+        generator: Any,
+    ) -> List[str]:
+        if not callable(self.weave_trace_fn) or self.weave_remaining_budget <= 0:
+            return [normalize_text(output).strip() for output in generator()]
+
+        protein_id = normalize_text(query.sample_meta.get("protein_id")).strip()
+        call_payload = {
+            "run_name": normalize_text(self.args.run_name).strip() or "<auto>",
+            "job_type": "train_rl",
+            "stage": "rollout",
+            "step": int(step),
+            "rank": int(self.runtime.rank),
+            "split": normalize_text(split).strip() or "train",
+            "protein_id": protein_id,
+            "repeat_count": int(repeat_count),
+            "query": {
+                "prompt_text": normalize_text(query.prompt_text),
+                "go_aspects": [normalize_text(aspect) for aspect in query.go_aspects],
+                "sample_meta": traceable_sample_meta(
+                    query.sample_meta,
+                    allowed_keys=ROLLOUT_TRACE_SAMPLE_META_KEYS,
+                ),
+            },
+            "sampling": asdict(sampling),
+        }
+        result = self._trace_weave_stage(
+            stage_name="rollout",
+            weave_fn=self.weave_trace_fn,
+            payload=call_payload,
+            callback=lambda: [normalize_text(output).strip() for output in generator()],
+            attributes=self._build_weave_attributes(
+                stage="rollout",
+                step=step,
+                split=split,
+                protein_id=protein_id,
+            ),
+            decrement_rollout_budget=True,
+        )
+        return [normalize_text(output).strip() for output in result.get("outputs", [])]
+
+    def trace_reward_call(
+        self,
+        *,
+        step: int,
+        split: str,
+        query: PreparedQuery,
+        completions: Sequence[str],
+        callback: Any,
+    ) -> List[float]:
+        protein_id = normalize_text(query.sample_meta.get("protein_id")).strip()
+        payload = {
+            "run_name": normalize_text(self.args.run_name).strip() or "<auto>",
+            "job_type": "train_rl",
+            "stage": "reward",
+            "step": int(step),
+            "rank": int(self.runtime.rank),
+            "split": normalize_text(split).strip() or "train",
+            "protein_id": protein_id,
+            "target_go_ids": build_target_go_ids(query.sample_meta),
+            "completions": [normalize_text(completion).strip() for completion in completions],
+        }
+        result = self._trace_weave_stage(
+            stage_name="reward",
+            weave_fn=self.weave_reward_trace_fn,
+            payload=payload,
+            callback=callback,
+            attributes=self._build_weave_attributes(
+                stage="reward",
+                step=step,
+                split=split,
+                protein_id=protein_id,
+            ),
+        )
+        if isinstance(result, Mapping):
+            return [float(item) for item in result.get("rewards", [])]
+        return [float(item) for item in result]
+
+    def trace_scoring_call(
+        self,
+        *,
+        step: int,
+        split: str,
+        query: PreparedQuery,
+        payload: Mapping[str, Any],
+        callback: Any,
+    ) -> Mapping[str, Any]:
+        protein_id = normalize_text(query.sample_meta.get("protein_id")).strip()
+        stage_payload = {
+            "run_name": normalize_text(self.args.run_name).strip() or "<auto>",
+            "job_type": "train_rl",
+            "stage": "old_ref_scoring",
+            "step": int(step),
+            "rank": int(self.runtime.rank),
+            "split": normalize_text(split).strip() or "train",
+            "protein_id": protein_id,
+            **dict(payload),
+        }
+        result = self._trace_weave_stage(
+            stage_name="scoring",
+            weave_fn=self.weave_scoring_trace_fn,
+            payload=stage_payload,
+            callback=callback,
+            attributes=self._build_weave_attributes(
+                stage="old_ref_scoring",
+                step=step,
+                split=split,
+                protein_id=protein_id,
+            ),
+        )
+        return dict(result or {})
+
+    def trace_policy_update_call(
+        self,
+        *,
+        step: int,
+        split: str,
+        callback: Any,
+        payload: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        stage_payload = {
+            "run_name": normalize_text(self.args.run_name).strip() or "<auto>",
+            "job_type": "train_rl",
+            "stage": "policy_update",
+            "step": int(step),
+            "rank": int(self.runtime.rank),
+            "split": normalize_text(split).strip() or "train",
+            **dict(payload),
+        }
+        result = self._trace_weave_stage(
+            stage_name="policy_update",
+            weave_fn=self.weave_update_trace_fn,
+            payload=stage_payload,
+            callback=callback,
+            attributes=self._build_weave_attributes(
+                stage="policy_update",
+                step=step,
+                split=split,
+                protein_id="",
+            ),
+        )
+        return dict(result or {})
+
+    def log_rollout_trace(self, payload: Mapping[str, Any], trace_to_weave: bool = True) -> None:
+        payload_dict = dict(payload)
+        payload_dict.setdefault("run_name", normalize_text(self.args.run_name).strip() or "<auto>")
+        payload_dict.setdefault("job_type", "train_rl")
+        if self.weave_project:
+            payload_dict.setdefault("weave_project", self.weave_project)
+        line = json.dumps(payload_dict, ensure_ascii=True)
+        with self.trace_path.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+        _ = trace_to_weave
+
+    def log_checkpoint_artifact(self, checkpoint_dir: Path, aliases: Sequence[str], metadata: Mapping[str, Any]) -> None:
+        if self.runtime.rank != 0 or self.wandb_run is None:
+            return
+        try:
+            import wandb
+        except ImportError:
+            return
+        artifact = wandb.Artifact(
+            normalize_text(self.args.checkpoint_artifact_name).strip() or "train-rl-output",
+            type="model",
+            metadata=dict(metadata),
+        )
+        artifact.add_dir(str(checkpoint_dir))
+        self.wandb_run.log_artifact(artifact, aliases=list(aliases))
+
+    def finish(self) -> None:
+        if self.weave_client is not None:
+            flush = getattr(self.weave_client, "flush", None)
+            if callable(flush):
+                try:
+                    flush()
+                except Exception:
+                    pass
+        if self.runtime.rank == 0 and self.wandb_run is not None:
+            self.wandb_run.finish()
+
+
+def load_reasoning_datasets(args: argparse.Namespace) -> Tuple[Any, Any]:
+    from bioreason2.dataset.cafa5.load import load_cafa5_dataset
+
+    train_dataset, validation_dataset, _ = load_cafa5_dataset(
+        dataset=args.cafa5_dataset,
+        dataset_name=args.reasoning_dataset_name,
+        cache_dir=args.dataset_cache_dir,
+        structure_dir=args.structure_dir,
+        num_proc=resolve_dataset_num_proc(args.dataset_num_proc),
+        return_as_chat_template=True,
+        include_go_defs=False,
+        interpro_dataset_name=args.interpro_dataset_name,
+        split_go_aspects=False,
+        include_protein_function_summary=True,
+        interpro_in_prompt=True,
+        ppi_in_prompt=True,
+        predict_interpro=False,
+        reasoning_dataset_name=args.reasoning_dataset_name,
+        go_gpt_predictions_column=args.go_gpt_predictions_column,
+        include_ground_truth_in_final_answer=False,
+        add_uniprot_summary=False,
+        is_swissprot=False,
+        reasoning_prompt_style="paper_native",
+    )
+    return train_dataset, validation_dataset
+
+
+def disable_model_dropout(module: Any) -> None:
+    require_torch()
+    for child in module.modules():
+        if isinstance(child, torch.nn.Dropout):
+            child.p = 0.0
+
+
+def apply_lora_to_text_model(model: Any, args: argparse.Namespace, trainable: bool) -> None:
+    from peft import LoraConfig, get_peft_model
+    from bioreason2.models.protein_llm import _get_target_modules
+
+    lora_config = LoraConfig(
+        r=int(args.lora_rank),
+        lora_alpha=int(args.lora_alpha),
+        lora_dropout=float(args.lora_dropout),
+        target_modules=_get_target_modules(model),
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    model.text_model = get_peft_model(model.text_model, lora_config)
+    if trainable:
+        model.text_model.train()
+    else:
+        model.text_model.eval()
+        for param in model.text_model.parameters():
+            param.requires_grad = False
+
+
+def instantiate_policy_model(args: argparse.Namespace, trainable: bool) -> Any:
+    from bioreason2.models.protein_llm import ProteinLLMModel
+
+    model = ProteinLLMModel(
+        text_model_name=args.text_model_name,
+        protein_model_name=args.protein_model_name,
+        cache_dir=args.cache_dir,
+        max_length_protein=int(args.max_length_protein),
+        max_length_text=int(args.max_length_text),
+        text_model_finetune=True,
+        protein_model_finetune=False,
+        protein_embedding_layer=int(args.protein_embedding_layer),
+        go_model_finetune=False,
+        attn_implementation=normalize_text(args.attn_implementation).strip() or "auto",
+        go_obo_path=args.go_obo_path,
+        precomputed_embeddings_path=args.precomputed_embeddings_path,
+        go_hidden_dim=int(args.go_hidden_dim),
+        go_num_gat_layers=int(args.go_num_gat_layers),
+        go_num_heads=int(args.go_num_heads),
+        go_num_reduced_embeddings=int(args.go_num_reduced_embeddings),
+        go_embedding_dim=int(args.go_embedding_dim),
+        quantization_config=None,
+        load_in_4bit=False,
+        unified_go_encoder=bool(args.unified_go_encoder),
+        use_unsloth=False,
+    )
+    apply_lora_to_text_model(model, args, trainable=trainable)
+    if args.disable_model_dropout:
+        disable_model_dropout(model.text_model)
+    if args.gradient_checkpointing and trainable:
+        enable_gc = getattr(model.text_model, "gradient_checkpointing_enable", None)
+        if callable(enable_gc):
+            try:
+                enable_gc(gradient_checkpointing_kwargs={"use_reentrant": False})
+            except TypeError:
+                enable_gc()
+        config = getattr(model.text_model, "config", None)
+        if config is not None and hasattr(config, "use_cache"):
+            config.use_cache = False
+    if not trainable:
+        model.eval()
+        for param in model.parameters():
+            param.requires_grad = False
+    return model
+
+
+def build_deepspeed_config(args: argparse.Namespace, runtime_spec: RuntimeSpec) -> Dict[str, Any]:
+    return {
+        "train_micro_batch_size_per_gpu": runtime_spec.optimizer_micro_batch_size_per_gpu,
+        "gradient_accumulation_steps": runtime_spec.gradient_accumulation_steps,
+        "gradient_clipping": float(args.max_grad_norm),
+        "bf16": {"enabled": bool(runtime_spec.bf16)},
+        "zero_optimization": {
+            "stage": int(runtime_spec.zero_stage),
+            "overlap_comm": True,
+            "contiguous_gradients": True,
+        },
+        "steps_per_print": 1,
+    }
+
+
+@dataclass
+class PolicyStack:
+    engine: Any
+    old_policy: Any
+    ref_policy: Any
+    tokenizer: Any
+    pad_token_id: int
+
+
+def initialize_policy_stack(
+    args: argparse.Namespace,
+    runtime_spec: RuntimeSpec,
+    runtime: DistributedRuntime,
+) -> PolicyStack:
+    require_torch()
+    import deepspeed
+    from transformers import get_cosine_schedule_with_warmup
+
+    current_model = instantiate_policy_model(args, trainable=True)
+    initial_state = copy.deepcopy(current_model.state_dict())
+
+    old_policy = instantiate_policy_model(args, trainable=False)
+    old_policy.load_state_dict(initial_state, strict=False)
+
+    ref_policy = instantiate_policy_model(args, trainable=False)
+    ref_policy.load_state_dict(initial_state, strict=False)
+
+    current_model.to(runtime.device)
+    old_policy.to("cpu")
+    ref_policy.to("cpu")
+
+    trainable_parameters = [param for param in current_model.parameters() if param.requires_grad]
+    optimizer = torch.optim.AdamW(
+        trainable_parameters,
+        lr=float(args.learning_rate),
+        weight_decay=float(args.weight_decay),
+        betas=(float(args.adam_beta1), float(args.adam_beta2)),
+        eps=float(args.adam_epsilon),
+    )
+    total_optimizer_steps = int(args.max_steps) * int(args.steps_per_generation)
+    warmup_steps = max(int(total_optimizer_steps * float(args.warmup_ratio)), 1)
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=max(total_optimizer_steps, 1),
+    )
+    engine, _, _, _ = deepspeed.initialize(
+        model=current_model,
+        model_parameters=trainable_parameters,
+        optimizer=optimizer,
+        lr_scheduler=scheduler,
+        config=build_deepspeed_config(args, runtime_spec),
+    )
+    tokenizer = engine.module.text_tokenizer
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    return PolicyStack(
+        engine=engine,
+        old_policy=old_policy,
+        ref_policy=ref_policy,
+        tokenizer=tokenizer,
+        pad_token_id=int(pad_token_id),
     )
 
 
-def compute_completion_token_log_probs(
-    model: Any,
-    input_ids: Any,
-    attention_mask: Any,
-    prompt_len: int,
-    protein_sequences: Sequence[str],
-    batch_idx_map: Sequence[int],
-    structure_coords: Any,
-    go_aspects: Sequence[str],
-    multimodal_cache: Optional[Dict[str, Any]] = None,
-) -> Any:
-    import torch
-    import torch.nn.functional as F
+def unwrap_model(model: Any) -> Any:
+    return getattr(model, "module", model)
 
-    outputs = model(
+
+def move_model_to_device(model: Any, device: Any) -> Any:
+    if hasattr(model, "to"):
+        model.to(device)
+    return model
+
+
+def offload_model_to_cpu(model: Any) -> Any:
+    if hasattr(model, "to"):
+        model.to("cpu")
+    gc.collect()
+    if torch is not None and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return model
+
+
+def build_single_example_batch(example: Mapping[str, Any], model: Any) -> Dict[str, Any]:
+    from bioreason2.dataset.cafa5.collate import qwen_protein_collate_fn
+
+    return qwen_protein_collate_fn(
+        [dict(example)],
+        processor=unwrap_model(model).processor,
+        max_length_text=int(unwrap_model(model).max_length_text),
+        max_length_protein=int(unwrap_model(model).max_length_protein),
+        return_answer_in_batch=False,
+        inference_mode=True,
+    )
+
+
+def extract_single_query(batch: Mapping[str, Any], model: Any, device: Any) -> PreparedQuery:
+    require_torch()
+    prompt_mask = batch["attention_mask"][0].bool()
+    input_ids = batch["input_ids"][0][prompt_mask].unsqueeze(0).to(device)
+    attention_mask = torch.ones_like(input_ids, device=device)
+    structure_coords = batch.get("structure_coords")
+    if isinstance(structure_coords, torch.Tensor):
+        structure_coords = structure_coords[0:1].to(device)
+    query = PreparedQuery(
         input_ids=input_ids,
         attention_mask=attention_mask,
-        protein_sequences=list(protein_sequences),
-        batch_idx_map=list(batch_idx_map),
+        protein_sequences=list(batch.get("protein_sequences") or []),
+        batch_idx_map=[0 for _ in list(batch.get("protein_sequences") or [])],
         structure_coords=structure_coords,
-        go_aspects=list(go_aspects),
-        multimodal_cache=multimodal_cache,
+        go_aspects=[normalize_text((batch.get("batch_go_aspects") or ["all"])[0]).strip() or "all"],
+        sample_meta=build_query_sample_meta(batch),
+        prompt_text=normalize_text((batch.get("prompt") or [""])[0]),
     )
-    logits = outputs.logits[:, :-1, :]
-    targets = input_ids[:, 1:]
-    token_log_probs = F.log_softmax(logits, dim=-1).gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+    query.multimodal_cache = unwrap_model(model).build_multimodal_cache(
+        protein_sequences=query.protein_sequences,
+        batch_idx_map=query.batch_idx_map,
+        batch_size=1,
+        structure_coords=query.structure_coords,
+        go_aspects=query.go_aspects,
+    )
+    return query
 
-    start_index = max(prompt_len - 1, 0)
-    return token_log_probs[:, start_index:]
+
+def repeat_multimodal_cache(cache: Optional[Dict[str, Any]], repeat_count: int) -> Optional[Dict[str, Any]]:
+    if cache is None:
+        return None
+    if repeat_count <= 0:
+        raise ValueError(f"repeat_count must be positive, got {repeat_count}")
+    protein_embeddings = cache.get("protein_embeddings")
+    go_embeddings = cache.get("go_embeddings")
+    expanded: Dict[str, Any] = {
+        "batch_size": repeat_count,
+        "protein_embeddings": None,
+        "go_embeddings": None,
+    }
+    if protein_embeddings:
+        expanded["protein_embeddings"] = [protein_embeddings[0] for _ in range(repeat_count)]
+    if go_embeddings:
+        expanded["go_embeddings"] = [go_embeddings[0] for _ in range(repeat_count)]
+    return expanded
 
 
-def compute_batched_completion_kl(
-    model: Any,
-    ref_model: Any,
-    prompt_input_ids: Any,
-    prompt_attention_mask: Any,
-    completion_ids_list: Sequence[Any],
-    protein_sequences: Sequence[str],
-    batch_idx_map: Sequence[int],
-    structure_coords: Any,
-    go_aspects: Sequence[str],
+def repeat_query_for_rollouts(query: PreparedQuery, repeat_count: int, device: Any) -> Dict[str, Any]:
+    require_torch()
+    input_ids = query.input_ids.repeat(repeat_count, 1).to(device)
+    attention_mask = query.attention_mask.repeat(repeat_count, 1).to(device)
+
+    structure_coords = query.structure_coords
+    if isinstance(structure_coords, torch.Tensor):
+        repeat_dims = [repeat_count] + [1] * max(structure_coords.dim() - 1, 0)
+        structure_coords = structure_coords.repeat(*repeat_dims).to(device)
+
+    protein_sequences: List[str] = []
+    batch_idx_map: List[int] = []
+    for rollout_idx in range(repeat_count):
+        protein_sequences.extend(query.protein_sequences)
+        batch_idx_map.extend([rollout_idx] * len(query.protein_sequences))
+
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "protein_sequences": protein_sequences,
+        "batch_idx_map": batch_idx_map,
+        "structure_coords": structure_coords,
+        "go_aspects": query.go_aspects * repeat_count,
+        "multimodal_cache": repeat_multimodal_cache(query.multimodal_cache, repeat_count),
+    }
+
+
+def tokenize_completion_texts(tokenizer: Any, completions: Sequence[str], device: Any) -> List[Any]:
+    require_torch()
+    encoded: List[Any] = []
+    for completion in completions:
+        token_ids = tokenizer.encode(normalize_text(completion), add_special_tokens=False)
+        encoded.append(torch.tensor(token_ids, dtype=torch.long, device=device))
+    return encoded
+
+
+def build_scoring_batch(
+    query: PreparedQuery,
+    completion_ids: Sequence[Any],
     pad_token_id: int,
-) -> float:
-    import torch
+    device: Any,
+) -> Dict[str, Any]:
+    require_torch()
 
-    if ref_model is None:
-        return 0.0
+    prompt_ids = query.input_ids[0].to(device)
+    prompt_len = int(prompt_ids.numel())
+    max_completion_len = max((int(item.numel()) for item in completion_ids), default=0)
+    total_len = prompt_len + max_completion_len
 
-    max_completion_len = max((int(completion_ids.numel()) for completion_ids in completion_ids_list), default=0)
-    if max_completion_len <= 0:
-        return 0.0
+    batch_size = len(completion_ids)
+    input_ids = torch.full((batch_size, total_len), int(pad_token_id), dtype=prompt_ids.dtype, device=device)
+    attention_mask = torch.zeros((batch_size, total_len), dtype=query.attention_mask.dtype, device=device)
+    completion_mask = torch.zeros((batch_size, total_len - 1), dtype=torch.float32, device=device)
 
-    completion_batch = torch.full(
-        (len(completion_ids_list), max_completion_len),
-        int(pad_token_id),
-        dtype=prompt_input_ids.dtype,
-        device=prompt_input_ids.device,
-    )
-    completion_attention = torch.zeros(
-        (len(completion_ids_list), max_completion_len),
-        dtype=prompt_attention_mask.dtype,
-        device=prompt_attention_mask.device,
-    )
+    for row_idx, completion in enumerate(completion_ids):
+        completion = completion.to(device)
+        row_len = prompt_len + int(completion.numel())
+        input_ids[row_idx, :prompt_len] = prompt_ids
+        attention_mask[row_idx, :row_len] = 1
+        if completion.numel() > 0:
+            input_ids[row_idx, prompt_len:row_len] = completion
+            start_idx = max(prompt_len - 1, 0)
+            end_idx = start_idx + int(completion.numel())
+            completion_mask[row_idx, start_idx:end_idx] = 1.0
 
-    for example_idx, completion_ids in enumerate(completion_ids_list):
-        completion_len = int(completion_ids.numel())
-        if completion_len <= 0:
-            continue
-        completion_tensor = completion_ids.to(device=prompt_input_ids.device, dtype=prompt_input_ids.dtype)
-        completion_batch[example_idx, :completion_len] = completion_tensor
-        completion_attention[example_idx, :completion_len] = 1
+    structure_coords = query.structure_coords
+    if isinstance(structure_coords, torch.Tensor):
+        repeat_dims = [batch_size] + [1] * max(structure_coords.dim() - 1, 0)
+        structure_coords = structure_coords.repeat(*repeat_dims).to(device)
 
-    combined_input_ids = torch.cat([prompt_input_ids, completion_batch], dim=1)
-    combined_attention_mask = torch.cat([prompt_attention_mask, completion_attention], dim=1)
-    prompt_len = prompt_input_ids.shape[1]
+    protein_sequences: List[str] = []
+    batch_idx_map: List[int] = []
+    for row_idx in range(batch_size):
+        protein_sequences.extend(query.protein_sequences)
+        batch_idx_map.extend([row_idx] * len(query.protein_sequences))
 
-    current_lp = compute_completion_token_log_probs(
-        model,
-        combined_input_ids,
-        combined_attention_mask,
-        prompt_len,
-        protein_sequences,
-        batch_idx_map,
-        structure_coords,
-        go_aspects,
-    )
-    ref_lp = compute_completion_token_log_probs(
-        ref_model,
-        combined_input_ids,
-        combined_attention_mask,
-        prompt_len,
-        protein_sequences,
-        batch_idx_map,
-        structure_coords,
-        go_aspects,
-    )
-    valid_mask = completion_attention.bool()
-    if not torch.any(valid_mask):
-        return 0.0
-
-    kl_term = torch.exp(ref_lp - current_lp) - (ref_lp - current_lp) - 1.0
-    valid_counts = valid_mask.sum(dim=1)
-    per_example_kl = (kl_term * valid_mask.to(dtype=kl_term.dtype)).sum(dim=1) / valid_counts.clamp_min(1).to(
-        dtype=kl_term.dtype
-    )
-    return float(per_example_kl[valid_counts > 0].sum().item())
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "completion_mask": completion_mask,
+        "protein_sequences": protein_sequences,
+        "batch_idx_map": batch_idx_map,
+        "structure_coords": structure_coords,
+        "go_aspects": query.go_aspects * batch_size,
+        "multimodal_cache": repeat_multimodal_cache(query.multimodal_cache, batch_size),
+    }
 
 
-def compute_rollout_policy_statistics(
+def compute_sequence_log_probs(
     model: Any,
-    rollout_group: Mapping[str, Any],
+    query: PreparedQuery,
+    completion_ids: Sequence[Any],
+    pad_token_id: int,
+    device: Any,
     microbatch_size: int = 0,
-) -> Tuple[Any, Any, Any]:
-    import torch
+) -> Any:
+    require_torch()
 
-    def _compute(subgroup: Mapping[str, Any]) -> Tuple[Any, Any, Any]:
-        token_log_probs = compute_completion_token_log_probs(
-            model,
-            subgroup["combined_input_ids"],
-            subgroup["combined_attention_mask"],
-            subgroup["prompt_token_len"],
-            subgroup["protein_sequences"],
-            subgroup["batch_idx_map"],
-            subgroup["structure_coords"],
-            subgroup["go_aspects"],
-            subgroup.get("multimodal_cache"),
+    def _compute(subgroup_completion_ids: Sequence[Any]) -> Any:
+        scoring_batch = build_scoring_batch(query, subgroup_completion_ids, pad_token_id, device)
+        outputs = model(
+            input_ids=scoring_batch["input_ids"],
+            attention_mask=scoring_batch["attention_mask"],
+            protein_sequences=scoring_batch["protein_sequences"],
+            batch_idx_map=scoring_batch["batch_idx_map"],
+            structure_coords=scoring_batch["structure_coords"],
+            go_aspects=scoring_batch["go_aspects"],
+            multimodal_cache=scoring_batch["multimodal_cache"],
         )
-        token_mask = subgroup["completion_attention"].to(device=token_log_probs.device, dtype=token_log_probs.dtype)
-        sequence_log_probs = (token_log_probs * token_mask).sum(dim=1)
-        valid_counts = token_mask.sum(dim=1).clamp_min(1.0)
-        return token_log_probs, sequence_log_probs, valid_counts
+        logits = outputs.logits[:, :-1, :]
+        targets = scoring_batch["input_ids"][:, 1:]
+        token_log_probs = F.log_softmax(logits, dim=-1).gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+        return (token_log_probs * scoring_batch["completion_mask"]).sum(dim=1)
 
-    total_rollouts = int(rollout_group["combined_input_ids"].shape[0])
+    total_rollouts = len(completion_ids)
+    if total_rollouts == 0:
+        return torch.zeros((0,), dtype=torch.float32, device=device)
     if microbatch_size <= 0 or total_rollouts <= microbatch_size:
-        return _compute(rollout_group)
+        return _compute(completion_ids)
 
-    token_chunks: List[Any] = []
     sequence_chunks: List[Any] = []
-    count_chunks: List[Any] = []
     for start_idx in range(0, total_rollouts, microbatch_size):
-        subgroup = slice_rollout_group(rollout_group, start_idx, min(total_rollouts, start_idx + microbatch_size))
-        token_log_probs, sequence_log_probs, valid_counts = _compute(subgroup)
-        token_chunks.append(token_log_probs)
-        sequence_chunks.append(sequence_log_probs)
-        count_chunks.append(valid_counts)
-
-    return (
-        torch.cat(token_chunks, dim=0),
-        torch.cat(sequence_chunks, dim=0),
-        torch.cat(count_chunks, dim=0),
-    )
+        end_idx = min(total_rollouts, start_idx + microbatch_size)
+        sequence_chunks.append(_compute(completion_ids[start_idx:end_idx]))
+    return torch.cat(sequence_chunks, dim=0)
 
 
-def compute_old_policy_sequence_log_probs(
-    model: Any,
-    example: Mapping[str, Any],
-    completion_ids_list: Sequence[Any],
+def compute_chunk_loss(
+    current_model: Any,
+    query: PreparedQuery,
+    completion_ids: Sequence[Any],
+    advantages: Any,
+    old_log_probs: Any,
+    ref_log_probs: Any,
+    algorithm: AlgorithmSpec,
     pad_token_id: int,
-    microbatch_size: int = 0,
-    multimodal_cache: Optional[Dict[str, Any]] = None,
-) -> List[float]:
-    import torch
-
-    rollout_group = build_rollout_group_inputs(
-        example,
-        completion_ids_list,
+    device: Any,
+    logprob_microbatch_size: int = 0,
+) -> Tuple[Any, Dict[str, float]]:
+    require_torch()
+    current_log_probs = compute_sequence_log_probs(
+        current_model,
+        query,
+        completion_ids,
         pad_token_id,
-        multimodal_cache=multimodal_cache,
+        device,
+        microbatch_size=logprob_microbatch_size,
     )
-    valid_mask = rollout_group["completion_attention"].bool()
-    if not torch.any(valid_mask.any(dim=1)):
-        return [0.0 for _ in completion_ids_list]
-
-    with torch.no_grad():
-        _, sequence_log_probs, _ = compute_rollout_policy_statistics(
-            model,
-            rollout_group,
-            microbatch_size=microbatch_size,
-        )
-    return [float(value.detach().item()) for value in sequence_log_probs]
-
-
-def precompute_ref_policy_log_probs(
-    ref_model: Any,
-    rollout_group: Mapping[str, Any],
-    *,
-    microbatch_size: int = 0,
-) -> Optional[Any]:
-    import torch
-
-    if ref_model is None:
-        return None
-    valid_mask = rollout_group["completion_attention"].bool()
-    if not torch.any(valid_mask.any(dim=1)):
-        return None
-    with torch.no_grad():
-        ref_log_probs, _, _ = compute_rollout_policy_statistics(
-            ref_model,
-            rollout_group,
-            microbatch_size=microbatch_size,
-        )
-    return ref_log_probs
-
-
-def compute_group_policy_losses_batched(
-    model: Any,
-    ref_model: Any,
-    example: Mapping[str, Any],
-    completion_ids_list: Sequence[Any],
-    advantages: Sequence[float],
-    old_sequence_log_probs: Sequence[float],
-    pad_token_id: int,
-    args: argparse.Namespace,
-    rollout_group: Optional[Mapping[str, Any]] = None,
-    cached_ref_log_probs: Optional[Any] = None,
-) -> Tuple[Any, Dict[str, float], bool]:
-    import torch
-
-    selected_indices = select_rollout_indices_for_loss(
-        completion_ids_list,
-        max_loss_completion_tokens=int(getattr(args, "max_loss_completion_tokens", 0)),
+    ratios = torch.exp(current_log_probs - old_log_probs)
+    if algorithm.importance_sampling_cap > 0:
+        ratios = ratios.clamp(max=float(algorithm.importance_sampling_cap))
+    clipped_ratios = ratios.clamp(
+        min=1.0 - float(algorithm.clip_epsilon_low),
+        max=1.0 + float(algorithm.clip_epsilon_high),
     )
-    filtered_rollouts = float(len(completion_ids_list) - len(selected_indices))
-    if not selected_indices:
-        return (
-            torch.tensor(0.0, device=example["input_ids"].device),
-            {"filtered_rollouts": filtered_rollouts, "valid_rollouts": 0.0},
-            False,
-        )
-
-    if len(selected_indices) != len(completion_ids_list):
-        completion_ids_list = [completion_ids_list[idx] for idx in selected_indices]
-        advantages = [advantages[idx] for idx in selected_indices]
-        old_sequence_log_probs = [old_sequence_log_probs[idx] for idx in selected_indices]
-        if rollout_group is not None:
-            rollout_group = index_rollout_group(rollout_group, selected_indices)
-        if cached_ref_log_probs is not None:
-            cached_ref_log_probs = cached_ref_log_probs.index_select(
-                0,
-                torch.tensor(selected_indices, device=cached_ref_log_probs.device, dtype=torch.long),
-            )
-
-    if rollout_group is None:
-        rollout_group = build_rollout_group_inputs(example, completion_ids_list, pad_token_id)
-    valid_mask = rollout_group["completion_attention"].bool()
-    nonempty_rollouts = valid_mask.any(dim=1)
-    if not torch.any(nonempty_rollouts):
-        return (
-            torch.tensor(0.0, device=example["input_ids"].device),
-            {"filtered_rollouts": filtered_rollouts, "valid_rollouts": 0.0},
-            False,
-        )
-
-    current_log_probs, current_sequence_log_probs, valid_counts = compute_rollout_policy_statistics(
-        model,
-        rollout_group,
-        microbatch_size=args.rollout_logprob_microbatch_size,
+    surrogate = torch.minimum(ratios * advantages, clipped_ratios * advantages)
+    kl = current_log_probs - ref_log_probs
+    loss = (
+        -(surrogate.sum() / algorithm.policy_denominator)
+        + (float(algorithm.kl_beta) * kl.sum() / algorithm.kl_denominator)
     )
-
-    with torch.no_grad():
-        if cached_ref_log_probs is not None:
-            ref_log_probs = cached_ref_log_probs.to(device=current_log_probs.device, dtype=current_log_probs.dtype)
-        elif ref_model is not None:
-            ref_log_probs, _, _ = compute_rollout_policy_statistics(
-                ref_model,
-                rollout_group,
-                microbatch_size=args.rollout_logprob_microbatch_size,
-            )
-        else:
-            ref_log_probs = torch.zeros_like(current_log_probs)
-
-    token_mask = rollout_group["completion_attention"].to(
-        device=current_log_probs.device,
-        dtype=current_log_probs.dtype,
-    )
-    advantage_tensor = torch.tensor(
-        list(advantages),
-        device=current_log_probs.device,
-        dtype=current_log_probs.dtype,
-    )
-    old_sequence_tensor = torch.tensor(
-        list(old_sequence_log_probs),
-        device=current_log_probs.device,
-        dtype=current_log_probs.dtype,
-    )
-    log_ratio = current_sequence_log_probs - old_sequence_tensor
-    ratio = torch.exp(log_ratio)
-    if args.importance_sampling_cap > 0:
-        ratio = ratio.clamp(max=float(args.importance_sampling_cap))
-    clipped_ratio = ratio.clamp(
-        min=1.0 - float(args.clip_epsilon_low),
-        max=1.0 + float(args.clip_epsilon_high),
-    )
-    surrogate = torch.minimum(ratio * advantage_tensor, clipped_ratio * advantage_tensor)
-    kl_term = torch.exp(ref_log_probs - current_log_probs) - (ref_log_probs - current_log_probs) - 1.0
-    sequence_kl = (kl_term * token_mask).sum(dim=1) / valid_counts
-    per_rollout_loss = -(surrogate - float(args.kl_beta) * sequence_kl) / max(float(args.max_new_tokens), 1.0)
-    nonempty_losses = per_rollout_loss[nonempty_rollouts]
     metrics = {
-        "kl_mean": float(sequence_kl[nonempty_rollouts].mean().detach().item()),
-        "ratio_mean": float(ratio[nonempty_rollouts].mean().detach().item()),
-        "ratio_max": float(ratio[nonempty_rollouts].max().detach().item()),
-        "valid_rollouts": float(nonempty_rollouts.sum().item()),
-        "filtered_rollouts": filtered_rollouts,
+        "ratio_mean": float(ratios.detach().mean().item()),
+        "ratio_max": float(ratios.detach().max().item()),
+        "kl_mean": float(kl.detach().mean().item()),
+        "policy_objective_mean": float(surrogate.detach().mean().item()),
     }
-    return nonempty_losses.mean(), metrics, True
+    return loss, metrics
 
 
-def compute_group_policy_losses_sequential(
-    model: Any,
-    ref_model: Any,
-    example: Mapping[str, Any],
-    completion_ids_list: Sequence[Any],
-    advantages: Sequence[float],
-    old_sequence_log_probs: Sequence[float],
-    args: argparse.Namespace,
-    multimodal_cache: Optional[Dict[str, Any]] = None,
-    cached_ref_log_probs: Optional[Any] = None,
-) -> Tuple[Any, Dict[str, float], bool]:
-    import torch
+def save_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(dict(payload), handle, indent=2, sort_keys=True)
 
-    losses: List[Any] = []
-    kl_values: List[float] = []
-    ratio_values: List[float] = []
-    filtered_rollouts = 0.0
-    trainable = False
-    for rollout_idx, (completion_ids, advantage, old_sequence_log_prob) in enumerate(
-        zip(completion_ids_list, advantages, old_sequence_log_probs)
-    ):
-        if int(getattr(args, "max_loss_completion_tokens", 0)) > 0 and int(completion_ids.numel()) > int(
-            getattr(args, "max_loss_completion_tokens", 0)
-        ):
-            filtered_rollouts += 1.0
-            continue
-        if completion_ids.numel() <= 0:
-            continue
-        trainable = True
-        combined_ids, combined_mask, prompt_token_len = build_combined_inputs(
-            example["input_ids"],
-            example["attention_mask"],
-            completion_ids,
-        )
-        current_log_probs = compute_completion_token_log_probs(
-            model,
-            combined_ids,
-            combined_mask,
-            prompt_token_len,
-            example["protein_sequences"],
-            example["batch_idx_map"],
-            example["structure_coords"],
-            example["go_aspects"],
-            multimodal_cache,
-        )
-        with torch.no_grad():
-            if cached_ref_log_probs is not None:
-                ref_log_probs = cached_ref_log_probs[rollout_idx : rollout_idx + 1].to(
-                    device=current_log_probs.device,
-                    dtype=current_log_probs.dtype,
-                )
-            elif ref_model is not None:
-                ref_log_probs = compute_completion_token_log_probs(
-                    ref_model,
-                    combined_ids,
-                    combined_mask,
-                    prompt_token_len,
-                    example["protein_sequences"],
-                    example["batch_idx_map"],
-                    example["structure_coords"],
-                    example["go_aspects"],
-                    multimodal_cache,
-                )
-            else:
-                ref_log_probs = torch.zeros_like(current_log_probs)
 
-        sequence_log_prob = current_log_probs.sum(dim=1).squeeze(0)
-        ratio = torch.exp(sequence_log_prob - float(old_sequence_log_prob))
-        if args.importance_sampling_cap > 0:
-            ratio = ratio.clamp(max=float(args.importance_sampling_cap))
-        clipped_ratio = ratio.clamp(
-            min=1.0 - float(args.clip_epsilon_low),
-            max=1.0 + float(args.clip_epsilon_high),
-        )
-        surrogate = torch.minimum(ratio * float(advantage), clipped_ratio * float(advantage))
-        kl_term = torch.exp(ref_log_probs - current_log_probs) - (ref_log_probs - current_log_probs) - 1.0
-        sequence_kl = kl_term.mean()
-        losses.append(-(surrogate - float(args.kl_beta) * sequence_kl) / max(float(args.max_new_tokens), 1.0))
-        kl_values.append(float(kl_term.mean().detach().item()))
-        ratio_values.append(float(ratio.detach().item()))
+def export_inference_checkpoint(model: Any, export_dir: Path) -> None:
+    require_torch()
+    export_dir = export_dir.resolve()
+    if export_dir.exists():
+        shutil.rmtree(export_dir)
+    export_dir.mkdir(parents=True, exist_ok=False)
 
-    if not losses:
-        return (
-            torch.tensor(0.0, device=example["input_ids"].device),
-            {"filtered_rollouts": filtered_rollouts, "valid_rollouts": 0.0},
-            False,
-        )
-    metrics = {
-        "kl_mean": sum(kl_values) / len(kl_values),
-        "ratio_mean": sum(ratio_values) / len(ratio_values),
-        "ratio_max": max(ratio_values),
-        "valid_rollouts": float(len(losses)),
-        "filtered_rollouts": filtered_rollouts,
+    base_model = copy.deepcopy(unwrap_model(model)).cpu()
+    text_model = base_model.text_model
+    if hasattr(text_model, "merge_and_unload"):
+        text_model = text_model.merge_and_unload()
+        base_model.text_model = text_model
+
+    base_model.text_model.save_pretrained(export_dir, safe_serialization=True)
+    base_model.text_tokenizer.save_pretrained(export_dir)
+    torch.save(base_model.protein_projection.state_dict(), export_dir / "protein_projection.pt")
+    if getattr(base_model, "go_projection", None) is not None:
+        torch.save(base_model.go_projection.state_dict(), export_dir / "go_projection.pt")
+    if getattr(base_model, "go_encoder", None) is not None:
+        torch.save(base_model.go_encoder.state_dict(), export_dir / "go_encoder.pt")
+    protein_model_dir = export_dir / "protein_model"
+    protein_model_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(base_model.protein_model.state_dict(), protein_model_dir / "pytorch_model.bin")
+    del base_model
+    gc.collect()
+
+
+def build_rollout_query_payload(query: PreparedQuery) -> Dict[str, Any]:
+    structure_coords = query.structure_coords
+    if isinstance(structure_coords, torch.Tensor):
+        structure_coords = structure_coords.detach().cpu()
+    return {
+        "input_ids": query.input_ids.detach().cpu(),
+        "attention_mask": query.attention_mask.detach().cpu(),
+        "protein_sequences": list(query.protein_sequences),
+        "batch_idx_map": list(query.batch_idx_map),
+        "structure_coords": structure_coords,
+        "go_aspects": list(query.go_aspects),
     }
-    return torch.stack(losses).mean(), metrics, trainable
 
 
-def generate_rollouts_sequential(
-    model: Any,
-    example: Mapping[str, Any],
-    tokenizer: Any,
-    args: argparse.Namespace,
-    *,
-    global_step: int,
-    epoch_idx: int,
-    prompt_len: int,
-    example_multimodal_cache: Optional[Dict[str, Any]] = None,
-) -> Tuple[List[Any], List[str]]:
-    completion_ids_list: List[Any] = []
-    completions: List[str] = []
-    generation_kwargs = build_generation_kwargs(args, tokenizer, for_eval=False)
-    for rollout_idx in range(args.num_generations):
-        print(
-            "Generating RL rollout: "
-            f"global_step={global_step}, epoch={epoch_idx}, rollout_idx={rollout_idx}, "
-            f"prompt_len={prompt_len}, max_new_tokens={args.max_new_tokens}"
-        )
-        generated_ids = model.generate(
-            input_ids=example["input_ids"],
-            attention_mask=example["attention_mask"],
-            protein_sequences=example["protein_sequences"],
-            batch_idx_map=example["batch_idx_map"],
-            structure_coords=example["structure_coords"],
-            go_aspects=example["go_aspects"],
-            multimodal_cache=example_multimodal_cache,
-            **generation_kwargs,
-        )
-        completion_ids = extract_completion_ids(generated_ids, example["input_ids"])
-        print(
-            "Completed RL rollout generation: "
-            f"global_step={global_step}, rollout_idx={rollout_idx}, completion_tokens={completion_ids.numel()}"
-        )
-        completion_ids_list.append(completion_ids)
-        completions.append(decode_completion(tokenizer, completion_ids))
-    return completion_ids_list, completions
+def query_from_rollout_payload(payload: Mapping[str, Any]) -> PreparedQuery:
+    return PreparedQuery(
+        input_ids=payload["input_ids"],
+        attention_mask=payload["attention_mask"],
+        protein_sequences=list(payload.get("protein_sequences") or []),
+        batch_idx_map=list(payload.get("batch_idx_map") or []),
+        structure_coords=payload.get("structure_coords"),
+        go_aspects=list(payload.get("go_aspects") or []),
+        sample_meta={},
+        prompt_text="",
+        multimodal_cache=None,
+    )
 
 
-def generate_rollouts_for_example(
-    model: Any,
-    example: Mapping[str, Any],
-    tokenizer: Any,
-    args: argparse.Namespace,
-    *,
-    global_step: int,
-    epoch_idx: int,
-    example_multimodal_cache: Optional[Dict[str, Any]] = None,
-) -> Tuple[List[Any], List[str]]:
-    import torch
+def create_vllm_rollout_model(args: argparse.Namespace, checkpoint_dir: Path) -> Any:
+    from bioreason2.models.protein_vllm import ProteinLLMModel as VLLMProteinLLMModel
 
-    prompt_len = example["input_ids"].shape[1]
-    rollout_batch = expand_example_for_rollouts(example, args.num_generations)
-    rollout_multimodal_cache = expand_single_example_multimodal_cache(model, example_multimodal_cache, args.num_generations)
-    generation_kwargs = build_generation_kwargs(args, tokenizer, for_eval=False)
-    if is_distributed_enabled():
-        print(
-            "Distributed RL rollout generation is using sequential mode for stability: "
-            f"global_step={global_step}, epoch={epoch_idx}, num_generations={args.num_generations}"
-        )
-        return generate_rollouts_sequential(
-            model,
-            example,
-            tokenizer,
-            args,
-            global_step=global_step,
-            epoch_idx=epoch_idx,
-            prompt_len=prompt_len,
-            example_multimodal_cache=example_multimodal_cache,
-        )
+    return VLLMProteinLLMModel(
+        ckpt_dir=str(checkpoint_dir),
+        text_model_name=str(checkpoint_dir),
+        protein_model_name=args.protein_model_name,
+        cache_dir=args.cache_dir,
+        max_length_protein=int(args.max_length_protein),
+        max_length_text=int(args.max_length_text),
+        protein_embedding_layer=int(args.protein_embedding_layer),
+        go_obo_path=args.go_obo_path,
+        precomputed_embeddings_path=args.precomputed_embeddings_path,
+        go_hidden_dim=int(args.go_hidden_dim),
+        go_num_gat_layers=int(args.go_num_gat_layers),
+        go_num_heads=int(args.go_num_heads),
+        go_num_reduced_embeddings=int(args.go_num_reduced_embeddings),
+        go_embedding_dim=int(args.go_embedding_dim),
+        unified_go_encoder=bool(args.unified_go_encoder),
+        gpu_memory_utilization=float(args.vllm_gpu_memory_utilization),
+        max_model_len=int(args.vllm_max_model_len),
+        max_num_seqs=max(int(args.vllm_max_num_seqs), int(args.rollouts_per_query)),
+        cpu_offload_gb=float(args.vllm_cpu_offload_gb),
+        swap_space=float(args.vllm_swap_space_gb),
+        enforce_eager=bool(args.vllm_enforce_eager),
+        enable_sleep_mode=bool(args.vllm_enable_sleep_mode),
+        tensor_parallel_size=1,
+        attention_backend=normalize_text(args.vllm_attention_backend).strip() or None,
+        worker_multiproc_method=normalize_text(args.vllm_worker_multiproc_method).strip() or "spawn",
+        use_v1=bool(args.vllm_use_v1),
+    )
+
+
+def cleanup_vllm_rollout_model(model: Any) -> None:
+    if model is None:
+        return
     try:
-        print(
-            "Generating RL rollout batch: "
-            f"global_step={global_step}, epoch={epoch_idx}, num_generations={args.num_generations}, "
-            f"prompt_len={prompt_len}, max_new_tokens={args.max_new_tokens}"
+        shutdown = getattr(model, "shutdown", None)
+        if callable(shutdown):
+            shutdown()
+    except Exception:
+        pass
+    del model
+    gc.collect()
+    if torch is not None and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def rollout_worker_process_main(connection: Any, bootstrap: Mapping[str, Any]) -> None:
+    model = None
+    sleeping = False
+    try:
+        os.environ["CUDA_VISIBLE_DEVICES"] = normalize_text(bootstrap.get("cuda_visible_device")).strip()
+        os.environ["LOCAL_RANK"] = "0"
+        os.environ["RANK"] = "0"
+        os.environ["WORLD_SIZE"] = "1"
+
+        args = argparse.Namespace(**dict(bootstrap.get("args", {})))
+        checkpoint_dir = Path(bootstrap["checkpoint_dir"])
+
+        def load_model(checkpoint_path: Path) -> Any:
+            nonlocal model, sleeping
+            cleanup_vllm_rollout_model(model)
+            model = create_vllm_rollout_model(args, checkpoint_path)
+            sleeping = False
+            return model
+
+        load_model(checkpoint_dir)
+        connection.send({"status": "ready"})
+
+        while True:
+            message = connection.recv()
+            command = normalize_text(message.get("cmd")).strip()
+            if command == "generate":
+                if sleeping and hasattr(model, "wake_up"):
+                    model.wake_up()
+                    sleeping = False
+                query = query_from_rollout_payload(message["query"])
+                sampling = SamplingSpec(**dict(message["sampling"]))
+                rollout_batch = repeat_query_for_rollouts(query, int(message["repeat_count"]), query.input_ids.device)
+                stop_markers = ["<|/FINAL_ANSWER|>", "<|im_end|>", "<|endoftext|>"]
+                outputs = model.generate(
+                    input_ids=rollout_batch["input_ids"],
+                    attention_mask=rollout_batch["attention_mask"],
+                    protein_sequences=rollout_batch["protein_sequences"],
+                    batch_idx_map=rollout_batch["batch_idx_map"],
+                    structure_coords=rollout_batch["structure_coords"],
+                    go_aspects=rollout_batch["go_aspects"],
+                    temperature=float(sampling.temperature),
+                    top_k=int(sampling.top_k),
+                    top_p=float(sampling.top_p),
+                    min_p=float(sampling.min_p),
+                    repetition_penalty=float(sampling.repetition_penalty),
+                    max_new_tokens=int(sampling.max_new_tokens),
+                    stop=stop_markers,
+                )
+                if bool(args.vllm_enable_sleep_mode) and hasattr(model, "sleep"):
+                    model.sleep(level=int(args.vllm_sleep_level))
+                    sleeping = True
+                connection.send({"status": "ok", "outputs": [normalize_text(output).strip() for output in outputs]})
+                continue
+            if command == "refresh":
+                load_model(Path(message["checkpoint_dir"]))
+                connection.send({"status": "ok"})
+                continue
+            if command == "sleep":
+                if model is not None and hasattr(model, "sleep"):
+                    model.sleep(level=int(message.get("level", getattr(args, "vllm_sleep_level", 1))))
+                    sleeping = True
+                connection.send({"status": "ok"})
+                continue
+            if command == "close":
+                connection.send({"status": "ok"})
+                break
+            raise RuntimeError(f"Unsupported rollout worker command: {command!r}")
+    except KeyboardInterrupt:
+        pass
+    except Exception as exc:
+        try:
+            connection.send(
+                {
+                    "status": "error",
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                }
+            )
+        except Exception:
+            pass
+        raise
+    finally:
+        cleanup_vllm_rollout_model(model)
+        destroy_torch_distributed_process_group(
+            log_prefix=f"[rollout-worker cuda={normalize_text(bootstrap.get('cuda_visible_device')).strip() or 'unknown'}]"
         )
-        generated_ids = model.generate(
+        connection.close()
+
+
+class VLLMRolloutWorker:
+    def __init__(self, args: argparse.Namespace, checkpoint_dir: Path, runtime: DistributedRuntime) -> None:
+        self.args = args
+        self.checkpoint_dir = checkpoint_dir
+        self.runtime = runtime
+        self.backend = normalize_text(getattr(args, "rollout_backend", "subprocess")).strip() or "subprocess"
+        self.model = None
+        self._connection = None
+        self._process = None
+        if self.backend == "subprocess":
+            self._start_subprocess(checkpoint_dir)
+        else:
+            self._load(checkpoint_dir)
+
+    def _recv_response(self, expected_status: str = "ok") -> Mapping[str, Any]:
+        if self._connection is None:
+            raise RuntimeError("Rollout worker subprocess is not initialized.")
+        try:
+            response = self._connection.recv()
+        except EOFError as exc:
+            exitcode = self._process.exitcode if self._process is not None else None
+            raise RuntimeError(f"Rollout worker subprocess exited unexpectedly with exitcode={exitcode}.") from exc
+        if normalize_text(response.get("status")).strip() == "error":
+            raise RuntimeError(
+                "Rollout worker subprocess failed: "
+                f"{normalize_text(response.get('error')).strip()}\n{normalize_text(response.get('traceback')).strip()}"
+            )
+        if normalize_text(response.get("status")).strip() != expected_status:
+            raise RuntimeError(f"Unexpected rollout worker response: {response}")
+        return response
+
+    def _start_subprocess(self, checkpoint_dir: Path) -> None:
+        ctx = mp.get_context(normalize_text(self.args.rollout_worker_start_method).strip() or "spawn")
+        parent_conn, child_conn = ctx.Pipe()
+        bootstrap = {
+            "checkpoint_dir": str(checkpoint_dir),
+            "cuda_visible_device": resolve_local_cuda_visible_device(self.runtime.local_rank),
+            "args": dict(vars(self.args)),
+        }
+        process = ctx.Process(
+            target=rollout_worker_process_main,
+            args=(child_conn, bootstrap),
+            daemon=False,
+        )
+        process.start()
+        child_conn.close()
+        self._connection = parent_conn
+        self._process = process
+        self._recv_response(expected_status="ready")
+
+    def unload(self) -> None:
+        if self.backend == "subprocess":
+            if self._connection is not None and bool(self.args.vllm_enable_sleep_mode):
+                self._connection.send({"cmd": "sleep", "level": int(self.args.vllm_sleep_level)})
+                self._recv_response()
+            return
+        if self.model is not None:
+            cleanup_vllm_rollout_model(self.model)
+            self.model = None
+
+    def _load(self, checkpoint_dir: Path) -> None:
+        self.unload()
+        self.model = create_vllm_rollout_model(self.args, checkpoint_dir)
+
+    def refresh(self, checkpoint_dir: Path) -> None:
+        self.checkpoint_dir = checkpoint_dir
+        if self.backend == "subprocess":
+            if self._connection is None:
+                raise RuntimeError("Rollout worker subprocess is not initialized.")
+            self._connection.send({"cmd": "refresh", "checkpoint_dir": str(checkpoint_dir)})
+            self._recv_response()
+            return
+        self._load(checkpoint_dir)
+
+    def generate_group(self, query: PreparedQuery, repeat_count: int, sampling: SamplingSpec) -> List[str]:
+        if self.backend == "subprocess":
+            if self._connection is None:
+                raise RuntimeError("Rollout worker subprocess is not initialized.")
+            self._connection.send(
+                {
+                    "cmd": "generate",
+                    "query": build_rollout_query_payload(query),
+                    "repeat_count": int(repeat_count),
+                    "sampling": asdict(sampling),
+                }
+            )
+            response = self._recv_response()
+            return [normalize_text(output).strip() for output in response.get("outputs", [])]
+        if self.model is None:
+            self._load(self.checkpoint_dir)
+        rollout_batch = repeat_query_for_rollouts(query, repeat_count, query.input_ids.device)
+        stop_markers = ["<|/FINAL_ANSWER|>", "<|im_end|>", "<|endoftext|>"]
+        outputs = self.model.generate(
             input_ids=rollout_batch["input_ids"],
             attention_mask=rollout_batch["attention_mask"],
             protein_sequences=rollout_batch["protein_sequences"],
             batch_idx_map=rollout_batch["batch_idx_map"],
             structure_coords=rollout_batch["structure_coords"],
             go_aspects=rollout_batch["go_aspects"],
-            multimodal_cache=rollout_multimodal_cache,
-            **generation_kwargs,
+            temperature=float(sampling.temperature),
+            top_k=int(sampling.top_k),
+            top_p=float(sampling.top_p),
+            min_p=float(sampling.min_p),
+            repetition_penalty=float(sampling.repetition_penalty),
+            max_new_tokens=int(sampling.max_new_tokens),
+            stop=stop_markers,
         )
-        completion_ids_list = extract_completion_ids_batch(generated_ids, rollout_batch["input_ids"])
-        print(
-            "Completed RL rollout batch generation: "
-            f"global_step={global_step}, num_generations={args.num_generations}, "
-            f"completion_tokens={[int(completion_ids.numel()) for completion_ids in completion_ids_list]}"
-        )
-        return completion_ids_list, [decode_completion(tokenizer, completion_ids) for completion_ids in completion_ids_list]
-    except torch.cuda.OutOfMemoryError:
-        print(
-            f"CUDA Out of Memory while generating {args.num_generations} RL rollouts in one batch; "
-            "falling back to sequential rollout generation for this prompt."
-        )
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception as exc:
-        print(
-            f"Batched RL rollout generation failed for num_generations={args.num_generations}: {exc}. "
-            "Falling back to sequential rollout generation for this prompt."
-        )
-        traceback.print_exc()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        return [normalize_text(output).strip() for output in outputs]
 
-    return generate_rollouts_sequential(
-        model,
-        example,
-        tokenizer,
-        args,
-        global_step=global_step,
-        epoch_idx=epoch_idx,
-        prompt_len=prompt_len,
-        example_multimodal_cache=example_multimodal_cache,
-    )
-
-
-def generate_rollouts_for_batch(
-    model: Any,
-    batch: Mapping[str, Any],
-    tokenizer: Any,
-    args: argparse.Namespace,
-    *,
-    global_step: int,
-    epoch_idx: int,
-    device: Any,
-    batch_multimodal_cache: Optional[Dict[str, Any]] = None,
-) -> Optional[List[Dict[str, Any]]]:
-    import torch
-
-    local_batch_size = int(batch["input_ids"].shape[0])
-    if local_batch_size <= 0:
-        return []
-    if local_batch_size == 1:
-        return None
-    if is_distributed_enabled():
-        return None
-    if normalize_text(getattr(args, "rollout_execution_mode", "")).strip() != "batch_first":
-        return None
-
-    prompt_lens = batch["input_ids"].ne(tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0).sum(dim=1)
-    prompt_len_summary = [int(value) for value in prompt_lens.tolist()]
-    expanded_batch = expand_batch_for_rollouts(batch, args.num_generations, device)
-    expanded_cache = expand_batch_multimodal_cache(batch_multimodal_cache, args.num_generations)
-    generation_kwargs = build_generation_kwargs(args, tokenizer, for_eval=False)
-    try:
-        print(
-            "Generating RL rollout batch-first: "
-            f"global_step={global_step}, epoch={epoch_idx}, proteins={local_batch_size}, "
-            f"rollouts_per_protein={args.num_generations}, total_trajectories={local_batch_size * args.num_generations}, "
-            f"prompt_lens={prompt_len_summary}, max_new_tokens={args.max_new_tokens}"
-        )
-        generated_ids = model.generate(
-            input_ids=expanded_batch["input_ids"],
-            attention_mask=expanded_batch["attention_mask"],
-            protein_sequences=expanded_batch["protein_sequences"],
-            batch_idx_map=expanded_batch["batch_idx_map"],
-            structure_coords=expanded_batch["structure_coords"],
-            go_aspects=expanded_batch["go_aspects"],
-            multimodal_cache=expanded_cache,
-            **generation_kwargs,
-        )
-        completion_ids_list = extract_completion_ids_batch(generated_ids, expanded_batch["input_ids"])
-        completions = [decode_completion(tokenizer, completion_ids) for completion_ids in completion_ids_list]
-        per_example_outputs: List[Dict[str, Any]] = []
-        for example_idx in range(local_batch_size):
-            start_idx = example_idx * args.num_generations
-            end_idx = start_idx + args.num_generations
-            per_example_completion_ids = completion_ids_list[start_idx:end_idx]
-            per_example_completions = completions[start_idx:end_idx]
-            print(
-                "Completed RL rollout batch-first slice: "
-                f"global_step={global_step}, example_idx={example_idx}, "
-                f"completion_tokens={[int(item.numel()) for item in per_example_completion_ids]}"
-            )
-            per_example_outputs.append(
-                {
-                    "completion_ids_list": per_example_completion_ids,
-                    "completions": per_example_completions,
-                }
-            )
-        return per_example_outputs
-    except torch.cuda.OutOfMemoryError:
-        print(
-            "CUDA Out of Memory during batch-first RL rollout generation; "
-            "falling back to per-example rollout generation for this train batch."
-        )
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception as exc:
-        print(
-            f"Batch-first RL rollout generation failed: {exc}. "
-            "Falling back to per-example rollout generation for this train batch."
-        )
-        traceback.print_exc()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    return None
-
-
-def evaluate_policy_example(
-    model: Any,
-    ref_model: Any,
-    example: Mapping[str, Any],
-    tokenizer: Any,
-    args: argparse.Namespace,
-    reward_names: Sequence[str],
-    reward_weights: Sequence[float],
-    trace_state: Optional[Dict[str, Any]] = None,
-    global_step: int = 0,
-    trace_split_name: str = "validation",
-) -> Dict[str, float]:
-    import torch
-
-    generation_kwargs = build_generation_kwargs(args, tokenizer, for_eval=True)
-    generated_ids = model.generate(
-        input_ids=example["input_ids"],
-        attention_mask=example["attention_mask"],
-        protein_sequences=example["protein_sequences"],
-        batch_idx_map=example["batch_idx_map"],
-        structure_coords=example["structure_coords"],
-        go_aspects=example["go_aspects"],
-        **generation_kwargs,
-    )
-    completion_ids = extract_completion_ids(generated_ids, example["input_ids"])
-    completion_text = decode_completion(tokenizer, completion_ids)
-    rewards, reward_components = compute_group_rewards([completion_text], example["sample_meta"], reward_names, reward_weights)
-    maybe_trace_generation(
-        trace_state,
-        split=trace_split_name,
-        global_step=global_step,
-        sample_meta=example["sample_meta"],
-        tokenizer=tokenizer,
-        completion_ids=completion_ids,
-        completion=completion_text,
-        total_reward=rewards[0],
-        advantage=None,
-        reward_components={name: scores[0] for name, scores in reward_components.items()},
-        max_new_tokens=args.max_new_tokens,
-    )
-
-    kl_value = 0.0
-    if ref_model is not None and completion_ids.numel() > 0:
-        combined_ids, combined_mask, prompt_token_len = build_combined_inputs(
-            example["input_ids"],
-            example["attention_mask"],
-            completion_ids,
-        )
-        current_lp = compute_completion_token_log_probs(
-            model,
-            combined_ids,
-            combined_mask,
-            prompt_token_len,
-            example["protein_sequences"],
-            example["batch_idx_map"],
-            example["structure_coords"],
-            example["go_aspects"],
-        )
-        ref_lp = compute_completion_token_log_probs(
-            ref_model,
-            combined_ids,
-            combined_mask,
-            prompt_token_len,
-            example["protein_sequences"],
-            example["batch_idx_map"],
-            example["structure_coords"],
-            example["go_aspects"],
-        )
-        kl_term = torch.exp(ref_lp - current_lp) - (ref_lp - current_lp) - 1.0
-        kl_value = float(kl_term.mean().item())
-
-    return {
-        "reward_sum": float(rewards[0]),
-        "length_sum": float(completion_ids.numel()),
-        "kl_sum": kl_value,
-        "sample_count": 1.0,
-    }
-
-
-def evaluate_policy_batch(
-    model: Any,
-    ref_model: Any,
-    batch: Mapping[str, Any],
-    tokenizer: Any,
-    args: argparse.Namespace,
-    reward_names: Sequence[str],
-    reward_weights: Sequence[float],
-    device: Any,
-    trace_state: Optional[Dict[str, Any]] = None,
-    global_step: int = 0,
-    trace_split_name: str = "validation",
-) -> Dict[str, float]:
-    import torch
-
-    input_ids = batch["input_ids"].to(device)
-    attention_mask = batch["attention_mask"].to(device)
-    batch_size = input_ids.shape[0]
-    structure_coords = batch.get("structure_coords")
-    if isinstance(structure_coords, torch.Tensor):
-        structure_coords = structure_coords.to(device)
-
-    protein_sequences = list(batch.get("protein_sequences") or [])
-    batch_idx_map = list(batch.get("batch_idx_map") or [])
-    raw_go_aspects = list(batch.get("batch_go_aspects") or [])
-    go_aspects = [raw_go_aspects[idx] if idx < len(raw_go_aspects) and raw_go_aspects[idx] is not None else "all" for idx in range(batch_size)]
-    generation_kwargs = build_generation_kwargs(args, tokenizer, for_eval=True)
-
-    generated_ids = model.generate(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        protein_sequences=protein_sequences,
-        batch_idx_map=batch_idx_map,
-        structure_coords=structure_coords,
-        go_aspects=go_aspects,
-        **generation_kwargs,
-    )
-    completion_ids_list = extract_completion_ids_batch(generated_ids, input_ids)
-
-    reward_sum = 0.0
-    length_sum = 0.0
-    for example_idx, completion_ids in enumerate(completion_ids_list):
-        completion_text = decode_completion(tokenizer, completion_ids)
-        sample_meta = extract_sample_meta_from_batch(batch, example_idx)
-        rewards, reward_components = compute_group_rewards([completion_text], sample_meta, reward_names, reward_weights)
-        reward_sum += float(rewards[0])
-        length_sum += float(completion_ids.numel())
-        maybe_trace_generation(
-            trace_state,
-            split=trace_split_name,
-            global_step=global_step,
-            sample_meta=sample_meta,
-            tokenizer=tokenizer,
-            completion_ids=completion_ids,
-            completion=completion_text,
-            total_reward=rewards[0],
-            advantage=None,
-            reward_components={name: scores[0] for name, scores in reward_components.items()},
-            max_new_tokens=args.max_new_tokens,
-        )
-
-    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
-    kl_sum = compute_batched_completion_kl(
-        model,
-        ref_model,
-        input_ids,
-        attention_mask,
-        completion_ids_list,
-        protein_sequences,
-        batch_idx_map,
-        structure_coords,
-        go_aspects,
-        pad_token_id,
-    )
-    return {
-        "reward_sum": reward_sum,
-        "length_sum": length_sum,
-        "kl_sum": kl_sum,
-        "sample_count": float(batch_size),
-    }
-
-
-def compute_group_rewards(
-    completions: Sequence[str],
-    sample_meta: Mapping[str, Any],
-    reward_funcs: Sequence[str],
-    reward_weights: Sequence[float],
-) -> Tuple[List[float], Dict[str, List[float]]]:
-    registry = build_reward_registry()
-    component_scores: Dict[str, List[float]] = {}
-    total_scores = [0.0 for _ in completions]
-
-    for reward_name, reward_weight in zip(reward_funcs, reward_weights):
-        reward_fn = registry[reward_name]
-        scores = [float(reward_fn(completion, sample_meta)) for completion in completions]
-        component_scores[reward_name] = scores
-        for idx, score in enumerate(scores):
-            total_scores[idx] += reward_weight * score
-
-    return total_scores, component_scores
-
-
-def compute_reward_diagnostics(
-    completions: Sequence[str],
-    sample_meta: Mapping[str, Any],
-) -> Dict[str, List[float]]:
-    registry = build_reward_registry()
-    diagnostics: Dict[str, List[float]] = {}
-    for reward_name in DIAGNOSTIC_REWARD_NAMES:
-        reward_fn = registry.get(reward_name)
-        if reward_fn is None:
-            continue
-        diagnostics[reward_name] = [float(reward_fn(completion, sample_meta)) for completion in completions]
-    return diagnostics
-
-
-def save_raw_checkpoint(model: Any, checkpoint_dir: Path, step: int, args: argparse.Namespace) -> Path:
-    import torch
-
-    model = unwrap_model(model)
-    step_dir = checkpoint_dir / f"checkpoint-{step}"
-    step_dir.mkdir(parents=True, exist_ok=True)
-
-    state_dict = model.state_dict()
-    cpu_state_dict = {}
-    for key, value in state_dict.items():
-        cpu_state_dict[key] = value.detach().cpu() if hasattr(value, "detach") else value
-
-    torch.save(cpu_state_dict, step_dir / "pytorch_model.bin")
-    metadata = {
-        "global_step": step,
-        "benchmark_version": args.benchmark_version,
-        "dataset_artifact": args.dataset_artifact,
-        "base_checkpoint": args.base_checkpoint,
-        "loss_type": args.loss_type,
-        "steps_per_generation": args.steps_per_generation,
-        "num_iterations": args.num_iterations,
-        "reward_funcs": parse_csv_items(args.reward_funcs),
-        "reward_weights": parse_reward_weights(args.reward_weights, len(parse_csv_items(args.reward_funcs))),
-        "reward_scaling": args.reward_scaling,
-        "importance_sampling_level": args.importance_sampling_level,
-        "importance_sampling_cap": args.importance_sampling_cap,
-        "clip_epsilon_low": args.clip_epsilon_low,
-        "clip_epsilon_high": args.clip_epsilon_high,
-        "ia_file_path": args.ia_file_path,
-        "kl_beta": args.kl_beta,
-    }
-    with open(step_dir / "training_metadata.json", "w", encoding="utf-8") as handle:
-        json.dump(metadata, handle, indent=2, sort_keys=True)
-    return step_dir
-
-
-def export_hf_model(model: Any, save_dir: Path) -> None:
-    import shutil
-    import torch
-
-    model = unwrap_model(model)
-    export_dir = save_dir / "exported_hf"
-    if export_dir.exists():
-        shutil.rmtree(export_dir)
-    export_dir.mkdir(parents=True, exist_ok=False)
-
-    if hasattr(model.text_model, "merge_and_unload"):
-        model.text_model = model.text_model.merge_and_unload()
-
-    model = model.cpu()
-    model.text_model.save_pretrained(export_dir)
-    model.text_tokenizer.save_pretrained(export_dir)
-    torch.save(model.protein_projection.state_dict(), export_dir / "protein_projection.pt")
-
-    if getattr(model, "go_projection", None) is not None:
-        torch.save(model.go_projection.state_dict(), export_dir / "go_projection.pt")
-    if getattr(model, "go_encoder", None) is not None:
-        torch.save(model.go_encoder.state_dict(), export_dir / "go_encoder.pt")
-    protein_model_dir = export_dir / "protein_model"
-    protein_model_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(model.protein_model.state_dict(), protein_model_dir / "pytorch_model.bin")
-    for item in export_dir.iterdir():
-        target_path = save_dir / item.name
-        if target_path.exists():
-            if target_path.is_dir():
-                shutil.rmtree(target_path)
-            else:
-                target_path.unlink()
-        item.replace(target_path)
-    export_dir.rmdir()
-
-
-def maybe_init_wandb(args: argparse.Namespace, tracking_config: Mapping[str, Any]) -> Any:
-    import wandb
-
-    init_kwargs: Dict[str, Any] = {
-        "project": args.wandb_project,
-        "entity": args.wandb_entity,
-        "job_type": args.wandb_job_type,
-        "name": tracking_config.get("run_name"),
-        "config": dict(tracking_config),
-    }
-    if normalize_text(args.wandb_mode).strip():
-        init_kwargs["mode"] = args.wandb_mode
-    return wandb.init(**init_kwargs)
-
-
-def attach_global_step(payload: Mapping[str, Any], global_step: int) -> Dict[str, Any]:
-    enriched = dict(payload)
-    enriched["global_step"] = float(global_step)
-    return enriched
-
-
-def maybe_bootstrap_wandb_history(
-    run: Any,
-    *,
-    reward_names: Sequence[str],
-) -> bool:
-    if run is None:
-        return False
-
-    define_metric = getattr(run, "define_metric", None)
-    if callable(define_metric):
-        define_metric("global_step")
-        for metric_name in WANDB_BOOTSTRAP_METRICS:
-            define_metric(metric_name, step_metric="global_step")
-        for reward_name in reward_names:
-            define_metric(f"reward_component/{reward_name}", step_metric="global_step")
-        for reward_name in DIAGNOSTIC_REWARD_NAMES:
-            define_metric(f"diagnostic/{reward_name}", step_metric="global_step")
-
-    bootstrap_payload: Dict[str, Any] = {
-        "global_step": 0.0,
-        "status/initialized": 1.0,
-    }
-    for metric_name in WANDB_BOOTSTRAP_METRICS:
-        bootstrap_payload[metric_name] = 0.0
-    for reward_name in reward_names:
-        bootstrap_payload[f"reward_component/{reward_name}"] = 0.0
-    for reward_name in DIAGNOSTIC_REWARD_NAMES:
-        bootstrap_payload[f"diagnostic/{reward_name}"] = 0.0
-    run.log(bootstrap_payload, step=0)
-    return True
-
-
-def resolve_weave_project(args: argparse.Namespace) -> str:
-    explicit = normalize_text(getattr(args, "weave_project", None)).strip()
-    if explicit:
-        return explicit
-    entity = normalize_text(getattr(args, "wandb_entity", None)).strip()
-    project = normalize_text(getattr(args, "wandb_project", None)).strip()
-    if entity and project:
-        return f"{entity}/{project}"
-    return ""
-
-
-def ensure_weave_server_cache_dir(output_dir: Path) -> str:
-    cache_dir = os.environ.get("WEAVE_SERVER_CACHE_DIR")
-    if normalize_text(cache_dir).strip():
-        resolved = Path(cache_dir).expanduser()
-    else:
-        resolved = output_dir / "weave_server_cache"
-        os.environ["WEAVE_SERVER_CACHE_DIR"] = str(resolved)
-    resolved.mkdir(parents=True, exist_ok=True)
-    return str(resolved)
-
-
-def maybe_init_weave(args: argparse.Namespace, output_dir: Path) -> Optional[Dict[str, Any]]:
-    if weave is None:
-        print("⚠️  Weave is unavailable; RL generation traces will be skipped.")
-        return None
-
-    weave_project = resolve_weave_project(args)
-    if not weave_project:
-        print("⚠️  Weave project is not set; RL generation traces will be skipped.")
-        return None
-
-    cache_dir = ensure_weave_server_cache_dir(output_dir)
-    print(f"Initializing Weave for RL tracing: project={weave_project}, cache_dir={cache_dir}")
-    client = weave.init(weave_project)
-    print("Weave initialization for RL tracing completed.")
-
-    @weave.op(name="train_rl_generation_trace")
-    def trace_generation(payload: Dict[str, Any]) -> Dict[str, Any]:
-        return payload
-
-    return {
-        "client": client,
-        "trace_generation": trace_generation,
-        "remaining_budget": max(int(getattr(args, "weave_trace_budget", 0)), 0),
-        "full_group_budget": max(int(getattr(args, "weave_trace_full_group_count", 0)), 0),
-        "full_group_rollouts": max(int(getattr(args, "weave_trace_full_rollouts_per_group", 0)), 0),
-        "project": weave_project,
-        "logged": 0,
-    }
-
-
-def maybe_trace_generation(
-    trace_state: Optional[Dict[str, Any]],
-    *,
-    split: str,
-    global_step: int,
-    sample_meta: Mapping[str, Any],
-    tokenizer: Any,
-    completion_ids: Any,
-    completion: str,
-    total_reward: float,
-    advantage: Optional[float] = None,
-    reward_components: Optional[Mapping[str, float]] = None,
-    max_new_tokens: int,
-) -> None:
-    if not trace_state or trace_state.get("remaining_budget", 0) <= 0:
-        return
-
-    trace_state["remaining_budget"] -= 1
-    meta = inspect_completion(completion)
-    observability = build_rollout_observability(
-        tokenizer,
-        completion_ids,
-        completion,
-        total_reward=total_reward,
-        max_new_tokens=max_new_tokens,
-    )
-    payload = {
-        "split": split,
-        "global_step": int(global_step),
-        "protein_id": normalize_text(sample_meta.get("protein_id")),
-        "go_aspect": normalize_text(sample_meta.get("go_aspect")),
-        "prompt_preview": normalize_text(sample_meta.get("prompt_preview"))[:512],
-        "completion": completion,
-        "reasoning": meta["reasoning"],
-        "final_answer": meta["final_answer"],
-        "predicted_go_ids": meta["predicted_go_ids"],
-        "final_answer_go_ids": meta["final_answer_go_ids"],
-        "completion_go_ids": meta["completion_go_ids"],
-        "prediction_source": meta["prediction_source"],
-        "has_closed_reasoning": bool(meta["has_closed_reasoning"]),
-        "go_summary_aspect_labels": meta["go_summary_aspect_labels"],
-        "final_answer_aspect_labels": meta["final_answer_aspect_labels"],
-        "has_go_summary": bool(meta["has_go_summary"]),
-        "has_function_summary": bool(meta["has_function_summary"]),
-        "has_complete_summary_schema": bool(meta["has_complete_summary_schema"]),
-        "final_answer_clean": bool(meta["final_answer_clean"]),
-        "structural_noise_count": int(meta["structural_noise_count"]),
-        "predicted_go_id_count": int(len(meta["predicted_go_ids"])),
-        "completion_token_count": int(observability["completion_token_count"]),
-        "stop_reason": observability["stop_reason"],
-        "max_new_tokens_hit": bool(observability["max_new_tokens_hit"]),
-        "has_go_summary_end": bool(observability["has_go_summary_end"]),
-        "first_go_summary_token_idx": int(observability["first_go_summary_token_idx"]),
-        "requested_go_aspects": build_requested_go_aspects(sample_meta),
-        "target_go_ids": build_target_go_ids(sample_meta),
-        "reward_total": float(total_reward),
-        "advantage": None if advantage is None else float(advantage),
-        "reward_components": dict(reward_components or {}),
-    }
-    trace_state["trace_generation"](payload)
-    trace_state["logged"] += 1
-
-
-def evaluate_policy(
-    model: Any,
-    ref_model: Any,
-    dataloader: Any,
-    tokenizer: Any,
-    args: argparse.Namespace,
-    reward_names: Sequence[str],
-    reward_weights: Sequence[float],
-    device: Any,
-    trace_state: Optional[Dict[str, Any]] = None,
-    global_step: int = 0,
-    trace_split_name: str = "validation",
-) -> Dict[str, float]:
-    import torch
-
-    model.eval()
-    total_reward = 0.0
-    total_kl = 0.0
-    total_length = 0.0
-    sample_count = 0
-
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(dataloader):
-            if args.max_eval_batches > 0 and batch_idx >= args.max_eval_batches:
-                break
-            batch_size = batch["input_ids"].shape[0]
-            batch_metrics: Optional[Dict[str, float]] = None
-            if batch_size > 1:
+    def close(self) -> None:
+        if self.backend == "subprocess":
+            if self._connection is not None:
                 try:
-                    print(
-                        f"Running batched RL validation eval: batch_idx={batch_idx}, "
-                        f"batch_size={batch_size}, global_step={global_step}."
-                    )
-                    batch_metrics = evaluate_policy_batch(
-                        model=model,
-                        ref_model=ref_model,
-                        batch=batch,
-                        tokenizer=tokenizer,
-                        args=args,
-                        reward_names=reward_names,
-                        reward_weights=reward_weights,
-                        device=device,
-                        trace_state=trace_state,
-                        global_step=global_step,
-                        trace_split_name=trace_split_name,
-                    )
-                except torch.cuda.OutOfMemoryError:
-                    print(
-                        f"CUDA Out of Memory during RL validation eval batch of size {batch_size}; "
-                        "falling back to single-sample validation for this batch."
-                    )
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                except Exception as exc:
-                    print(
-                        f"Batched RL validation eval failed for batch size {batch_size}: {exc}. "
-                        "Falling back to single-sample validation for this batch."
-                    )
-                    traceback.print_exc()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-            else:
-                batch_metrics = evaluate_policy_batch(
-                    model=model,
-                    ref_model=ref_model,
-                    batch=batch,
-                    tokenizer=tokenizer,
-                    args=args,
-                    reward_names=reward_names,
-                    reward_weights=reward_weights,
-                    device=device,
-                    trace_state=trace_state,
-                    global_step=global_step,
-                    trace_split_name=trace_split_name,
-                )
+                    self._connection.send({"cmd": "close"})
+                    self._recv_response()
+                except Exception:
+                    pass
+                finally:
+                    self._connection.close()
+                    self._connection = None
+            if self._process is not None:
+                self._process.join(timeout=10)
+                if self._process.is_alive():
+                    self._process.terminate()
+                    self._process.join(timeout=5)
+                self._process = None
+            return
+        self.unload()
 
-            if batch_metrics is not None:
-                total_reward += batch_metrics["reward_sum"]
-                total_length += batch_metrics["length_sum"]
-                total_kl += batch_metrics["kl_sum"]
-                sample_count += int(batch_metrics["sample_count"])
-                continue
 
-            for example_idx in range(batch_size):
-                example = extract_example_from_batch(batch, example_idx, device)
-                example_metrics = evaluate_policy_example(
-                    model=model,
-                    ref_model=ref_model,
-                    example=example,
-                    tokenizer=tokenizer,
-                    args=args,
-                    reward_names=reward_names,
-                    reward_weights=reward_weights,
-                    trace_state=trace_state,
-                    global_step=global_step,
-                    trace_split_name=trace_split_name,
-                )
-                total_reward += example_metrics["reward_sum"]
-                total_length += example_metrics["length_sum"]
-                total_kl += example_metrics["kl_sum"]
-                sample_count += int(example_metrics["sample_count"])
+def maybe_trace_group(
+    tracker: RunTracker,
+    runtime: DistributedRuntime,
+    step: int,
+    group: RolloutGroup,
+) -> None:
+    trace_full_group = tracker.claim_full_group_trace()
+    for rollout_idx, (completion, reward) in enumerate(zip(group.completions, group.rewards)):
+        trace_to_weave = (
+            trace_full_group and rollout_idx < max(tracker.weave_full_group_rollouts, 0)
+        ) or (
+            (not trace_full_group) and rollout_idx == 0
+        )
+        tracker.log_rollout_trace(
+            {
+                "step": step,
+                "rank": runtime.rank,
+                "run_name": normalize_text(tracker.args.run_name).strip() or "<auto>",
+                "split": "train",
+                "protein_id": group.query.sample_meta.get("protein_id", ""),
+                "rollout_idx": rollout_idx,
+                "reward": float(reward),
+                "completion": completion,
+                "target_go_ids": build_target_go_ids(group.query.sample_meta),
+                "predicted_go_ids": extract_go_terms_from_final_answer(completion) or [],
+            },
+            trace_to_weave=trace_to_weave,
+        )
 
-    model.train()
-    if sample_count == 0:
-        return {
-            "eval_reward": 0.0,
-            "eval_completion_length": 0.0,
-            "eval_loss_kl_div": 0.0,
-            "eval_data_step_num_datums": 0.0,
-        }
+
+def mean_or_zero(values: Sequence[float]) -> float:
+    return float(sum(values) / len(values)) if values else 0.0
+
+
+def evaluate_validation_subset(
+    validation_dataset: Any,
+    policy_worker: VLLMRolloutWorker,
+    policy_model: Any,
+    ia_weights: Mapping[str, float],
+    go_graph: Mapping[str, Tuple[str, ...]],
+    eval_spec: EvalSpec,
+    runtime: DistributedRuntime,
+) -> Dict[str, float]:
+    if runtime.rank != 0:
+        return {}
+    limit = min(len(validation_dataset), int(eval_spec.validation_num_proteins))
+    deterministic_sampling = SamplingSpec(
+        temperature=0.0,
+        top_k=-1,
+        top_p=1.0,
+        min_p=0.0,
+        repetition_penalty=1.0,
+        max_new_tokens=10_000,
+    )
+    rewards: List[float] = []
+    for idx in range(limit):
+        batch = build_single_example_batch(validation_dataset[int(idx)], policy_model)
+        query = extract_single_query(batch, policy_model, runtime.device)
+        completions = policy_worker.generate_group(query, repeat_count=1, sampling=deterministic_sampling)
+        rewards.extend(compute_group_rewards(completions, query.sample_meta, go_graph, ia_weights))
     return {
-        "eval_reward": total_reward / sample_count,
-        "eval_completion_length": total_length / sample_count,
-        "eval_loss_kl_div": total_kl / sample_count if sample_count else 0.0,
-        "eval_data_step_num_datums": float(sample_count),
+        "validation_reward_mean": mean_or_zero(rewards),
+        "validation_reward_nonzero_rate": mean_or_zero([1.0 if reward > 0.0 else 0.0 for reward in rewards]),
+        "validation_num_proteins": float(limit),
     }
 
 
-def maybe_run_rotating_validation_eval(
-    model: Any,
-    ref_model: Any,
-    full_val_dataset: Any,
-    tokenizer: Any,
+def save_training_checkpoint(
+    policy_stack: PolicyStack,
     args: argparse.Namespace,
-    reward_names: Sequence[str],
-    reward_weights: Sequence[float],
-    device: Any,
-    trace_state: Optional[Dict[str, Any]],
-    global_step: int,
-    wandb_run: Any,
-) -> Optional[Dict[str, float]]:
-    if args.rotating_eval_every_n_steps <= 0 or global_step % args.rotating_eval_every_n_steps != 0:
-        return None
-
-    rotating_seed = args.seed + global_step * max(args.rotating_eval_seed_stride, 1)
-    rotating_dataset, _ = select_validation_subset(
-        full_val_dataset,
-        max_samples=args.rotating_eval_max_samples,
-        seed=rotating_seed,
-        strategy=args.rotating_eval_sample_strategy,
-        label="rotating",
-    )
-    rotating_loader = build_dataloader(rotating_dataset, model, args.eval_batch_size, args.num_workers, shuffle=False)
-    print(f"Starting rotating RL validation eval at global_step={global_step} with seed={rotating_seed}.")
-    rotating_metrics = evaluate_policy(
-        model=model,
-        ref_model=ref_model,
-        dataloader=rotating_loader,
-        tokenizer=tokenizer,
-        args=args,
-        reward_names=reward_names,
-        reward_weights=reward_weights,
-        device=device,
-        trace_state=trace_state,
-        global_step=global_step,
-        trace_split_name="validation_rotating",
-    )
-    rotating_metrics = {f"rotating_{key}": value for key, value in rotating_metrics.items()}
-    rotating_metrics["rotating_eval_subset_seed"] = float(rotating_seed)
-    rotating_metrics["rotating_eval_selected_samples"] = float(len(rotating_dataset))
-    if wandb_run is not None:
-        wandb_run.log(attach_global_step(rotating_metrics, global_step), step=global_step)
-        print(f"Rotating RL validation metrics logged at global_step={global_step}.")
-    return rotating_metrics
+    step: int,
+    tracker: RunTracker,
+    runtime: DistributedRuntime,
+) -> None:
+    checkpoint_root = Path(args.output_dir) / "checkpoints" / f"step-{step:06d}"
+    checkpoint_root.mkdir(parents=True, exist_ok=True)
+    policy_stack.engine.save_checkpoint(str(checkpoint_root / "deepspeed"))
+    barrier(runtime)
+    if runtime.rank == 0:
+        export_dir = checkpoint_root / "inference_export"
+        export_inference_checkpoint(policy_stack.engine.module, export_dir)
+        metadata = {
+            "global_step": step,
+            "checkpoint_artifact_name": args.checkpoint_artifact_name,
+            "base_checkpoint": normalize_text(args.base_checkpoint).strip() or args.text_model_name,
+            "benchmark_version": args.benchmark_version,
+            "dataset_artifact": args.dataset_artifact,
+            "runtime_stack": args.runtime_stack,
+        }
+        save_json(checkpoint_root / "training_metadata.json", metadata)
+        aliases = [item.strip() for item in normalize_text(args.checkpoint_artifact_aliases).split(",") if item.strip()]
+        tracker.log_checkpoint_artifact(checkpoint_root, aliases=aliases or ["latest"], metadata=metadata)
+    barrier(runtime)
 
 
-def build_zero_connected_loss(model: Any) -> Any:
-    import torch
-
-    reference_param = None
-    for param in model.parameters():
-        if param.requires_grad:
-            reference_param = param
-            break
-    if reference_param is None:
-        device = next(model.parameters()).device
-        return torch.zeros((), device=device, dtype=torch.float32)
-    return reference_param.reshape(-1)[0] * 0.0
-
-
-def aggregate_mean_metric(local_sum: float, local_count: float, device: Any) -> float:
-    global_sum = distributed_sum_scalar(local_sum, device)
-    global_count = distributed_sum_scalar(local_count, device)
-    if global_count <= 0.0:
-        return 0.0
-    return global_sum / global_count
+def refresh_old_policy_and_rollout_worker(
+    policy_stack: PolicyStack,
+    rollout_worker: VLLMRolloutWorker,
+    output_dir: Path,
+    runtime: DistributedRuntime,
+    step: int,
+) -> None:
+    policy_stack.old_policy.load_state_dict(unwrap_model(policy_stack.engine.module).state_dict(), strict=False)
+    rollout_dir = output_dir / f"rank{runtime.rank:02d}" / "rollout_policy" / f"step-{step:06d}"
+    export_inference_checkpoint(policy_stack.old_policy, rollout_dir)
+    rollout_worker.refresh(rollout_dir)
 
 
 def train(args: argparse.Namespace) -> None:
-    import torch
-    from torch.nn.parallel import DistributedDataParallel as DDP
-    from torch.nn.utils import clip_grad_norm_
-    from torch.optim import AdamW
+    require_torch()
+    validate_runtime_dependencies()
+    run_name = normalize_text(args.run_name).strip() or f"train-rl-{int(time.time())}"
+    args.run_name = run_name
+    if not normalize_text(args.base_checkpoint).strip():
+        args.base_checkpoint = args.text_model_name
+    validate_spec_inputs(args)
 
-    from bioreason2.utils import (
-        build_checkpoint_artifact_metadata,
-        build_training_tracking_config,
-        maybe_log_directory_artifact,
-        maybe_use_artifact_refs,
-        parse_artifact_aliases,
-        prepare_model_artifact_directory,
-        sync_run_config,
-    )
-    distributed = init_distributed_runtime(args.distributed_timeout_seconds)
-    device = distributed["device"]
-    rank = distributed["rank"]
-    world_size = distributed["world_size"]
-    is_main = rank == 0
+    algorithm = build_algorithm_spec(args)
+    runtime_spec = build_runtime_spec(args)
+    sampling = build_sampling_spec(args)
+    eval_spec = build_eval_spec(args)
+    runtime = initialize_runtime(args)
+    validate_runtime_shape(runtime, algorithm, runtime_spec, args)
 
-    set_seed(args.seed + rank)
-    configure_reward_context(args)
-    torch.set_float32_matmul_precision("high")
-    batch_semantics = build_batch_semantics(args, world_size)
-    for field_name, field_value in batch_semantics.items():
-        setattr(args, field_name, field_value)
-    if is_main:
-        maybe_log_rollout_semantics(batch_semantics)
-
-    run_name = args.run_name or f"train-rl-{int(time.time())}"
-    output_dir = Path(args.output_dir)
+    output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    raw_checkpoint_dir = output_dir / "raw_checkpoints"
-    raw_checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    tracking_config = build_training_tracking_config(args=args, run_name=run_name, job_type="train_rl")
-    tracking_config["model_artifact"] = args.checkpoint_artifact_name or args.model_artifact
-    tracking_config.update(batch_semantics)
-    tracking_config["distributed_enabled"] = distributed["enabled"]
-    tracking_config["distributed_strategy"] = "single_node_ddp" if distributed["enabled"] else "single_gpu"
-    tracking_config["distributed_timeout_seconds"] = distributed.get(
-        "timeout_seconds",
-        int(getattr(args, "distributed_timeout_seconds", 7200)),
+    rank0_print(runtime, "Loading train / validation datasets for spec-first DR-GRPO.")
+    train_dataset, validation_dataset = load_reasoning_datasets(args)
+
+    rank0_print(runtime, "Initializing DeepSpeed policy stack.")
+    policy_stack = initialize_policy_stack(args, runtime_spec, runtime)
+    go_graph = load_go_term_graph(normalize_text(args.go_obo_path).strip())
+    ia_weights = load_ia_weights(normalize_text(args.ia_file_path).strip())
+    tracker = RunTracker(
+        args=args,
+        config=build_tracking_config(args, algorithm, runtime_spec, runtime, run_name=run_name),
+        output_dir=output_dir,
+        runtime=runtime,
     )
-    tracking_config["multimodal_cache_enabled"] = can_cache_multimodal_prefix(args)
-    tracking_config["ref_logprob_cache_enabled"] = bool(args.kl_beta > 0)
 
-    wandb_run = None
-    weave_trace_state = None
-    final_checkpoint_dir: Optional[Path] = None
+    rank0_print(runtime, "Exporting initial old-policy checkpoint for the vLLM rollout worker.")
+    initial_rollout_dir = output_dir / f"rank{runtime.rank:02d}" / "rollout_policy" / "step-000000"
+    export_inference_checkpoint(policy_stack.old_policy, initial_rollout_dir)
+    rollout_worker = VLLMRolloutWorker(args, initial_rollout_dir, runtime)
 
     try:
-        base_model = instantiate_model(args, trainable=True).to(device)
-        if args.resume_from_raw_checkpoint:
-            checkpoint = torch.load(args.resume_from_raw_checkpoint, map_location="cpu", weights_only=False)
-            base_model.load_state_dict(checkpoint, strict=False)
-            if is_main:
-                print(f"Resumed RL model weights from {args.resume_from_raw_checkpoint}")
-
-        model = base_model
-        if distributed["enabled"]:
-            model = DDP(
-                base_model,
-                device_ids=[distributed["local_rank"]],
-                output_device=distributed["local_rank"],
-                find_unused_parameters=True,
+        for step in range(int(args.max_steps)):
+            global_query_indices = sample_query_indices(
+                dataset_length=len(train_dataset),
+                queries_per_step=algorithm.queries_per_step,
+                seed=int(args.seed),
+                step=step,
+                runtime=runtime,
             )
-        ref_model = instantiate_model(args, trainable=False).to(device) if args.kl_beta > 0 else None
+            local_query_indices = partition_queries_for_rank(global_query_indices, runtime.rank, max(runtime.world_size, 1))
+            local_queries: List[PreparedQuery] = []
+            for dataset_idx in local_query_indices:
+                batch = build_single_example_batch(train_dataset[int(dataset_idx)], policy_stack.engine.module)
+                local_queries.append(extract_single_query(batch, policy_stack.engine.module, runtime.device))
 
-        train_dataset, fixed_val_dataset, full_val_dataset = load_rl_datasets(args)
-        train_loader = build_dataloader(
-            train_dataset,
-            model,
-            int(batch_semantics["per_device_train_batch_size"]),
-            args.num_workers,
-            shuffle=True,
-            distributed=distributed["enabled"],
-            seed=args.seed,
-        )
-        val_loader = None
-        if is_main:
-            val_loader = build_dataloader(
-                fixed_val_dataset,
-                model,
-                int(batch_semantics["per_device_eval_batch_size"]),
-                args.num_workers,
-                shuffle=False,
-                distributed=False,
-                seed=args.seed,
-            )
-
-        tokenizer = base_model.text_tokenizer
-        multimodal_cache_enabled = can_cache_multimodal_prefix(args)
-        reward_names = parse_csv_items(args.reward_funcs)
-        reward_weights = parse_reward_weights(args.reward_weights, len(reward_names))
-        resolved_ia_file_path = require_training_ia_file(args, reward_names)
-        if resolved_ia_file_path and is_main:
-            print(f"Using IA-weighted RL reward with IA file: {resolved_ia_file_path}")
-
-        optimizer = AdamW(
-            [parameter for parameter in model.parameters() if parameter.requires_grad],
-            lr=args.learning_rate,
-            weight_decay=args.weight_decay,
-            betas=(args.adam_beta1, args.adam_beta2),
-            eps=args.adam_epsilon,
-        )
-        total_update_passes = max(args.max_steps, 1) * max(args.steps_per_generation, 1) * max(args.num_iterations, 1)
-        optimizer_step_budget = max(math.ceil(total_update_passes / max(args.gradient_accumulation_steps, 1)), 1)
-        warmup_steps = int(optimizer_step_budget * max(args.warmup_ratio, 0.0))
-        if args.lr_scheduler_type == "cosine":
-            from transformers import get_cosine_schedule_with_warmup
-
-            scheduler = get_cosine_schedule_with_warmup(
-                optimizer,
-                num_warmup_steps=warmup_steps,
-                num_training_steps=optimizer_step_budget,
-            )
-        else:
-            scheduler = None
-
-        if is_main:
-            ensure_weave_server_cache_dir(output_dir)
-            wandb_run = maybe_init_wandb(args, tracking_config)
-            if wandb_run is not None:
-                sync_run_config(wandb_run, tracking_config)
-                sync_run_config(
-                    wandb_run,
-                    {
-                        "dataset_train_size": len(train_dataset),
-                        "dataset_validation_size": len(fixed_val_dataset),
-                        "dataset_validation_full_size": len(full_val_dataset),
-                        **batch_semantics,
-                        "distributed_enabled": distributed["enabled"],
-                        "distributed_world_size": world_size,
-                        "distributed_strategy": "single_node_ddp" if distributed["enabled"] else "single_gpu",
-                    },
-                )
-                maybe_use_artifact_refs(
-                    wandb_run,
-                    {
-                        "temporal_split_artifact": args.temporal_split_artifact,
-                        "dataset_artifact": args.dataset_artifact,
-                        "base_checkpoint": args.base_checkpoint,
-                    },
-                )
-                maybe_bootstrap_wandb_history(
-                    wandb_run,
-                    reward_names=reward_names,
-                )
-            weave_trace_state = maybe_init_weave(args, output_dir)
-            if wandb_run is not None:
-                sync_run_config(
-                    wandb_run,
-                    {
-                        "weave_trace_enabled": bool(weave_trace_state is not None),
-                        "weave_trace_budget": int(getattr(args, "weave_trace_budget", 0)),
-                    },
+            if runtime.enabled and len(local_queries) != 1:
+                raise RuntimeError(
+                    f"Spec-first distributed mode expects exactly one query per rank, got {len(local_queries)} on rank {runtime.rank}."
                 )
 
-        best_val_reward = float("-inf")
-        global_step = 0
-        last_eval_step: Optional[int] = None
-        optimizer_substep = 0
-        optimizer.zero_grad(set_to_none=True)
-
-        def maybe_run_eval_and_save(current_step: int) -> None:
-            nonlocal best_val_reward, last_eval_step
-
-            should_eval = args.eval_every_n_steps > 0 and current_step % args.eval_every_n_steps == 0
-            should_save = args.save_every_n_steps > 0 and current_step % args.save_every_n_steps == 0
-            if not should_eval and not should_save:
-                return
-
-            distributed_barrier()
-            if should_eval and is_main and val_loader is not None:
-                print(f"Starting RL validation eval at global_step={current_step}.")
-                val_metrics = evaluate_policy(
-                    model=base_model,
-                    ref_model=ref_model,
-                    dataloader=val_loader,
-                    tokenizer=tokenizer,
-                    args=args,
-                    reward_names=reward_names,
-                    reward_weights=reward_weights,
-                    device=device,
-                    trace_state=weave_trace_state,
-                    global_step=current_step,
-                    trace_split_name="validation_fixed",
-                )
-                if wandb_run is not None:
-                    wandb_run.log(attach_global_step(val_metrics, current_step), step=current_step)
-                    print(f"RL validation metrics logged at global_step={current_step}.")
-                last_eval_step = current_step
-                if val_metrics["eval_reward"] > best_val_reward:
-                    best_val_reward = val_metrics["eval_reward"]
-                    save_raw_checkpoint(base_model, raw_checkpoint_dir / "best", current_step, args)
-                maybe_run_rotating_validation_eval(
-                    model=base_model,
-                    ref_model=ref_model,
-                    full_val_dataset=full_val_dataset,
-                    tokenizer=tokenizer,
-                    args=args,
-                    reward_names=reward_names,
-                    reward_weights=reward_weights,
-                    device=device,
-                    trace_state=weave_trace_state,
-                    global_step=current_step,
-                    wandb_run=wandb_run,
-                )
-            distributed_barrier()
-
-            if should_save and is_main and not args.audit_only:
-                save_raw_checkpoint(base_model, raw_checkpoint_dir, current_step, args)
-            distributed_barrier()
-
-        for epoch_idx in range(args.max_epochs):
-            if global_step >= args.max_steps:
-                break
-            sampler = getattr(train_loader, "sampler", None)
-            if distributed["enabled"] and hasattr(sampler, "set_epoch"):
-                sampler.set_epoch(epoch_idx)
-
-            for batch in train_loader:
-                model.train()
-                if is_main:
-                    print(f"Starting RL train batch at global_step={global_step}, epoch={epoch_idx}.")
-                local_batch_size = batch["input_ids"].shape[0]
-                batch_multimodal_cache = (
-                    maybe_build_batch_multimodal_cache(base_model, batch, args, device)
-                    if multimodal_cache_enabled
-                    else None
-                )
-                batch_first_rollouts = generate_rollouts_for_batch(
-                    base_model,
-                    batch,
-                    tokenizer,
-                    args,
-                    global_step=global_step,
-                    epoch_idx=epoch_idx,
-                    device=device,
-                    batch_multimodal_cache=batch_multimodal_cache,
-                )
-                reward_totals: List[float] = []
-                reward_component_scores: Dict[str, List[float]] = {reward_name: [] for reward_name in reward_names}
-                diagnostic_component_scores: Dict[str, List[float]] = {
-                    reward_name: [] for reward_name in DIAGNOSTIC_REWARD_NAMES
-                }
-                completion_lengths: List[int] = []
-                stop_reason_counts: Dict[str, float] = {
-                    "summary_end": 0.0,
-                    "eos": 0.0,
-                    "max_tokens": 0.0,
-                    "unknown": 0.0,
-                }
-                go_summary_end_hits = 0.0
-                max_new_tokens_hits = 0.0
-                reward_nonzero_hits = 0.0
-                filtered_rollout_hits = 0.0
-                first_go_summary_token_indices: List[float] = []
-                kl_values: List[float] = []
-                ratio_means: List[float] = []
-                ratio_maxes: List[float] = []
-                local_trainable_group_count = 0
-                pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
-                grouped_rewards: List[List[float]] = []
-                rollout_records: List[Dict[str, Any]] = []
-
-                for example_idx in range(local_batch_size):
-                    example = extract_example_from_batch(batch, example_idx, device)
-                    example_multimodal_cache = (
-                        maybe_build_example_multimodal_cache(base_model, example, args)
-                        if multimodal_cache_enabled
-                        else None
-                    )
-                    rollout_multimodal_cache = (
-                        expand_single_example_multimodal_cache(base_model, example_multimodal_cache, args.num_generations)
-                        if example_multimodal_cache is not None
-                        else None
-                    )
-
-                    base_model.eval()
-                    if batch_first_rollouts is not None:
-                        completion_ids_list = batch_first_rollouts[example_idx]["completion_ids_list"]
-                        completions = batch_first_rollouts[example_idx]["completions"]
-                    else:
-                        completion_ids_list, completions = generate_rollouts_for_example(
-                            base_model,
-                            example,
-                            tokenizer,
-                            args,
-                            global_step=global_step,
-                            epoch_idx=epoch_idx,
-                            example_multimodal_cache=example_multimodal_cache,
-                        )
-                    old_sequence_log_probs = compute_old_policy_sequence_log_probs(
-                        base_model,
-                        example,
-                        completion_ids_list,
-                        pad_token_id,
-                        microbatch_size=args.rollout_logprob_microbatch_size,
-                        multimodal_cache=rollout_multimodal_cache,
-                    )
-                    rollout_group = build_rollout_group_inputs(
-                        example,
-                        completion_ids_list,
-                        pad_token_id,
-                        multimodal_cache=rollout_multimodal_cache,
-                    )
-                    cached_ref_log_probs = precompute_ref_policy_log_probs(
-                        ref_model,
-                        rollout_group,
-                        microbatch_size=args.rollout_logprob_microbatch_size,
-                    )
-                    model.train()
-                    completion_lengths.extend(int(completion_ids.numel()) for completion_ids in completion_ids_list)
-
-                    total_rewards, reward_components = compute_group_rewards(
-                        completions,
-                        example["sample_meta"],
-                        reward_names,
-                        reward_weights,
-                    )
-                    diagnostic_components = compute_reward_diagnostics(completions, example["sample_meta"])
-                    grouped_rewards.append(total_rewards)
-                    rollout_records.append(
-                        {
-                            "example": example,
-                            "completion_ids_list": completion_ids_list,
-                            "completions": completions,
-                            "total_rewards": total_rewards,
-                            "reward_components": reward_components,
-                            "diagnostic_components": diagnostic_components,
-                            "old_sequence_log_probs": old_sequence_log_probs,
-                            "rollout_group": rollout_group,
-                            "example_multimodal_cache": example_multimodal_cache,
-                            "rollout_multimodal_cache": rollout_multimodal_cache,
-                            "cached_ref_log_probs": cached_ref_log_probs,
-                        }
-                    )
-                    for reward_name, scores in reward_components.items():
-                        reward_component_scores.setdefault(reward_name, []).extend(scores)
-                    for reward_name, scores in diagnostic_components.items():
-                        diagnostic_component_scores.setdefault(reward_name, []).extend(scores)
-                    reward_totals.extend(total_rewards)
-                    for completion_ids, completion_text, total_reward in zip(
-                        completion_ids_list,
-                        completions,
-                        total_rewards,
-                    ):
-                        observability = build_rollout_observability(
-                            tokenizer,
-                            completion_ids,
-                            completion_text,
-                            total_reward=total_reward,
-                            max_new_tokens=args.max_new_tokens,
-                        )
-                        stop_reason = normalize_text(observability["stop_reason"]).strip().lower() or "unknown"
-                        stop_reason_counts.setdefault(stop_reason, 0.0)
-                        stop_reason_counts[stop_reason] += 1.0
-                        if observability["has_go_summary_end"]:
-                            go_summary_end_hits += 1.0
-                        if observability["max_new_tokens_hit"]:
-                            max_new_tokens_hits += 1.0
-                        if observability["reward_nonzero"]:
-                            reward_nonzero_hits += 1.0
-                        if observability["first_go_summary_token_idx"] >= 0:
-                            first_go_summary_token_indices.append(float(observability["first_go_summary_token_idx"]))
-
-                grouped_advantages, global_reward_std = compute_batch_relative_advantages(
-                    grouped_rewards,
-                    epsilon_std=args.advantage_epsilon_std,
-                    reward_scaling=args.reward_scaling,
-                    distributed_device=device,
-                )
-                for record, advantages in zip(rollout_records, grouped_advantages):
-                    record["advantages"] = advantages
-                    if any(completion_ids.numel() > 0 for completion_ids in record["completion_ids_list"]):
-                        local_trainable_group_count += 1
-                    if not record["completions"]:
-                        continue
-                    trace_rollout_count = 1
-                    if weave_trace_state and weave_trace_state.get("full_group_budget", 0) > 0:
-                        trace_rollout_count = min(
-                            len(record["completions"]),
-                            max(int(weave_trace_state.get("full_group_rollouts", 0)), 1),
-                        )
-                        weave_trace_state["full_group_budget"] -= 1
-                    for rollout_idx in range(trace_rollout_count):
-                        maybe_trace_generation(
-                            weave_trace_state,
-                            split="train",
-                            global_step=global_step,
-                            sample_meta=record["example"]["sample_meta"],
-                            tokenizer=tokenizer,
-                            completion_ids=record["completion_ids_list"][rollout_idx],
-                            completion=record["completions"][rollout_idx],
-                            total_reward=record["total_rewards"][rollout_idx] if record["total_rewards"] else 0.0,
-                            advantage=advantages[rollout_idx] if advantages else None,
-                            reward_components={
-                                reward_name: record["reward_components"][reward_name][rollout_idx]
-                                for reward_name in record["reward_components"]
-                            },
-                            max_new_tokens=args.max_new_tokens,
-                        )
-
-                global_trainable_group_count = int(round(distributed_sum_scalar(float(local_trainable_group_count), device)))
-                local_groups_submitted = float(local_batch_size)
-                local_trajectories = float(len(reward_totals))
-                local_tokens = float(sum(completion_lengths))
-                global_groups_submitted_rank_sum = distributed_sum_scalar(local_groups_submitted, device)
-                global_trajectories_rank_sum = distributed_sum_scalar(local_trajectories, device)
-                global_datums_rank_sum = distributed_sum_scalar(float(local_batch_size), device)
-                global_tokens_rank_sum = distributed_sum_scalar(local_tokens, device)
-                global_groups_target = float(batch_semantics["global_unique_proteins_target"])
-                global_trajectories_target = float(batch_semantics["global_num_trajectories_per_step"])
-
-                if global_trainable_group_count == 0:
-                    global_step += 1
-                    skipped_payload = {
-                        "loss_learning_rate": optimizer.param_groups[0]["lr"],
-                        "data_step_num_groups_submitted": global_groups_target,
-                        "data_step_num_groups_submitted_rank_sum": global_groups_submitted_rank_sum,
-                        "data_step_num_groups_trainable": float(global_trainable_group_count),
-                        "data_step_num_trajectories": global_trajectories_target,
-                        "data_step_num_trajectories_rank_sum": global_trajectories_rank_sum,
-                        "data_step_num_datums": global_groups_target,
-                        "data_step_num_datums_rank_sum": global_datums_rank_sum,
-                        "data_step_trainer_tokens": global_tokens_rank_sum,
-                        "reward": aggregate_mean_metric(sum(reward_totals), float(len(reward_totals)), device),
-                        "reward_std_dev": float(global_reward_std),
-                        "diagnostic/go_summary_end_rate": aggregate_mean_metric(
-                            go_summary_end_hits,
-                            float(len(reward_totals)),
-                            device,
-                        ),
-                        "diagnostic/max_new_tokens_hit_rate": aggregate_mean_metric(
-                            max_new_tokens_hits,
-                            float(len(reward_totals)),
-                            device,
-                        ),
-                        "diagnostic/reward_nonzero_rate": aggregate_mean_metric(
-                            reward_nonzero_hits,
-                            float(len(reward_totals)),
-                            device,
-                        ),
-                        "diagnostic/filtered_rollout_rate": aggregate_mean_metric(
-                            filtered_rollout_hits,
-                            float(len(reward_totals)),
-                            device,
-                        ),
-                        "diagnostic/audit_only": 1.0 if args.audit_only else 0.0,
-                        "train_skipped_update": 1.0,
-                    }
-                    if first_go_summary_token_indices:
-                        skipped_payload["diagnostic/first_go_summary_token_idx_mean"] = aggregate_mean_metric(
-                            sum(first_go_summary_token_indices),
-                            float(len(first_go_summary_token_indices)),
-                            device,
-                        )
-                    for stop_reason, count in stop_reason_counts.items():
-                        skipped_payload[f"diagnostic/stop_reason_{stop_reason}_rate"] = aggregate_mean_metric(
-                            count,
-                            float(len(reward_totals)),
-                            device,
-                        )
-                    for reward_name, scores in reward_component_scores.items():
-                        if scores:
-                            skipped_payload[f"reward_component/{reward_name}"] = aggregate_mean_metric(
-                                sum(scores),
-                                float(len(scores)),
-                                device,
-                            )
-                    for reward_name, scores in diagnostic_component_scores.items():
-                        if scores:
-                            skipped_payload[f"diagnostic/{reward_name}"] = aggregate_mean_metric(
-                                sum(scores),
-                                float(len(scores)),
-                                device,
-                            )
-                    if wandb_run is not None and is_main:
-                        print(f"Logging RL skipped-update metrics at global_step={global_step}.")
-                        wandb_run.log(attach_global_step(skipped_payload, global_step), step=global_step)
-                        print(f"RL skipped-update metrics logged at global_step={global_step}.")
-
-                    maybe_run_eval_and_save(global_step)
-                    if global_step >= args.max_steps:
-                        break
-                    continue
-
-                if args.audit_only:
-                    global_step += 1
-                    audit_payload = {
-                        "loss_train": 0.0,
-                        "reward": aggregate_mean_metric(sum(reward_totals), float(len(reward_totals)), device),
-                        "reward_std_dev": float(global_reward_std),
-                        "diagnostic/go_summary_end_rate": aggregate_mean_metric(
-                            go_summary_end_hits,
-                            float(len(reward_totals)),
-                            device,
-                        ),
-                        "diagnostic/max_new_tokens_hit_rate": aggregate_mean_metric(
-                            max_new_tokens_hits,
-                            float(len(reward_totals)),
-                            device,
-                        ),
-                        "diagnostic/reward_nonzero_rate": aggregate_mean_metric(
-                            reward_nonzero_hits,
-                            float(len(reward_totals)),
-                            device,
-                        ),
-                        "diagnostic/filtered_rollout_rate": aggregate_mean_metric(
-                            filtered_rollout_hits,
-                            float(len(reward_totals)),
-                            device,
-                        ),
-                        "diagnostic/audit_only": 1.0,
-                        "loss_kl_div": 0.0,
-                        "loss_policy_ratio_mean": 0.0,
-                        "loss_policy_ratio_max": 0.0,
-                        "loss_learning_rate": optimizer.param_groups[0]["lr"],
-                        "loss_grad_norm": 0.0,
-                        "data_step_num_groups_submitted": global_groups_target,
-                        "data_step_num_groups_submitted_rank_sum": global_groups_submitted_rank_sum,
-                        "data_step_num_groups_trainable": float(global_trainable_group_count),
-                        "data_step_num_trajectories": global_trajectories_target,
-                        "data_step_num_trajectories_rank_sum": global_trajectories_rank_sum,
-                        "data_step_num_datums": global_groups_target,
-                        "data_step_num_datums_rank_sum": global_datums_rank_sum,
-                        "data_step_trainer_tokens": global_tokens_rank_sum,
-                        "data_step_num_update_passes": 0.0,
-                        "train_skipped_update": 1.0,
-                    }
-                    if first_go_summary_token_indices:
-                        audit_payload["diagnostic/first_go_summary_token_idx_mean"] = aggregate_mean_metric(
-                            sum(first_go_summary_token_indices),
-                            float(len(first_go_summary_token_indices)),
-                            device,
-                        )
-                    for stop_reason, count in stop_reason_counts.items():
-                        audit_payload[f"diagnostic/stop_reason_{stop_reason}_rate"] = aggregate_mean_metric(
-                            count,
-                            float(len(reward_totals)),
-                            device,
-                        )
-                    for reward_name, scores in reward_component_scores.items():
-                        if not scores:
-                            continue
-                        audit_payload[f"reward_component/{reward_name}"] = aggregate_mean_metric(
-                            sum(scores),
-                            float(len(scores)),
-                            device,
-                        )
-                    for reward_name, scores in diagnostic_component_scores.items():
-                        if not scores:
-                            continue
-                        audit_payload[f"diagnostic/{reward_name}"] = aggregate_mean_metric(
-                            sum(scores),
-                            float(len(scores)),
-                            device,
-                        )
-                    if wandb_run is not None and is_main:
-                        print(f"Logging RL audit metrics at global_step={global_step}.")
-                        wandb_run.log(attach_global_step(audit_payload, global_step), step=global_step)
-                        print(f"RL audit metrics logged at global_step={global_step}.")
-
-                    maybe_run_eval_and_save(global_step)
-                    if global_step >= args.max_steps:
-                        break
-                    continue
-
-                grad_norm_value = 0.0
-                optimizer.zero_grad(set_to_none=True)
-                local_update_loss_sums: List[float] = []
-                local_update_loss_counts: List[float] = []
-                total_update_passes = max(args.steps_per_generation, 1) * max(args.num_iterations, 1)
-                for update_idx in range(total_update_passes):
-                    optimizer_substep += 1
-                    should_step = (
-                        optimizer_substep % max(args.gradient_accumulation_steps, 1) == 0
-                        or update_idx == total_update_passes - 1
-                    )
-                    sync_context = nullcontext()
-                    if distributed["enabled"] and not should_step:
-                        sync_context = model.no_sync()
-                    with sync_context:
-                        local_backward_terms = []
-                        update_loss_accumulator = 0.0
-                        update_trainable_groups = 0
-                        for record in rollout_records:
-                            try:
-                                group_loss, group_metrics, has_trainable_rollout = compute_group_policy_losses_batched(
-                                    model,
-                                    ref_model,
-                                    record["example"],
-                                    record["completion_ids_list"],
-                                    record["advantages"],
-                                    record["old_sequence_log_probs"],
-                                    pad_token_id,
-                                    args,
-                                    rollout_group=record.get("rollout_group"),
-                                    cached_ref_log_probs=record.get("cached_ref_log_probs"),
-                                )
-                            except torch.cuda.OutOfMemoryError:
-                                if is_main:
-                                    print(
-                                        "CUDA Out of Memory during batched RL loss computation; "
-                                        "falling back to sequential rollout loss computation for this prompt."
-                                    )
-                                if torch.cuda.is_available():
-                                    torch.cuda.empty_cache()
-                                group_loss, group_metrics, has_trainable_rollout = compute_group_policy_losses_sequential(
-                                    model,
-                                    ref_model,
-                                    record["example"],
-                                    record["completion_ids_list"],
-                                    record["advantages"],
-                                    record["old_sequence_log_probs"],
-                                    args,
-                                    multimodal_cache=record.get("example_multimodal_cache"),
-                                    cached_ref_log_probs=record.get("cached_ref_log_probs"),
-                                )
-
-                            if not has_trainable_rollout:
-                                if group_metrics and "filtered_rollouts" in group_metrics:
-                                    filtered_rollout_hits += float(group_metrics["filtered_rollouts"])
-                                continue
-
-                            local_backward_terms.append(group_loss / max(float(global_trainable_group_count), 1.0))
-                            update_loss_accumulator += float(group_loss.detach().item())
-                            update_trainable_groups += 1
-                            if group_metrics:
-                                if "filtered_rollouts" in group_metrics:
-                                    filtered_rollout_hits += float(group_metrics["filtered_rollouts"])
-                                if "kl_mean" in group_metrics:
-                                    kl_values.append(float(group_metrics["kl_mean"]))
-                                if "ratio_mean" in group_metrics:
-                                    ratio_means.append(float(group_metrics["ratio_mean"]))
-                                if "ratio_max" in group_metrics:
-                                    ratio_maxes.append(float(group_metrics["ratio_max"]))
-
-                        backward_loss = (
-                            torch.stack(local_backward_terms).sum()
-                            if local_backward_terms
-                            else build_zero_connected_loss(base_model)
-                        )
-                        backward_loss.backward()
-
-                    if should_step:
-                        grad_norm = clip_grad_norm_(
-                            [parameter for parameter in model.parameters() if parameter.requires_grad],
-                            args.max_grad_norm,
-                        )
-                        grad_norm_value = float(grad_norm.item()) if hasattr(grad_norm, "item") else float(grad_norm)
-                        optimizer.step()
-                        if scheduler is not None:
-                            scheduler.step()
-                        optimizer.zero_grad(set_to_none=True)
-                    local_update_loss_sums.append(update_loss_accumulator)
-                    local_update_loss_counts.append(float(update_trainable_groups))
-
-                global_step += 1
-                loss_train_sum = distributed_sum_scalar(sum(local_update_loss_sums), device)
-                loss_train_count = distributed_sum_scalar(sum(local_update_loss_counts), device)
-                log_payload = {
-                    "loss_train": (loss_train_sum / loss_train_count) if loss_train_count > 0 else 0.0,
-                    "reward": aggregate_mean_metric(sum(reward_totals), float(len(reward_totals)), device),
-                    "reward_std_dev": float(global_reward_std),
-                    "diagnostic/go_summary_end_rate": aggregate_mean_metric(
-                        go_summary_end_hits,
-                        float(len(reward_totals)),
-                        device,
+            local_groups: List[RolloutGroup] = []
+            for query in local_queries:
+                completions = tracker.trace_rollout_call(
+                    step=step + 1,
+                    split="train",
+                    query=query,
+                    repeat_count=algorithm.rollouts_per_query,
+                    sampling=sampling,
+                    generator=lambda current_query=query: rollout_worker.generate_group(
+                        current_query,
+                        algorithm.rollouts_per_query,
+                        sampling,
                     ),
-                    "diagnostic/max_new_tokens_hit_rate": aggregate_mean_metric(
-                        max_new_tokens_hits,
-                        float(len(reward_totals)),
-                        device,
+                )
+                completion_ids = tokenize_completion_texts(policy_stack.tokenizer, completions, runtime.device)
+                rewards = tracker.trace_reward_call(
+                    step=step + 1,
+                    split="train",
+                    query=query,
+                    completions=completions,
+                    callback=lambda current_completions=list(completions), current_query=query: compute_group_rewards(
+                        current_completions,
+                        current_query.sample_meta,
+                        go_graph,
+                        ia_weights,
                     ),
-                    "diagnostic/reward_nonzero_rate": aggregate_mean_metric(
-                        reward_nonzero_hits,
-                        float(len(reward_totals)),
-                        device,
-                    ),
-                    "diagnostic/filtered_rollout_rate": aggregate_mean_metric(
-                        filtered_rollout_hits,
-                        float(len(reward_totals)),
-                        device,
-                    ),
-                    "loss_kl_div": aggregate_mean_metric(sum(kl_values), float(len(kl_values)), device),
-                    "loss_policy_ratio_mean": aggregate_mean_metric(sum(ratio_means), float(len(ratio_means)), device),
-                    "loss_policy_ratio_max": distributed_max_scalar(max(ratio_maxes) if ratio_maxes else 0.0, device),
-                    "loss_learning_rate": optimizer.param_groups[0]["lr"],
-                    "loss_grad_norm": grad_norm_value,
-                    "data_step_num_groups_submitted": global_groups_target,
-                    "data_step_num_groups_submitted_rank_sum": global_groups_submitted_rank_sum,
-                    "data_step_num_groups_trainable": float(global_trainable_group_count),
-                    "data_step_num_trajectories": global_trajectories_target,
-                    "data_step_num_trajectories_rank_sum": global_trajectories_rank_sum,
-                    "data_step_num_datums": global_groups_target,
-                    "data_step_num_datums_rank_sum": global_datums_rank_sum,
-                    "data_step_trainer_tokens": global_tokens_rank_sum,
-                    "data_step_num_update_passes": float(total_update_passes),
-                    "train_skipped_update": 0.0,
-                }
-                if first_go_summary_token_indices:
-                    log_payload["diagnostic/first_go_summary_token_idx_mean"] = aggregate_mean_metric(
-                        sum(first_go_summary_token_indices),
-                        float(len(first_go_summary_token_indices)),
-                        device,
-                    )
-                for stop_reason, count in stop_reason_counts.items():
-                    log_payload[f"diagnostic/stop_reason_{stop_reason}_rate"] = aggregate_mean_metric(
-                        count,
-                        float(len(reward_totals)),
-                        device,
-                    )
-                for reward_name, scores in reward_component_scores.items():
-                    if not scores:
-                        continue
-                    log_payload[f"reward_component/{reward_name}"] = aggregate_mean_metric(
-                        sum(scores),
-                        float(len(scores)),
-                        device,
-                    )
-                for reward_name, scores in diagnostic_component_scores.items():
-                    if not scores:
-                        continue
-                    log_payload[f"diagnostic/{reward_name}"] = aggregate_mean_metric(
-                        sum(scores),
-                        float(len(scores)),
-                        device,
-                    )
-                if wandb_run is not None and is_main:
-                    print(f"Logging RL train metrics at global_step={global_step}.")
-                    wandb_run.log(attach_global_step(log_payload, global_step), step=global_step)
-                    print(f"RL train metrics logged at global_step={global_step}.")
+                )
+                group = RolloutGroup(
+                    query=query,
+                    completions=completions,
+                    completion_ids=completion_ids,
+                    rewards=rewards,
+                )
+                local_groups.append(group)
+                maybe_trace_group(tracker, runtime, step, group)
 
-                maybe_run_eval_and_save(global_step)
-                if global_step >= args.max_steps:
-                    break
-
-        distributed_barrier()
-        if global_step > 0 and last_eval_step != global_step and is_main and val_loader is not None:
-            print(f"Starting RL final validation eval at global_step={global_step}.")
-            final_val_metrics = evaluate_policy(
-                model=base_model,
-                ref_model=ref_model,
-                dataloader=val_loader,
-                tokenizer=tokenizer,
-                args=args,
-                reward_names=reward_names,
-                reward_weights=reward_weights,
-                device=device,
-                trace_state=weave_trace_state,
-                global_step=global_step,
-                trace_split_name="validation_final",
-            )
-            final_val_metrics = {f"final/{key}": value for key, value in final_val_metrics.items()}
-            if wandb_run is not None:
-                wandb_run.log(attach_global_step(final_val_metrics, global_step), step=global_step)
-                print(f"RL final validation metrics logged at global_step={global_step}.")
-        distributed_barrier()
-
-        if is_main and not args.audit_only:
-            final_checkpoint_dir = save_raw_checkpoint(base_model, raw_checkpoint_dir, global_step, args)
-            export_hf_model(base_model, output_dir)
-
-        distributed_barrier()
-
-        if wandb_run is not None and is_main:
-            import wandb
-
-            artifact_export_dir = output_dir / "_artifact_export"
-            artifact_manifest = prepare_model_artifact_directory(
-                source_dir=str(output_dir),
-                export_dir=str(artifact_export_dir),
-            )
-            artifact_directory = (
-                artifact_manifest["export_dir"]
-                if artifact_manifest.get("prepared")
-                else str(output_dir)
-            )
-            checkpoint_status = maybe_log_directory_artifact(
-                run=wandb_run,
-                wandb_module=wandb,
-                artifact_name=args.checkpoint_artifact_name,
-                artifact_type="model",
-                directory=artifact_directory,
-                aliases=parse_artifact_aliases(args.checkpoint_artifact_aliases),
-                metadata=build_checkpoint_artifact_metadata(
-                    args,
-                    run_name,
-                    tracking_config={
-                        **tracking_config,
-                        "artifact_export_mode": artifact_manifest.get("mode"),
-                        "artifact_selected_checkpoint": artifact_manifest.get("selected_checkpoint"),
-                    },
+            rank_print(
+                runtime,
+                (
+                    f"step {step + 1}: rollout generation complete "
+                    f"(local_queries={len(local_queries)}, local_rollouts={sum(len(group.completions) for group in local_groups)})"
                 ),
             )
-            if checkpoint_status["logged"]:
-                sync_run_config(
-                    wandb_run,
-                    {
-                        "model_artifact": checkpoint_status["artifact_name"],
-                        "model_artifact_aliases": checkpoint_status["aliases"],
-                        "last_raw_checkpoint": str(final_checkpoint_dir) if final_checkpoint_dir else "",
-                        "weave_trace_project": weave_trace_state["project"] if weave_trace_state else None,
-                        "weave_trace_count": weave_trace_state["logged"] if weave_trace_state else 0,
+            rollout_worker.unload()
+            global_reward_std = compute_global_reward_std(
+                [group.rewards for group in local_groups],
+                runtime=runtime,
+                epsilon=algorithm.reward_std_epsilon,
+            )
+
+            rank_print(runtime, f"step {step + 1}: starting old/ref log-prob scoring")
+            move_model_to_device(policy_stack.old_policy, runtime.device)
+            move_model_to_device(policy_stack.ref_policy, runtime.device)
+            for group in local_groups:
+                completion_token_lengths = [int(item.numel()) for item in group.completion_ids]
+
+                def score_group(current_group: RolloutGroup = group) -> Dict[str, Any]:
+                    full_advantages = torch.tensor(
+                        compute_group_advantages(current_group.rewards, global_reward_std),
+                        dtype=torch.float32,
+                        device=runtime.device,
+                    )
+                    selected_indices = select_rollout_indices_for_loss(
+                        current_group.completion_ids,
+                        max_loss_completion_tokens=int(args.max_loss_completion_tokens),
+                    )
+                    current_group.filtered_rollouts = float(len(current_group.completion_ids) - len(selected_indices))
+                    if not selected_indices:
+                        current_group.selected_completion_ids = []
+                        current_group.advantages = torch.zeros((0,), dtype=torch.float32, device=runtime.device)
+                        current_group.old_log_probs = torch.zeros((0,), dtype=torch.float32, device=runtime.device)
+                        current_group.ref_log_probs = torch.zeros((0,), dtype=torch.float32, device=runtime.device)
+                        return {
+                            "raw_rollout_count": len(current_group.completion_ids),
+                            "selected_rollout_count": 0,
+                            "filtered_rollout_count": float(current_group.filtered_rollouts),
+                            "old_log_prob_mean": 0.0,
+                            "ref_log_prob_mean": 0.0,
+                        }
+
+                    index_tensor = torch.tensor(selected_indices, dtype=torch.long, device=runtime.device)
+                    current_group.selected_completion_ids = [current_group.completion_ids[idx] for idx in selected_indices]
+                    current_group.advantages = full_advantages.index_select(0, index_tensor)
+                    with torch.no_grad():
+                        current_group.old_log_probs = compute_sequence_log_probs(
+                            policy_stack.old_policy,
+                            current_group.query,
+                            current_group.selected_completion_ids,
+                            policy_stack.pad_token_id,
+                            runtime.device,
+                            microbatch_size=int(args.rollout_logprob_microbatch_size),
+                        ).detach()
+                        current_group.ref_log_probs = compute_sequence_log_probs(
+                            policy_stack.ref_policy,
+                            current_group.query,
+                            current_group.selected_completion_ids,
+                            policy_stack.pad_token_id,
+                            runtime.device,
+                            microbatch_size=int(args.rollout_logprob_microbatch_size),
+                        ).detach()
+                    return {
+                        "raw_rollout_count": len(current_group.completion_ids),
+                        "selected_rollout_count": len(current_group.selected_completion_ids),
+                        "filtered_rollout_count": float(current_group.filtered_rollouts),
+                        "old_log_prob_mean": float(current_group.old_log_probs.detach().mean().item()),
+                        "ref_log_prob_mean": float(current_group.ref_log_probs.detach().mean().item()),
+                    }
+
+                tracker.trace_scoring_call(
+                    step=step + 1,
+                    split="train",
+                    query=group.query,
+                    payload={
+                        "raw_rollout_count": len(group.completion_ids),
+                        "completion_token_lengths": completion_token_lengths,
+                        "max_loss_completion_tokens": int(args.max_loss_completion_tokens),
                     },
+                    callback=score_group,
+                )
+            offload_model_to_cpu(policy_stack.old_policy)
+            offload_model_to_cpu(policy_stack.ref_policy)
+
+            rank_print(
+                runtime,
+                (
+                    f"step {step + 1}: finished old/ref scoring "
+                    f"(valid_rollouts={sum(len(group.selected_completion_ids or []) for group in local_groups)}, "
+                    f"filtered_rollouts={sum(float(group.filtered_rollouts) for group in local_groups):.0f})"
+                ),
+            )
+            policy_loss_values: List[float] = []
+            kl_values: List[float] = []
+            ratio_means: List[float] = []
+            ratio_maxes: List[float] = []
+            filtered_rollout_counts = [float(group.filtered_rollouts) for group in local_groups]
+            valid_rollout_counts = [float(len(group.selected_completion_ids or [])) for group in local_groups]
+
+            rank_print(runtime, f"step {step + 1}: starting policy updates")
+            def run_policy_updates() -> Dict[str, Any]:
+                chunk_count = 0
+                for _ in range(algorithm.steps_per_generation):
+                    for group in local_groups:
+                        selected_completion_ids = list(group.selected_completion_ids or [])
+                        if not selected_completion_ids:
+                            continue
+                        policy_stack.engine.zero_grad()
+                        chunk_size = int(runtime_spec.optimizer_micro_batch_size_per_gpu)
+                        total_rollouts = len(selected_completion_ids)
+                        for start_idx in range(0, total_rollouts, chunk_size):
+                            end_idx = min(total_rollouts, start_idx + chunk_size)
+                            chunk_completion_ids = selected_completion_ids[start_idx:end_idx]
+                            chunk_advantages = group.advantages[start_idx:end_idx]
+                            chunk_old_log_probs = group.old_log_probs[start_idx:end_idx]
+                            chunk_ref_log_probs = group.ref_log_probs[start_idx:end_idx]
+                            loss, chunk_metrics = compute_chunk_loss(
+                                current_model=policy_stack.engine.module,
+                                query=group.query,
+                                completion_ids=chunk_completion_ids,
+                                advantages=chunk_advantages,
+                                old_log_probs=chunk_old_log_probs,
+                                ref_log_probs=chunk_ref_log_probs,
+                                algorithm=algorithm,
+                                pad_token_id=policy_stack.pad_token_id,
+                                device=runtime.device,
+                                logprob_microbatch_size=int(args.rollout_logprob_microbatch_size),
+                            )
+                            policy_stack.engine.backward(loss)
+                            policy_stack.engine.step()
+                            policy_loss_values.append(float(loss.detach().item()))
+                            kl_values.append(float(chunk_metrics["kl_mean"]))
+                            ratio_means.append(float(chunk_metrics["ratio_mean"]))
+                            ratio_maxes.append(float(chunk_metrics["ratio_max"]))
+                            chunk_count += 1
+                return {
+                    "update_chunk_count": chunk_count,
+                    "valid_rollout_count": int(sum(len(group.selected_completion_ids or []) for group in local_groups)),
+                    "policy_loss_mean": mean_or_zero(policy_loss_values),
+                    "kl_mean": mean_or_zero(kl_values),
+                    "ratio_mean": mean_or_zero(ratio_means),
+                    "ratio_max": max(ratio_maxes) if ratio_maxes else 0.0,
+                }
+
+            tracker.trace_policy_update_call(
+                step=step + 1,
+                split="train",
+                callback=run_policy_updates,
+                payload={
+                    "steps_per_generation": int(algorithm.steps_per_generation),
+                    "optimizer_micro_batch_size_per_gpu": int(runtime_spec.optimizer_micro_batch_size_per_gpu),
+                    "valid_rollout_counts": [int(value) for value in valid_rollout_counts],
+                    "filtered_rollout_counts": [int(value) for value in filtered_rollout_counts],
+                },
+            )
+
+            rank_print(runtime, f"step {step + 1}: policy updates complete, refreshing rollout worker")
+            refresh_old_policy_and_rollout_worker(
+                policy_stack=policy_stack,
+                rollout_worker=rollout_worker,
+                output_dir=output_dir,
+                runtime=runtime,
+                step=step + 1,
+            )
+            rank_print(runtime, f"step {step + 1}: waiting at post-refresh barrier")
+            barrier(runtime)
+            rank_print(runtime, f"step {step + 1}: passed post-refresh barrier")
+
+            local_rewards = [reward for group in local_groups for reward in group.rewards]
+            metrics = {
+                "reward_mean": mean_or_zero(local_rewards),
+                "reward_nonzero_rate": mean_or_zero([1.0 if reward > 0.0 else 0.0 for reward in local_rewards]),
+                "reward_std": float(global_reward_std),
+                "loss_mean": mean_or_zero(policy_loss_values),
+                "kl_mean": mean_or_zero(kl_values),
+                "ratio_mean": mean_or_zero(ratio_means),
+                "ratio_max": max(ratio_maxes) if ratio_maxes else 0.0,
+                "filtered_rollouts": sum(filtered_rollout_counts),
+                "valid_rollouts": sum(valid_rollout_counts),
+                "learning_rate": float(policy_stack.engine.optimizer.param_groups[0]["lr"]),
+                "step": float(step + 1),
+            }
+
+            aggregated_metrics = {
+                "reward_mean": all_reduce_sum_scalar(metrics["reward_mean"], runtime) / float(runtime.world_size),
+                "reward_nonzero_rate": all_reduce_sum_scalar(metrics["reward_nonzero_rate"], runtime) / float(runtime.world_size),
+                "reward_std": metrics["reward_std"],
+                "loss_mean": all_reduce_sum_scalar(metrics["loss_mean"], runtime) / float(runtime.world_size),
+                "kl_mean": all_reduce_sum_scalar(metrics["kl_mean"], runtime) / float(runtime.world_size),
+                "ratio_mean": all_reduce_sum_scalar(metrics["ratio_mean"], runtime) / float(runtime.world_size),
+                "ratio_max": all_reduce_max_scalar(metrics["ratio_max"], runtime),
+                "filtered_rollouts": all_reduce_sum_scalar(metrics["filtered_rollouts"], runtime),
+                "valid_rollouts": all_reduce_sum_scalar(metrics["valid_rollouts"], runtime),
+                "learning_rate": metrics["learning_rate"],
+            }
+            tracker.log_metrics(aggregated_metrics, step=step + 1)
+            rank0_print(
+                runtime,
+                (
+                    f"[step {step + 1:04d}] reward={aggregated_metrics['reward_mean']:.4f} "
+                    f"reward_std={aggregated_metrics['reward_std']:.4f} "
+                    f"loss={aggregated_metrics['loss_mean']:.6f}"
+                ),
+            )
+
+            if eval_spec.validation_every_n_steps > 0 and (step + 1) % eval_spec.validation_every_n_steps == 0:
+                validation_metrics = evaluate_validation_subset(
+                    validation_dataset=validation_dataset,
+                    policy_worker=rollout_worker,
+                    policy_model=policy_stack.engine.module,
+                    ia_weights=ia_weights,
+                    go_graph=go_graph,
+                    eval_spec=eval_spec,
+                    runtime=runtime,
+                )
+                if validation_metrics:
+                    tracker.log_metrics(validation_metrics, step=step + 1)
+
+            if eval_spec.save_every_n_steps > 0 and (step + 1) % eval_spec.save_every_n_steps == 0:
+                save_training_checkpoint(
+                    policy_stack=policy_stack,
+                    args=args,
+                    step=step + 1,
+                    tracker=tracker,
+                    runtime=runtime,
                 )
     finally:
-        if wandb_run is not None and is_main:
-            if weave_trace_state and weave_trace_state.get("client") is not None:
-                flush = getattr(weave_trace_state["client"], "flush", None)
-                if callable(flush):
-                    flush()
-            wandb_run.finish()
-        cleanup_distributed_runtime()
+        rollout_worker.close()
+        tracker.finish()
+        shutdown_runtime(runtime)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parse_args(argv)
+    if args.preflight_only:
+        raise SystemExit(0 if run_preflight(args) else 1)
     train(args)
 
 

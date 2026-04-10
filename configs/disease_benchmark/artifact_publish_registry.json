@@ -4,8 +4,14 @@
     "comparison-model-family": [
       "bioreason-pro-rl-paper"
     ],
+    "benchmark-ia": [
+      "disease-temporal-ia-main",
+      "disease-temporal-ia-comparison"
+    ],
     "all": [
-      "bioreason-pro-rl-paper"
+      "bioreason-pro-rl-paper",
+      "disease-temporal-ia-main",
+      "disease-temporal-ia-comparison"
     ]
   },
   "assets": {
@@ -41,6 +47,37 @@
             "protein_projection.pt",
             "protein_model/pytorch_model.bin"
           ]
+        }
+      ]
+    },
+    "disease-temporal-ia-main": {
+      "display_name": "disease-temporal-ia-main",
+      "artifact_name": "disease-temporal-ia",
+      "artifact_type": "dataset",
+      "registry_env_var": "BIOREASON_MAIN_IA_REGISTRY_PATH",
+      "artifact_aliases": [
+        "production",
+        "{benchmark_alias}"
+      ],
+      "sources": [
+        {
+          "type": "local_path",
+          "local_path": "${BIOREASON_MAIN_IA_SOURCE_PATH}"
+        }
+      ]
+    },
+    "disease-temporal-ia-comparison": {
+      "display_name": "disease-temporal-ia-comparison",
+      "artifact_name": "disease-temporal-ia",
+      "artifact_type": "dataset",
+      "registry_env_var": "BIOREASON_COMPARISON_IA_REGISTRY_PATH",
+      "artifact_aliases": [
+        "{benchmark_alias}"
+      ],
+      "sources": [
+        {
+          "type": "local_path",
+          "local_path": "${BIOREASON_COMPARISON_IA_SOURCE_PATH}"
         }
       ]
     }

@@ -1,24 +1,25 @@
 import importlib.util
+import io
+import json
+import math
+import os
+import subprocess
 import sys
+import tempfile
+import textwrap
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
-
-try:
-    import torch
-except ImportError:  # pragma: no cover - contract tests run without torch
-    torch = None
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = ROOT / "train_protein_grpo.py"
-SFT_SCRIPT_PATH = ROOT / "train_protein_llm.py"
 WRAPPER_PATH = ROOT / "scripts" / "sh_train_protein_grpo.sh"
-SFT_WRAPPER_PATH = ROOT / "scripts" / "sh_train_protein_qwen_staged.sh"
 
 
 def load_grpo_module():
-    module_name = "train_protein_grpo_contracts_test_module"
+    module_name = "train_protein_grpo_spec_test_module"
     spec = importlib.util.spec_from_file_location(module_name, SCRIPT_PATH)
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
@@ -30,722 +31,903 @@ def load_grpo_module():
 GRPO = load_grpo_module()
 
 
+class FakeWeaveClient:
+    def __init__(self) -> None:
+        self.flush_called = False
+
+    def flush(self) -> None:
+        self.flush_called = True
+
+
+class FakeWeaveAttributes:
+    def __init__(self, owner: "FakeWeaveModule", payload: dict[str, object]) -> None:
+        self.owner = owner
+        self.payload = dict(payload)
+
+    def __enter__(self) -> "FakeWeaveAttributes":
+        self.owner.attribute_calls.append(self.payload)
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+
+class FakeWeaveModule:
+    def __init__(self) -> None:
+        self.client = FakeWeaveClient()
+        self.init_calls: list[dict[str, object]] = []
+        self.attribute_calls: list[dict[str, object]] = []
+        self.trace_payloads: list[dict[str, object]] = []
+
+    def init(self, project: str, global_attributes: dict[str, object] | None = None) -> FakeWeaveClient:
+        self.init_calls.append(
+            {
+                "project": project,
+                "global_attributes": dict(global_attributes or {}),
+            }
+        )
+        return self.client
+
+    def op(self, name: str):
+        def decorator(fn):
+            def wrapped(payload):
+                payload_dict = dict(payload)
+                self.trace_payloads.append(payload_dict)
+                return fn(payload_dict)
+
+            wrapped._weave_name = name
+            return wrapped
+
+        return decorator
+
+    def attributes(self, payload: dict[str, object]) -> FakeWeaveAttributes:
+        return FakeWeaveAttributes(self, payload)
+
+
 class TrainProteinGrpoContractsTest(unittest.TestCase):
-    def test_resolve_attn_implementation_falls_back_without_flash_attn(self):
-        with mock.patch("importlib.util.find_spec", return_value=None):
-            self.assertEqual(GRPO.resolve_attn_implementation("flash_attention_2"), "sdpa")
+    def write_executable(self, path: Path, body: str) -> Path:
+        path.write_text(body, encoding="utf-8")
+        path.chmod(0o755)
+        return path
 
-    def test_wrapper_uses_sft_conversion_lora_settings(self):
-        wrapper_text = WRAPPER_PATH.read_text()
+    def create_model_bundle(self, root: Path) -> Path:
+        model_dir = root / "model_bundle"
+        (model_dir / "protein_model").mkdir(parents=True, exist_ok=True)
+        (model_dir / "config.json").write_text("{}", encoding="utf-8")
+        (model_dir / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+        (model_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+        (model_dir / "protein_projection.pt").write_text("stub", encoding="utf-8")
+        (model_dir / "protein_model" / "pytorch_model.bin").write_text("stub", encoding="utf-8")
+        return model_dir
 
-        self.assertIn("source_env_file_without_overrides()", wrapper_text)
-        self.assertIn('source_env_file_without_overrides "$REGISTRY_ENV_FILE"', wrapper_text)
-        self.assertIn('BASE_WANDB_PROJECT=${BASE_WANDB_PROJECT:-"${WANDB_PROJECT:-bioreasoning-pro}"}', wrapper_text)
-        self.assertIn('BASE_CHECKPOINT_LOCAL_DIR=${BASE_CHECKPOINT_LOCAL_DIR:-""}', wrapper_text)
-        self.assertIn('SFT_CONVERSION_LORA_RANK=${SFT_CONVERSION_LORA_RANK:-128}', wrapper_text)
-        self.assertIn('SFT_CONVERSION_LORA_ALPHA=${SFT_CONVERSION_LORA_ALPHA:-256}', wrapper_text)
-        self.assertIn('SFT_CONVERSION_LORA_DROPOUT=${SFT_CONVERSION_LORA_DROPOUT:-0.05}', wrapper_text)
-        self.assertIn('CAFA5_DATASET=${CAFA5_DATASET:-""}', wrapper_text)
-        self.assertIn('WEAVE_TRACE_BUDGET=${WEAVE_TRACE_BUDGET:-128}', wrapper_text)
-        self.assertIn('PER_DEVICE_TRAIN_BATCH_SIZE=${PER_DEVICE_TRAIN_BATCH_SIZE:-${TRAIN_BATCH_SIZE:-1}}', wrapper_text)
-        self.assertIn('PER_DEVICE_EVAL_BATCH_SIZE=${PER_DEVICE_EVAL_BATCH_SIZE:-${EVAL_BATCH_SIZE:-4}}', wrapper_text)
-        self.assertIn('MAX_EVAL_SAMPLES=${MAX_EVAL_SAMPLES:-200}', wrapper_text)
-        self.assertIn('MAX_EVAL_BATCHES=${MAX_EVAL_BATCHES:-0}', wrapper_text)
-        self.assertIn('ROTATING_EVAL_EVERY_N_STEPS=${ROTATING_EVAL_EVERY_N_STEPS:-100}', wrapper_text)
-        self.assertIn('ROTATING_EVAL_MAX_SAMPLES=${ROTATING_EVAL_MAX_SAMPLES:-256}', wrapper_text)
-        self.assertIn('ROTATING_EVAL_SAMPLE_STRATEGY=${ROTATING_EVAL_SAMPLE_STRATEGY:-"stratified_aspect_profile"}', wrapper_text)
-        self.assertIn('ROTATING_EVAL_SEED_STRIDE=${ROTATING_EVAL_SEED_STRIDE:-9973}', wrapper_text)
-        self.assertIn('AUDIT_ONLY=${AUDIT_ONLY:-"False"}', wrapper_text)
-        self.assertIn('SEED=${SEED:-42}', wrapper_text)
-        self.assertIn('LOSS_TYPE=${LOSS_TYPE:-"dr_grpo"}', wrapper_text)
-        self.assertIn('STEPS_PER_GENERATION=${STEPS_PER_GENERATION:-2}', wrapper_text)
-        self.assertIn('NUM_ITERATIONS=${NUM_ITERATIONS:-1}', wrapper_text)
-        self.assertIn('NUM_GENERATIONS=${NUM_GENERATIONS:-24}', wrapper_text)
-        self.assertIn('EVAL_DO_SAMPLE=${EVAL_DO_SAMPLE:-"False"}', wrapper_text)
-        self.assertIn('EVAL_TEMPERATURE=${EVAL_TEMPERATURE:-0.1}', wrapper_text)
-        self.assertIn('EVAL_TOP_P=${EVAL_TOP_P:-0.9}', wrapper_text)
-        self.assertIn('EVAL_TOP_K=${EVAL_TOP_K:-20}', wrapper_text)
-        self.assertIn('REPETITION_PENALTY=${REPETITION_PENALTY:-1.0}', wrapper_text)
-        self.assertIn('CLIP_EPSILON_LOW=${CLIP_EPSILON_LOW:-7e-4}', wrapper_text)
-        self.assertIn('CLIP_EPSILON_HIGH=${CLIP_EPSILON_HIGH:-9e-4}', wrapper_text)
-        self.assertIn('REWARD_SCALING=${REWARD_SCALING:-"batch"}', wrapper_text)
-        self.assertIn('IMPORTANCE_SAMPLING_CAP=${IMPORTANCE_SAMPLING_CAP:-2.0}', wrapper_text)
-        self.assertIn('REWARD_FINAL_ANSWER_ONLY=${REWARD_FINAL_ANSWER_ONLY:-"False"}', wrapper_text)
-        self.assertIn('REWARD_PREDICTION_SOURCE=${REWARD_PREDICTION_SOURCE:-"auto"}', wrapper_text)
-        self.assertIn('REWARD_FUNCS=${REWARD_FUNCS:-"ia_weighted_f1"}', wrapper_text)
-        self.assertIn('REWARD_WEIGHTS=${REWARD_WEIGHTS:-"1.0"}', wrapper_text)
-        self.assertIn('PYTHON_BIN=${PYTHON_BIN:-""}', wrapper_text)
-        self.assertIn('if [ -x "$(pwd)/.venv-gpu/bin/python" ]; then', wrapper_text)
-        self.assertIn('if [ "$TRAIN_NUM_GPUS" -gt 1 ]; then', wrapper_text)
-        self.assertIn('torch.distributed.run', wrapper_text)
-        self.assertIn('--nproc_per_node "$TRAIN_NUM_GPUS"', wrapper_text)
-        self.assertIn('ADD_UNIPROT_SUMMARY=${ADD_UNIPROT_SUMMARY:-"False"}', wrapper_text)
-        self.assertIn('CONTINUATION_MODE=${CONTINUATION_MODE:-"paper_native"}', wrapper_text)
-        self.assertIn('if [ "$CONTINUATION_MODE" = "paper_native" ]; then', wrapper_text)
-        self.assertIn('INCLUDE_PROTEIN_FUNCTION_SUMMARY="True"', wrapper_text)
-        self.assertIn('REASONING_PROMPT_STYLE=${REASONING_PROMPT_STYLE:-"auto"}', wrapper_text)
-        self.assertIn('COMPACT_INTERPRO_LIMIT=${COMPACT_INTERPRO_LIMIT:-12}', wrapper_text)
-        self.assertIn('COMPACT_PPI_LIMIT=${COMPACT_PPI_LIMIT:-10}', wrapper_text)
-        self.assertIn('COMPACT_GO_SPECULATION_LIMIT=${COMPACT_GO_SPECULATION_LIMIT:-8}', wrapper_text)
-        self.assertIn('MIN_NEW_TOKENS=${MIN_NEW_TOKENS:-1}', wrapper_text)
-        self.assertIn('MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-10000}', wrapper_text)
-        self.assertIn('if [ -z "${ROLLOUT_LOGPROB_MICROBATCH_SIZE+x}" ]; then', wrapper_text)
-        self.assertIn('ROLLOUT_LOGPROB_MICROBATCH_SIZE=1', wrapper_text)
-        self.assertIn('ROLLOUT_LOGPROB_MICROBATCH_SIZE=4', wrapper_text)
-        self.assertIn('SAMPLING_CONTRACT=${SAMPLING_CONTRACT:-"auto"}', wrapper_text)
-        self.assertIn('TEMPERATURE=${TEMPERATURE:-1.0}', wrapper_text)
-        self.assertIn('TOP_P=${TOP_P:-0.95}', wrapper_text)
-        self.assertIn('TOP_K=${TOP_K:-20}', wrapper_text)
-        self.assertIn('if [ "${CHECKPOINT_ARTIFACT_NAME+x}" = "x" ]; then', wrapper_text)
-        self.assertIn('RL_RUN_FAMILY="rl-sft"', wrapper_text)
-        self.assertIn('RL_RUN_FAMILY="rl-paper"', wrapper_text)
-        self.assertIn('WANDB_RUN_NAME=${WANDB_RUN_NAME:-"${RL_RUN_FAMILY}-${TIMESTAMP}"}', wrapper_text)
-        self.assertIn('--asset-key reasoning_dataset', wrapper_text)
-        self.assertIn('resolve_existing_dir()', wrapper_text)
-        self.assertIn('is_valid_hf_model_dir()', wrapper_text)
-        self.assertIn('"$PYTHON_BIN" "$MODEL_SOURCE_RESOLVER"', wrapper_text)
-        self.assertIn('"$PYTHON_BIN" - "$config_path"', wrapper_text)
-        self.assertIn('find "$RESOLVED_TRAIN_SFT_DIR" -maxdepth 2 -type f -name "*best*.ckpt"', wrapper_text)
-        self.assertIn('SFT_CKPT_PATH="$RESOLVED_TRAIN_SFT_DIR/last.ckpt"', wrapper_text)
-        self.assertIn('Error: BASE_CHECKPOINT_LOCAL_DIR is not a valid HF model directory', wrapper_text)
-        self.assertIn('--- Removing invalid converted HF train-sft-output at $TRAIN_SFT_HF_DIR', wrapper_text)
-        self.assertIn('Error: RL init model directory is not a valid HF model directory', wrapper_text)
-        self.assertIn('--lora_rank "$SFT_CONVERSION_LORA_RANK"', wrapper_text)
-        self.assertIn('--lora_alpha "$SFT_CONVERSION_LORA_ALPHA"', wrapper_text)
-        self.assertIn('--lora_dropout "$SFT_CONVERSION_LORA_DROPOUT"', wrapper_text)
-        self.assertIn('--seed "$SEED"', wrapper_text)
-        self.assertIn('--ia_file_path "$IA_FILE_PATH"', wrapper_text)
-        self.assertIn('--require_ia_file "$REQUIRE_IA_FILE"', wrapper_text)
-        self.assertIn('--weave_trace_budget "$WEAVE_TRACE_BUDGET"', wrapper_text)
-        self.assertIn('--audit_only "$AUDIT_ONLY"', wrapper_text)
-        self.assertIn('--weave_trace_full_group_count "$WEAVE_TRACE_FULL_GROUP_COUNT"', wrapper_text)
-        self.assertIn('--weave_trace_full_rollouts_per_group "$WEAVE_TRACE_FULL_ROLLOUTS_PER_GROUP"', wrapper_text)
-        self.assertIn('--loss_type "$LOSS_TYPE"', wrapper_text)
-        self.assertIn('--steps_per_generation "$STEPS_PER_GENERATION"', wrapper_text)
-        self.assertIn('--num_iterations "$NUM_ITERATIONS"', wrapper_text)
-        self.assertIn('--min_new_tokens "$MIN_NEW_TOKENS"', wrapper_text)
-        self.assertIn('--rollout_logprob_microbatch_size "$ROLLOUT_LOGPROB_MICROBATCH_SIZE"', wrapper_text)
-        self.assertIn('--min_p "$MIN_P"', wrapper_text)
-        self.assertIn('--repetition_penalty "$REPETITION_PENALTY"', wrapper_text)
-        self.assertIn('--clip_epsilon_low "$CLIP_EPSILON_LOW"', wrapper_text)
-        self.assertIn('--clip_epsilon_high "$CLIP_EPSILON_HIGH"', wrapper_text)
-        self.assertIn('--reward_scaling "$REWARD_SCALING"', wrapper_text)
-        self.assertIn('--importance_sampling_cap "$IMPORTANCE_SAMPLING_CAP"', wrapper_text)
-        self.assertIn('--reward_prediction_source "$REWARD_PREDICTION_SOURCE"', wrapper_text)
-        self.assertIn('--include_protein_function_summary "$INCLUDE_PROTEIN_FUNCTION_SUMMARY"', wrapper_text)
-        self.assertIn('--continuation_mode "$CONTINUATION_MODE"', wrapper_text)
-        self.assertIn('--reasoning_prompt_style "$REASONING_PROMPT_STYLE"', wrapper_text)
-        self.assertIn('--compact_interpro_limit "$COMPACT_INTERPRO_LIMIT"', wrapper_text)
-        self.assertIn('--compact_ppi_limit "$COMPACT_PPI_LIMIT"', wrapper_text)
-        self.assertIn('--compact_go_speculation_limit "$COMPACT_GO_SPECULATION_LIMIT"', wrapper_text)
-        self.assertIn('--sampling_contract "$SAMPLING_CONTRACT"', wrapper_text)
-        self.assertIn('--per_device_train_batch_size "$PER_DEVICE_TRAIN_BATCH_SIZE"', wrapper_text)
-        self.assertIn('--per_device_eval_batch_size "$PER_DEVICE_EVAL_BATCH_SIZE"', wrapper_text)
-        self.assertIn('TRAIN_LAUNCH_PREFIX=()', wrapper_text)
-        self.assertIn('stdbuf -oL -eL "${TRAIN_COMMAND[@]}" "${TRAIN_LAUNCH_PREFIX[@]}" train_protein_grpo.py', wrapper_text)
+    def create_dataset_dir(self, root: Path) -> Path:
+        dataset_dir = root / "dataset"
+        dataset_dir.mkdir(parents=True, exist_ok=True)
+        (dataset_dir / "dataset_dict.json").write_text("{}", encoding="utf-8")
+        return dataset_dir
 
-    def test_extract_go_ids_preserves_order_and_deduplicates(self):
-        text = "GO:0008150 and GO:0003674 and GO:0008150 again"
-        self.assertEqual(GRPO.extract_go_ids(text), ["GO:0008150", "GO:0003674"])
-
-    def test_extract_reasoning_and_answer_parses_sections(self):
-        text = "<think>first infer signaling loss</think><answer>GO:0007165, GO:0005515</answer>"
-        parsed = GRPO.extract_reasoning_and_answer(text)
-        self.assertEqual(parsed["reasoning"], "first infer signaling loss")
-        self.assertEqual(parsed["final_answer"], "GO:0007165, GO:0005515")
-
-    def test_build_target_go_ids_merges_all_aspects(self):
-        sample_meta = {
-            "go_bp": "GO:0007165",
-            "go_mf": "GO:0005515",
-            "go_cc": "GO:0005737",
-            "ground_truth_go_terms": "GO:0007165, GO:0009987",
-        }
-        self.assertEqual(
-            GRPO.build_target_go_ids(sample_meta),
-            ["GO:0007165", "GO:0005515", "GO:0005737", "GO:0009987"],
+    def create_wrapper_harness(self, root: Path) -> dict[str, str]:
+        model_dir = self.create_model_bundle(root)
+        dataset_dir = self.create_dataset_dir(root)
+        ia_dir = root / "ia_bundle"
+        ia_dir.mkdir(parents=True, exist_ok=True)
+        ia_path = ia_dir / "IA.txt"
+        ia_path.write_text("GO:0000001 1.0\n", encoding="utf-8")
+        obo_path = root / "mini.obo"
+        obo_path.write_text("[Term]\nid: GO:0000001\nname: root\n", encoding="utf-8")
+        hostfile = root / "hosts.txt"
+        hostfile.write_text("worker-0 slots=4\nworker-1 slots=4\n", encoding="utf-8")
+        registry_env = root / "wandb_registry_paths.env"
+        registry_env.write_text(
+            "\n".join(
+                [
+                    'export BIOREASON_RL_PAPER_MODEL_REGISTRY_PATH="env/project/bioreason-pro-rl-paper:production"',
+                    'export WANDB_PROJECT="env-project"',
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
         )
+        log_path = root / "tool_log.jsonl"
 
-    def test_go_overlap_reward_uses_reasoning_trace_when_configured(self):
-        completion = "<think>Reasoning mentions GO:0007165.</think><answer>GO:0005515</answer>"
-        sample_meta = {"go_bp": "GO:0007165"}
+        fake_python = self.write_executable(
+            root / "fake_python.py",
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env python3
+                import json
+                import os
+                import sys
+                from pathlib import Path
 
-        with mock.patch.dict(GRPO.REWARD_CONTEXT, {"reward_prediction_source": "reasoning_trace"}):
-            self.assertGreater(GRPO.go_overlap_reward(completion, sample_meta), 0.0)
+                log_path = Path(os.environ["FAKE_LOG_PATH"])
+                with log_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps({"tool": "python", "argv": sys.argv[1:]}) + "\\n")
 
-    def test_strict_format_reward_rejects_structural_tag_noise(self):
-        completion = "<think>reasoning</think></tool_call>"
+                script_name = Path(sys.argv[1]).name if len(sys.argv) > 1 else ""
+                argv = sys.argv[2:]
 
-        self.assertEqual(GRPO.strict_format_reward(completion, {}), 0.0)
-        self.assertLess(GRPO.structural_noise_reward(completion, {}), 0.0)
+                def value_after(flag: str) -> str:
+                    if flag not in argv:
+                        return ""
+                    index = argv.index(flag)
+                    if index + 1 >= len(argv):
+                        return ""
+                    return argv[index + 1]
 
-    def test_summary_schema_reward_requires_expected_summary_blocks(self):
-        completion = (
-            "<think>reasoning</think>"
-            "<|GO_SUMMARY_START|>\nBP: GO:0007165\n<|GO_SUMMARY_END|>\n\n"
-            "<|FUNCTION_SUMMARY_START|>\nKinase-linked signaling regulator.\n<|FUNCTION_SUMMARY_END|>"
-        )
-
-        self.assertEqual(GRPO.summary_schema_reward(completion, {"go_aspect": "bp"}), 1.0)
-
-    def test_summary_schema_reward_accepts_go_summary_without_function_summary(self):
-        completion = (
-            "<think>reasoning</think>"
-            "<|GO_SUMMARY_START|>\nBP: GO:0007165\n<|GO_SUMMARY_END|>"
-        )
-
-        self.assertEqual(GRPO.summary_schema_reward(completion, {"go_aspect": "bp"}), 1.0)
-
-    def test_go_presence_reward_penalizes_freeform_answers_without_go_ids(self):
-        completion = "<think>reasoning</think><answer>This protein likely regulates signaling.</answer>"
-
-        self.assertLess(GRPO.go_presence_reward(completion, {"go_bp": "GO:0007165"}), 0.0)
-
-    def test_go_presence_reward_rewards_tagged_go_summary(self):
-        completion = (
-            "<think>reasoning</think>"
-            "<|GO_SUMMARY_START|>\nBP: GO:0007165\n<|GO_SUMMARY_END|>\n\n"
-            "<|FUNCTION_SUMMARY_START|>\nKinase-linked signaling regulator.\n<|FUNCTION_SUMMARY_END|>"
-        )
-
-        self.assertEqual(GRPO.go_presence_reward(completion, {"go_bp": "GO:0007165"}), 1.0)
-
-    def test_go_presence_reward_accepts_unstructured_answer_tag_go_ids_in_trace_mode(self):
-        completion = "<think>reasoning</think><answer>GO:0007165</answer>"
-
-        self.assertGreater(GRPO.go_presence_reward(completion, {"go_bp": "GO:0007165"}), 0.0)
-
-    def test_build_generation_kwargs_omits_sampling_controls_for_greedy_eval(self):
-        args = GRPO.parse_args(
-            [
-                "--text_model_name",
-                "hf-model",
-                "--eval_do_sample",
-                "false",
-            ]
-        )
-        tokenizer = type("Tokenizer", (), {"pad_token_id": 0, "eos_token_id": 1, "encode": lambda self, text, add_special_tokens=False: [1]})()
-
-        kwargs = GRPO.build_generation_kwargs(args, tokenizer, for_eval=True)
-
-        self.assertFalse(kwargs["do_sample"])
-        self.assertNotIn("temperature", kwargs)
-        self.assertNotIn("top_p", kwargs)
-        self.assertNotIn("top_k", kwargs)
-
-    def test_build_generation_kwargs_uses_checkpoint_native_sampling_for_paper_native_train(self):
-        args = GRPO.parse_args(
-            [
-                "--text_model_name",
-                "hf-model",
-            ]
-        )
-        tokenizer = type("Tokenizer", (), {"pad_token_id": 0, "eos_token_id": 1, "encode": lambda self, text, add_special_tokens=False: [1]})()
-
-        kwargs = GRPO.build_generation_kwargs(args, tokenizer, for_eval=False)
-
-        self.assertNotIn("do_sample", kwargs)
-        self.assertNotIn("temperature", kwargs)
-        self.assertNotIn("top_p", kwargs)
-        self.assertNotIn("top_k", kwargs)
-        self.assertNotIn("stopping_criteria", kwargs)
-
-    def test_go_aspect_coverage_reward_tracks_requested_aspects(self):
-        completion = (
-            "<think>reasoning</think>"
-            "<|GO_SUMMARY_START|>\nMF: GO:0005515\nBP: GO:0007165\n<|GO_SUMMARY_END|>\n\n"
-            "<|FUNCTION_SUMMARY_START|>\nSignal adaptor.\n<|FUNCTION_SUMMARY_END|>"
-        )
-
-        self.assertEqual(
-            GRPO.go_aspect_coverage_reward(
-                completion,
-                {"go_bp": "GO:0007165", "go_mf": "GO:0005515", "go_cc": "GO:0005737"},
+                if script_name == "materialize_model_source.py":
+                    sys.stdout.write(os.environ["FAKE_MODEL_DIR"])
+                elif script_name == "materialize_data_bundle.py":
+                    asset_key = value_after("--asset-key")
+                    field = value_after("--print-field")
+                    if asset_key == "reasoning_dataset" and field == "local_dir":
+                        sys.stdout.write(os.environ["FAKE_DATASET_DIR"])
+                    elif asset_key == "reasoning_dataset" and field == "dataset_name":
+                        sys.stdout.write("demo_reasoning_dataset")
+                    elif asset_key == "reasoning_dataset" and field == "wandb_registry_path":
+                        sys.stdout.write(os.environ["FAKE_DATASET_ARTIFACT"])
+                    elif asset_key == "temporal_split_artifact" and field == "wandb_registry_path":
+                        sys.stdout.write(os.environ["FAKE_TEMPORAL_ARTIFACT"])
+                    elif asset_key == "ia_file" and field == "local_dir":
+                        sys.stdout.write(os.environ["FAKE_IA_DIR"])
+                    else:
+                        raise SystemExit(f"unexpected data bundle resolver call: {argv}")
+                elif script_name == "train_protein_grpo.py":
+                    pass
+                """
             ),
-            2.0 / 3.0,
+        )
+        fake_deepspeed = self.write_executable(
+            root / "fake_deepspeed.py",
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env python3
+                import json
+                import os
+                import sys
+                from pathlib import Path
+
+                log_path = Path(os.environ["FAKE_LOG_PATH"])
+                with log_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps({"tool": "deepspeed", "argv": sys.argv[1:]}) + "\\n")
+                """
+            ),
+        )
+        model_resolver = root / "materialize_model_source.py"
+        model_resolver.write_text("# resolver placeholder\n", encoding="utf-8")
+        data_resolver = root / "materialize_data_bundle.py"
+        data_resolver.write_text("# resolver placeholder\n", encoding="utf-8")
+
+        return {
+            "FAKE_LOG_PATH": str(log_path),
+            "PYTHON_BIN": str(fake_python),
+            "DEEPSPEED_BIN": str(fake_deepspeed),
+            "MODEL_SOURCE_RESOLVER": str(model_resolver),
+            "DATA_BUNDLE_RESOLVER": str(data_resolver),
+            "REGISTRY_ENV_FILE": str(registry_env),
+            "GO_OBO_PATH": str(obo_path),
+            "FAKE_MODEL_DIR": str(model_dir),
+            "FAKE_DATASET_DIR": str(dataset_dir),
+            "FAKE_IA_DIR": str(ia_dir),
+            "FAKE_TEMPORAL_ARTIFACT": "env/project/disease-temporal-split:production",
+            "FAKE_DATASET_ARTIFACT": "env/project/disease-temporal-reasoning:production",
+            "HOSTFILE_PATH": str(hostfile),
+        }
+
+    def read_tool_log(self, log_path: Path) -> list[dict[str, object]]:
+        if not log_path.exists():
+            return []
+        return [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+    def value_after(self, argv: list[str], flag: str) -> str:
+        index = argv.index(flag)
+        return argv[index + 1]
+
+    def test_defaults_match_specification(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            args = GRPO.parse_args(["--text_model_name", "/tmp/demo-model"])
+            algorithm = GRPO.build_algorithm_spec(args)
+            runtime_spec = GRPO.build_runtime_spec(args)
+
+        self.assertEqual(args.max_steps, 1200)
+        self.assertEqual(algorithm.queries_per_step, 8)
+        self.assertEqual(algorithm.rollouts_per_query, 24)
+        self.assertEqual(algorithm.total_trajectories, 192)
+        self.assertEqual(algorithm.steps_per_generation, 2)
+        self.assertEqual(algorithm.num_iterations, 1)
+        self.assertEqual(algorithm.max_new_tokens, 10000)
+        self.assertEqual(runtime_spec.optimizer_micro_batch_size_per_gpu, 6)
+        self.assertEqual(runtime_spec.gradient_accumulation_steps, 4)
+        self.assertEqual(runtime_spec.target_num_nodes, 2)
+        self.assertEqual(runtime_spec.target_gpus_per_node, 4)
+        self.assertEqual(runtime_spec.target_world_size, 8)
+        self.assertEqual(runtime_spec.runtime_stack, "deepspeed_vllm_colocate")
+        self.assertEqual(args.attn_implementation, "auto")
+        self.assertEqual(args.dataset_num_proc, 4)
+        self.assertEqual(args.vllm_attention_backend, "XFORMERS")
+        self.assertEqual(args.vllm_worker_multiproc_method, "spawn")
+        self.assertFalse(args.vllm_use_v1)
+
+    def test_parse_args_accepts_deepspeed_local_rank_flag(self):
+        args = GRPO.parse_args(
+            [
+                "--text_model_name",
+                "/tmp/demo-model",
+                "--local_rank=3",
+            ]
         )
 
-    def test_inspect_completion_uses_reasoning_trace_go_ids_by_default(self):
-        completion = "<think>reasoning</think>GO:0007165</tool_call>"
-        meta = GRPO.inspect_completion(completion)
+        self.assertEqual(args.local_rank, 3)
 
-        self.assertEqual(meta["predicted_go_ids"], ["GO:0007165"])
-        self.assertEqual(meta["prediction_source"], "reasoning_trace")
+    def test_resolve_dataset_num_proc_treats_non_positive_as_auto(self):
+        self.assertIsNone(GRPO.resolve_dataset_num_proc(0))
+        self.assertIsNone(GRPO.resolve_dataset_num_proc(-3))
+        self.assertEqual(GRPO.resolve_dataset_num_proc(4), 4)
 
-    def test_inspect_completion_in_reasoning_trace_mode_keeps_trace_go_ids(self):
-        completion = (
-            "<think>Reasoning mentions GO:0001111 speculatively.</think>"
-            "<answer>\n"
-            "Speculative note GO:0001111 should not count.\n"
-            "<|GO_SUMMARY_START|>\nBP: GO:0007165\n<|GO_SUMMARY_END|>\n\n"
-            "<|FUNCTION_SUMMARY_START|>\nSignal adaptor.\n<|FUNCTION_SUMMARY_END|>\n"
-            "</answer>"
-        )
-        GRPO.inspect_completion_text.cache_clear()
-        with mock.patch.dict(GRPO.REWARD_CONTEXT, {"reward_prediction_source": "reasoning_trace"}):
-            meta = GRPO.inspect_completion(completion)
-
-        self.assertIn("GO:0001111", meta["predicted_go_ids"])
-        self.assertEqual(meta["prediction_source"], "reasoning_trace")
-
-    def test_go_overlap_reward_uses_reasoning_trace_go_ids(self):
-        completion = "<think>reasoning</think><answer>GO:0007165</answer>"
-
-        with mock.patch.dict(GRPO.REWARD_CONTEXT, {"reward_prediction_source": "reasoning_trace"}):
-            self.assertGreater(GRPO.go_overlap_reward(completion, {"go_bp": "GO:0007165"}), 0.0)
-
-    def test_go_overlap_reward_uses_full_completion_when_think_never_closes(self):
-        completion = "<think>Reasoning cites GO:0007165 and GO:0005515"
-
-        self.assertGreater(GRPO.go_overlap_reward(completion, {"go_bp": "GO:0007165"}), 0.0)
-
-    def test_terminal_summary_markers_include_go_summary_end(self):
-        self.assertIn(GRPO.GO_SUMMARY_END, GRPO.TERMINAL_SUMMARY_MARKERS)
-        self.assertNotIn(GRPO.FUNCTION_SUMMARY_END, GRPO.TERMINAL_SUMMARY_MARKERS)
-
-    def test_ia_weighted_f1_reward_propagates_go_terms(self):
-        completion = (
-            "<think>reasoning</think>"
-            "<|GO_SUMMARY_START|>\nBP: GO:0009966\n<|GO_SUMMARY_END|>\n\n"
-            "<|FUNCTION_SUMMARY_START|>\nSignal response regulator.\n<|FUNCTION_SUMMARY_END|>"
+    def test_extract_go_terms_requires_final_answer_block(self):
+        self.assertIsNone(GRPO.extract_go_terms_from_final_answer("GO:0007165"))
+        self.assertEqual(
+            GRPO.extract_go_terms_from_final_answer(
+                "<|FINAL_ANSWER|>\nGO:0007165\nGO:0005515\n<|/FINAL_ANSWER|>"
+            ),
+            ["GO:0007165", "GO:0005515"],
         )
 
-        self.assertGreater(
-            GRPO.ia_weighted_f1_reward(completion, {"go_bp": "GO:0009967"}),
-            0.0,
+    def test_build_query_sample_meta_omits_reasoning_and_final_answer(self):
+        sample_meta = GRPO.build_query_sample_meta(
+            {
+                "protein_ids": ["P12345"],
+                "sample_splits": ["train"],
+                "go_bp_targets": ["GO:0000001"],
+                "go_mf_targets": [""],
+                "go_cc_targets": ["GO:0000002"],
+                "reasoning_targets": ["teacher reasoning"],
+                "final_answers": ["teacher final"],
+            }
         )
 
-    def test_compute_batch_relative_advantages_uses_global_std(self):
-        grouped_advantages, global_std = GRPO.compute_batch_relative_advantages(
-            [[1.0, 1.0, 3.0], [0.0, 0.0, 2.0]],
-            epsilon_std=1e-6,
-            reward_scaling="batch",
-        )
+        self.assertEqual(sample_meta["protein_id"], "P12345")
+        self.assertEqual(sample_meta["split"], "train")
+        self.assertEqual(sample_meta["go_bp"], "GO:0000001")
+        self.assertEqual(sample_meta["go_cc"], "GO:0000002")
+        self.assertNotIn("reasoning", sample_meta)
+        self.assertNotIn("final_answer", sample_meta)
 
+    def test_compute_group_advantages_uses_batch_global_std(self):
+        runtime = GRPO.DistributedRuntime(enabled=False, rank=0, world_size=1, local_rank=0, device="cpu")
+        global_std = GRPO.compute_global_reward_std([[1.0, 1.0, 3.0], [0.0, 0.0, 2.0]], runtime, epsilon=1e-6)
         self.assertGreater(global_std, 0.0)
-        self.assertEqual(len(grouped_advantages), 2)
-        self.assertAlmostEqual(sum(grouped_advantages[0]) + sum(grouped_advantages[1]), 0.0, places=5)
 
-    def test_build_batch_semantics_matches_single_node_8gpu_target(self):
-        args = mock.Mock(
-            train_batch_size=1,
-            eval_batch_size=4,
-            num_generations=24,
-            rollout_query_batch_size=8,
-            rollout_group_size=24,
-            target_num_nodes=1,
-            target_gpus_per_node=8,
-            runtime_stack="deepspeed_vllm_colocate",
-            rollout_execution_mode="batch_first",
+        first_group = GRPO.compute_group_advantages([1.0, 1.0, 3.0], global_std)
+        second_group = GRPO.compute_group_advantages([0.0, 0.0, 2.0], global_std)
+        self.assertAlmostEqual(sum(first_group) + sum(second_group), 0.0, places=5)
+
+    def test_partition_queries_for_rank_matches_one_query_per_rank_layout(self):
+        global_indices = list(range(8))
+        self.assertEqual(GRPO.partition_queries_for_rank(global_indices, rank=0, world_size=8), [0])
+        self.assertEqual(GRPO.partition_queries_for_rank(global_indices, rank=3, world_size=8), [3])
+        self.assertEqual(GRPO.partition_queries_for_rank(global_indices, rank=7, world_size=8), [7])
+
+    def test_resolve_local_cuda_visible_device_prefers_single_visible_gpu(self):
+        self.assertEqual(GRPO.resolve_local_cuda_visible_device(local_rank=3, cuda_visible_devices="5"), "5")
+        self.assertEqual(GRPO.resolve_local_cuda_visible_device(local_rank=2, cuda_visible_devices="0,2,4,6"), "4")
+
+    def test_select_rollout_indices_for_loss_filters_long_completions(self):
+        if GRPO.torch is None:
+            self.skipTest("torch is required for completion-id tensors")
+        completion_ids = [
+            GRPO.torch.tensor([1, 2, 3], dtype=GRPO.torch.long),
+            GRPO.torch.tensor([1, 2, 3, 4, 5], dtype=GRPO.torch.long),
+        ]
+        self.assertEqual(
+            GRPO.select_rollout_indices_for_loss(completion_ids, max_loss_completion_tokens=4),
+            [0],
         )
 
-        semantics = GRPO.build_batch_semantics(args, world_size=8)
-
-        self.assertEqual(semantics["per_device_train_batch_size"], 1)
-        self.assertEqual(semantics["per_device_eval_batch_size"], 4)
-        self.assertEqual(semantics["world_size"], 8)
-        self.assertEqual(semantics["global_unique_proteins_per_step"], 8)
-        self.assertEqual(semantics["global_num_trajectories_per_step"], 192)
-        self.assertEqual(semantics["rollout_total_trajectories_target"], 192)
-        self.assertTrue(semantics["paper_faithful_batch_shape"])
-        self.assertTrue(semantics["paper_faithful_hardware_shape"])
-        self.assertTrue(semantics["paper_faithful_runtime_stack"])
-        self.assertTrue(semantics["paper_faithful_execution_mode"])
-        self.assertEqual(semantics["paper_faithful_ready"], 1.0)
-
-    def test_expand_batch_for_rollouts_preserves_example_major_layout(self):
-        try:
-            import torch
-        except ModuleNotFoundError:
-            self.skipTest("torch is unavailable in this test environment")
-
-        batch = {
-            "input_ids": torch.tensor([[1, 2], [3, 4]], dtype=torch.long),
-            "attention_mask": torch.ones((2, 2), dtype=torch.long),
-            "protein_sequences": ["AAA", "BBB", "CCC"],
-            "batch_idx_map": [0, 0, 1],
-            "structure_coords": torch.randn(2, 5, 3),
-            "batch_go_aspects": ["bp", "mf"],
-        }
-
-        expanded = GRPO.expand_batch_for_rollouts(batch, rollout_count=3, device=torch.device("cpu"))
-
-        self.assertEqual(tuple(expanded["input_ids"].shape), (6, 2))
-        self.assertEqual(expanded["row_to_example_idx"], [0, 0, 0, 1, 1, 1])
-        self.assertEqual(expanded["go_aspects"], ["bp", "bp", "bp", "mf", "mf", "mf"])
-        self.assertEqual(expanded["protein_sequences"], ["AAA", "BBB", "AAA", "BBB", "AAA", "BBB", "CCC", "CCC", "CCC"])
-        self.assertEqual(expanded["batch_idx_map"], [0, 0, 1, 1, 2, 2, 3, 4, 5])
-
-    def test_truncation_penalty_reward_penalizes_long_non_terminal_output(self):
-        completion = "<think>reasoning</think>" + " word" * 330
-
-        self.assertLess(GRPO.truncation_penalty_reward(completion, {}), 0.0)
-
-    def test_truncation_penalty_reward_rewards_terminal_summary(self):
-        completion = (
-            "<think>reasoning</think>"
-            "<|GO_SUMMARY_START|>\nBP: GO:0007165\n<|GO_SUMMARY_END|>\n"
-            "<|FUNCTION_SUMMARY_START|>\nSignal adaptor.\n<|FUNCTION_SUMMARY_END|>"
-        )
-
-        self.assertGreater(GRPO.truncation_penalty_reward(completion, {}), 0.0)
-
-    def test_standardize_group_rewards_returns_zeroes_for_constant_group(self):
-        self.assertEqual(GRPO.standardize_group_rewards([0.5, 0.5, 0.5]), [0.0, 0.0, 0.0])
-
-    def test_compute_group_rewards_combines_named_components(self):
-        completion = (
-            "<think>reasoning</think>"
-            "<|GO_SUMMARY_START|>\nBP: GO:0007165\n<|GO_SUMMARY_END|>\n\n"
-            "<|FUNCTION_SUMMARY_START|>\nSignal adaptor.\n<|FUNCTION_SUMMARY_END|>"
-        )
-        sample_meta = {"go_bp": "GO:0007165"}
-
-        totals, components = GRPO.compute_group_rewards(
-            [completion],
-            sample_meta,
-            ["strict_format", "answer_nonempty", "go_overlap"],
-            [1.0, 1.0, 2.0],
-        )
-
-        self.assertEqual(components["strict_format"], [1.0])
-        self.assertEqual(components["answer_nonempty"], [1.0])
-        self.assertEqual(components["go_overlap"], [1.0])
-        self.assertEqual(totals, [4.0])
-
-    def test_parse_reward_weights_validates_expected_count(self):
-        with self.assertRaises(ValueError):
-            GRPO.parse_reward_weights("1.0,2.0", 3)
-
-    def test_parse_args_defaults_to_train_rl_contract(self):
+    def test_build_deepspeed_config_matches_spec_shape(self):
         args = GRPO.parse_args(["--text_model_name", "/tmp/demo-model"])
+        runtime_spec = GRPO.build_runtime_spec(args)
+        ds_config = GRPO.build_deepspeed_config(args, runtime_spec)
 
-        self.assertEqual(args.wandb_job_type, "train_rl")
-        self.assertEqual(args.dataset_config, "disease_temporal_hc_reasoning_v1")
-        self.assertEqual(args.reasoning_dataset_config, "disease_temporal_hc_reasoning_v1")
-        self.assertEqual(args.checkpoint_artifact_name, "train-rl-output")
-        self.assertEqual(args.output_dir, "data/artifacts/models/train_rl_output")
-        self.assertEqual(args.train_batch_size, 1)
-        self.assertEqual(args.eval_batch_size, 4)
-        self.assertEqual(args.max_eval_samples, 200)
-        self.assertEqual(args.eval_sample_strategy, "stratified_aspect_profile")
-        self.assertEqual(args.max_eval_batches, 0)
-        self.assertEqual(args.loss_type, "dr_grpo")
-        self.assertEqual(args.steps_per_generation, 2)
-        self.assertEqual(args.num_iterations, 1)
-        self.assertEqual(args.num_generations, 24)
-        self.assertEqual(args.max_new_tokens, 10000)
-        self.assertEqual(args.rollout_logprob_microbatch_size, 4)
-        self.assertEqual(args.temperature, 1.0)
-        self.assertEqual(args.top_p, 0.95)
-        self.assertEqual(args.top_k, 20)
-        self.assertEqual(args.repetition_penalty, 1.0)
-        self.assertEqual(args.clip_epsilon_low, 7e-4)
-        self.assertEqual(args.clip_epsilon_high, 9e-4)
-        self.assertEqual(args.importance_sampling_cap, 2.0)
-        self.assertFalse(args.eval_do_sample)
-        self.assertEqual(args.eval_temperature, 0.1)
-        self.assertEqual(args.eval_top_p, 0.9)
-        self.assertEqual(args.eval_top_k, 20)
-        self.assertEqual(args.rotating_eval_every_n_steps, 100)
-        self.assertEqual(args.rotating_eval_max_samples, 256)
-        self.assertEqual(args.reward_funcs, "ia_weighted_f1")
-        self.assertEqual(args.reward_weights, "1.0")
-        self.assertEqual(args.continuation_mode, "paper_native")
-        self.assertEqual(args.sampling_contract, "checkpoint_native")
-        self.assertEqual(args.reward_prediction_source, "reasoning_trace")
-        self.assertEqual(args.min_new_tokens, 1)
-        self.assertEqual(args.reasoning_prompt_style, "paper_native")
-        self.assertEqual(args.compact_interpro_limit, 12)
-        self.assertEqual(args.compact_ppi_limit, 10)
-        self.assertEqual(args.compact_go_speculation_limit, 8)
-        self.assertEqual(args.max_length_text, 512)
-        self.assertFalse(args.add_uniprot_summary)
-        self.assertTrue(args.bnb_4bit_use_double_quant)
-        self.assertEqual(args.weave_trace_budget, 64)
-        self.assertEqual(args.weave_trace_full_group_count, 4)
-        self.assertEqual(args.weave_trace_full_rollouts_per_group, 24)
-        self.assertTrue(args.gradient_checkpointing)
-        self.assertTrue(args.disable_model_dropout)
-        self.assertFalse(args.audit_only)
-        self.assertFalse(args.reward_final_answer_only)
-        self.assertTrue(args.require_ia_file)
-        self.assertFalse(args.ablation_from_paper_rl)
+        self.assertEqual(ds_config["train_micro_batch_size_per_gpu"], 6)
+        self.assertEqual(ds_config["gradient_accumulation_steps"], 4)
+        self.assertEqual(ds_config["gradient_clipping"], 1.0)
+        self.assertEqual(ds_config["zero_optimization"]["stage"], 2)
+        self.assertTrue(ds_config["bf16"]["enabled"])
 
-    def test_require_training_ia_file_raises_when_missing(self):
-        args = mock.Mock(ia_file_path="", require_ia_file=True)
+    def test_build_tracking_config_carries_required_spec_fields(self):
+        args = GRPO.parse_args(["--text_model_name", "/tmp/demo-model"])
+        args.temporal_split_artifact = "wandb-healthcare/bioreasoning-pro/disease-temporal-split:production"
+        args.dataset_artifact = "wandb-healthcare/bioreasoning-pro/disease-temporal-reasoning:production"
+        args.base_checkpoint = "wandb-healthcare/bioreasoning-pro/bioreason-pro-rl-paper:production"
+        algorithm = GRPO.build_algorithm_spec(args)
+        runtime_spec = GRPO.build_runtime_spec(args)
+        runtime = GRPO.DistributedRuntime(enabled=False, rank=0, world_size=1, local_rank=0, device="cpu")
 
-        with self.assertRaises(FileNotFoundError):
-            GRPO.require_training_ia_file(args, ["ia_weighted_f1"])
+        config = GRPO.build_tracking_config(args, algorithm, runtime_spec, runtime, run_name="demo-run")
 
-    def test_extract_completion_ids_handles_prompt_inclusive_output(self):
-        if torch is None:
-            self.skipTest("torch is not available in the contract test environment")
-
-        prompt_ids = torch.tensor([[11, 12, 13]])
-        generated_ids = torch.tensor([[11, 12, 13, 21, 22]])
-
-        completion_ids = GRPO.extract_completion_ids(generated_ids, prompt_ids)
-
-        self.assertTrue(torch.equal(completion_ids, torch.tensor([21, 22])))
-
-    def test_extract_completion_ids_handles_completion_only_output(self):
-        if torch is None:
-            self.skipTest("torch is not available in the contract test environment")
-
-        prompt_ids = torch.tensor([[11, 12, 13, 14]])
-        generated_ids = torch.tensor([[21, 22]])
-
-        completion_ids = GRPO.extract_completion_ids(generated_ids, prompt_ids)
-
-        self.assertTrue(torch.equal(completion_ids, torch.tensor([21, 22])))
-
-    def test_extract_completion_ids_batch_handles_prompt_inclusive_output(self):
-        if torch is None:
-            self.skipTest("torch is not available in the contract test environment")
-
-        prompt_ids = torch.tensor([[11, 12, 13], [21, 22, 23]])
-        generated_ids = torch.tensor([[11, 12, 13, 31, 32], [21, 22, 23, 41, 42]])
-
-        completion_ids_list = GRPO.extract_completion_ids_batch(generated_ids, prompt_ids)
-
-        self.assertEqual(len(completion_ids_list), 2)
-        self.assertTrue(torch.equal(completion_ids_list[0], torch.tensor([31, 32])))
-        self.assertTrue(torch.equal(completion_ids_list[1], torch.tensor([41, 42])))
-
-    def test_build_rollout_observability_detects_summary_end_and_marker_index(self):
-        if torch is None:
-            self.skipTest("torch is not available in the contract test environment")
-
-        class FakeTokenizer:
-            eos_token_id = 99
-
-            def encode(self, text, add_special_tokens=False):
-                mapping = {
-                    GRPO.GO_SUMMARY_START: [7, 8],
-                }
-                return mapping.get(text, [])
-
-        completion_ids = torch.tensor([1, 7, 8, 3, 4])
-        completion_text = f"{GRPO.GO_SUMMARY_START}\nBP: GO:0007165\n{GRPO.GO_SUMMARY_END}"
-
-        observability = GRPO.build_rollout_observability(
-            FakeTokenizer(),
-            completion_ids,
-            completion_text,
-            total_reward=1.0,
-            max_new_tokens=10000,
+        self.assertEqual(config["job_type"], "train_rl")
+        self.assertEqual(config["benchmark_version"], "213 -> 221 -> 225 -> 228")
+        self.assertEqual(
+            config["temporal_split_artifact"],
+            "wandb-healthcare/bioreasoning-pro/disease-temporal-split:production",
         )
-
-        self.assertEqual(observability["stop_reason"], "summary_end")
-        self.assertEqual(observability["first_go_summary_token_idx"], 1)
-        self.assertTrue(observability["has_go_summary_end"])
-        self.assertFalse(observability["max_new_tokens_hit"])
-        self.assertTrue(observability["reward_nonzero"])
-
-    def test_build_rollout_observability_detects_max_token_stop(self):
-        if torch is None:
-            self.skipTest("torch is not available in the contract test environment")
-
-        class FakeTokenizer:
-            eos_token_id = 99
-
-            def encode(self, text, add_special_tokens=False):
-                return []
-
-        completion_ids = torch.tensor([10, 11, 12, 13])
-
-        observability = GRPO.build_rollout_observability(
-            FakeTokenizer(),
-            completion_ids,
-            "plain reasoning without summary",
-            total_reward=0.0,
-            max_new_tokens=4,
+        self.assertEqual(
+            config["dataset_artifact"],
+            "wandb-healthcare/bioreasoning-pro/disease-temporal-reasoning:production",
         )
-
-        self.assertEqual(observability["stop_reason"], "max_tokens")
-        self.assertEqual(observability["first_go_summary_token_idx"], -1)
-        self.assertFalse(observability["has_go_summary_end"])
-        self.assertTrue(observability["max_new_tokens_hit"])
-        self.assertFalse(observability["reward_nonzero"])
-
-    def test_slice_rollout_group_reindexes_batch_idx_map_for_microbatches(self):
-        if torch is None:
-            self.skipTest("torch is not available in the contract test environment")
-
-        rollout_group = {
-            "combined_input_ids": torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]]),
-            "combined_attention_mask": torch.ones((4, 3), dtype=torch.long),
-            "completion_attention": torch.tensor([[1, 1], [1, 0], [1, 1], [0, 0]], dtype=torch.long),
-            "prompt_token_len": 1,
-            "protein_sequences": ["A", "B", "A", "B", "A", "B", "A", "B"],
-            "batch_idx_map": [0, 0, 1, 1, 2, 2, 3, 3],
-            "structure_coords": torch.arange(4, dtype=torch.float32).unsqueeze(-1),
-            "go_aspects": ["bp", "bp", "mf", "mf"],
-        }
-
-        sliced = GRPO.slice_rollout_group(rollout_group, 1, 3)
-
-        self.assertEqual(tuple(sliced["combined_input_ids"].shape), (2, 3))
-        self.assertEqual(sliced["protein_sequences"], ["A", "B", "A", "B"])
-        self.assertEqual(sliced["batch_idx_map"], [0, 0, 1, 1])
-        self.assertEqual(sliced["go_aspects"], ["bp", "mf"])
-        self.assertTrue(torch.equal(sliced["structure_coords"], torch.tensor([[1.0], [2.0]])))
-
-    def test_evaluate_policy_uses_batched_generation_for_eval_batches(self):
-        if torch is None:
-            self.skipTest("torch is not available in the contract test environment")
-
-        class FakeModel:
-            def __init__(self):
-                self.generate_calls = []
-                self.eval_calls = 0
-                self.train_calls = 0
-
-            def eval(self):
-                self.eval_calls += 1
-
-            def train(self):
-                self.train_calls += 1
-
-            def generate(self, **kwargs):
-                self.generate_calls.append(kwargs)
-                return torch.tensor([[11, 12, 31], [21, 22, 32]])
-
-        class FakeTokenizer:
-            pad_token_id = 0
-            eos_token_id = 2
-
-            def decode(self, completion_ids, skip_special_tokens=False):
-                values = completion_ids.tolist()
-                return " ".join(str(value) for value in values)
-
-        batch = {
-            "input_ids": torch.tensor([[11, 12], [21, 22]]),
-            "attention_mask": torch.tensor([[1, 1], [1, 1]]),
-            "protein_sequences": ["AAA", "BBB"],
-            "batch_idx_map": [0, 1],
-            "batch_go_aspects": ["bp", "mf"],
-            "protein_ids": ["P1", "P2"],
-            "sample_splits": ["validation", "validation"],
-            "go_bp_targets": ["", ""],
-            "go_mf_targets": ["", ""],
-            "go_cc_targets": ["", ""],
-            "reasoning_targets": ["", ""],
-            "final_answers": ["", ""],
-            "prompt": ["prompt-1", "prompt-2"],
-        }
-        args = mock.Mock(
-            max_eval_batches=8,
-            do_sample=False,
-            temperature=1.0,
-            top_p=0.95,
-            top_k=20,
-            repetition_penalty=1.0,
-            eval_do_sample=False,
-            eval_temperature=0.1,
-            eval_top_p=0.9,
-            eval_top_k=20,
-            min_new_tokens=1,
-            max_new_tokens=32,
-            min_p=0.0,
+        self.assertEqual(
+            config["base_checkpoint"],
+            "wandb-healthcare/bioreasoning-pro/bioreason-pro-rl-paper:production",
         )
-        model = FakeModel()
-        metrics = GRPO.evaluate_policy(
-            model=model,
-            ref_model=None,
-            dataloader=[batch],
-            tokenizer=FakeTokenizer(),
-            args=args,
-            reward_names=[],
-            reward_weights=[],
-            device=torch.device("cpu"),
-            trace_state=None,
-            global_step=25,
+        self.assertEqual(config["model_artifact"], "train-rl-output")
+        self.assertEqual(config["reward_extraction"], "final_answer_block_only")
+
+    def test_build_trace_path_is_rank_scoped_when_distributed(self):
+        runtime = GRPO.DistributedRuntime(enabled=True, rank=3, world_size=8, local_rank=3, device="cpu")
+        trace_path = GRPO.build_trace_path(Path("/tmp/out"), "rollout_traces.jsonl", runtime)
+        self.assertEqual(trace_path, Path("/tmp/out/rollout_traces.rank03.jsonl"))
+
+    def test_validate_runtime_shape_requires_target_world_size_match(self):
+        args = GRPO.parse_args(
+            [
+                "--text_model_name",
+                "/tmp/demo-model",
+                "--target_num_nodes",
+                "1",
+                "--target_gpus_per_node",
+                "4",
+                "--debug_single_process",
+                "true",
+            ]
         )
+        algorithm = GRPO.build_algorithm_spec(args)
+        runtime_spec = GRPO.build_runtime_spec(args)
+        runtime = GRPO.DistributedRuntime(enabled=False, rank=0, world_size=1, local_rank=0, device="cpu")
 
-        self.assertEqual(len(model.generate_calls), 1)
-        self.assertEqual(tuple(model.generate_calls[0]["input_ids"].shape), (2, 2))
-        self.assertFalse(model.generate_calls[0]["do_sample"])
-        self.assertNotIn("temperature", model.generate_calls[0])
-        self.assertNotIn("top_p", model.generate_calls[0])
-        self.assertNotIn("top_k", model.generate_calls[0])
-        self.assertEqual(model.generate_calls[0]["repetition_penalty"], 1.0)
-        self.assertEqual(metrics["eval_completion_length"], 1.0)
-        self.assertEqual(metrics["eval_data_step_num_datums"], 2.0)
-        self.assertEqual(model.eval_calls, 1)
-        self.assertEqual(model.train_calls, 1)
+        with self.assertRaisesRegex(ValueError, "target_num_nodes \\* target_gpus_per_node == queries_per_step"):
+            GRPO.validate_runtime_shape(runtime, algorithm, runtime_spec, args)
 
-    def test_rl_script_uses_canonical_metrics_and_input_artifact_lineage(self):
-        source = SCRIPT_PATH.read_text()
+    def test_validate_spec_inputs_requires_existing_ia_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            model_dir = self.create_model_bundle(tmp_path)
+            dataset_dir = self.create_dataset_dir(tmp_path)
+            obo_path = tmp_path / "mini.obo"
+            obo_path.write_text("[Term]\nid: GO:0000001\nname: root\n", encoding="utf-8")
+            args = GRPO.parse_args(
+                [
+                    "--text_model_name",
+                    str(model_dir),
+                    "--cafa5_dataset",
+                    str(dataset_dir),
+                    "--go_obo_path",
+                    str(obo_path),
+                    "--ia_file_path",
+                    str(tmp_path / "missing-ia.txt"),
+                ]
+            )
 
-        self.assertIn("maybe_use_artifact_refs(", source)
-        self.assertIn("maybe_trace_generation(", source)
-        self.assertIn("extract_completion_ids_batch(", source)
-        self.assertIn("evaluate_policy_batch(", source)
-        self.assertIn("build_rollout_group_inputs(", source)
-        self.assertIn("generate_rollouts_for_example(", source)
-        self.assertIn('reward_component/{reward_name}', source)
-        self.assertIn('"validation_rotating"', source)
-        self.assertIn("candidate.is_file()", source)
-        self.assertIn("precomputed_go_embedding_cache_path", source)
-        self.assertIn("model.load_precomputed_go_embedding_cache(", source)
-        self.assertIn("prepare_model_artifact_directory(", source)
-        self.assertIn('"artifact_export_mode"', source)
-        self.assertIn('"data_step_num_groups_submitted"', source)
-        self.assertIn('"data_step_num_groups_trainable"', source)
-        self.assertIn('"data_step_num_trajectories"', source)
-        self.assertIn('"data_step_num_datums"', source)
-        self.assertIn('"data_step_trainer_tokens"', source)
-        self.assertIn('"reward_std_dev"', source)
-        self.assertIn('"loss_train"', source)
-        self.assertIn('"loss_kl_div"', source)
-        self.assertIn('"loss_policy_ratio_mean"', source)
-        self.assertIn('"loss_policy_ratio_max"', source)
-        self.assertIn('"loss_learning_rate"', source)
-        self.assertIn('"loss_grad_norm"', source)
-        self.assertIn('"eval_reward"', source)
-        self.assertIn('"train_skipped_update"', source)
-        self.assertIn('diagnostic/{reward_name}', source)
-        self.assertIn("compute_batch_relative_advantages(", source)
-        self.assertIn("compute_old_policy_sequence_log_probs(", source)
-        self.assertIn("slice_rollout_group(", source)
-        self.assertIn('protein_model_dir = export_dir / "protein_model"', source)
-        self.assertIn('torch.save(model.protein_model.state_dict(), protein_model_dir / "pytorch_model.bin")', source)
-        self.assertIn('"diagnostic/audit_only": 1.0', source)
-        self.assertNotIn("train_rl_rollouts", source)
-        self.assertNotIn("wandb.Table(", source)
-        self.assertNotIn('"dataset/train_size"', source)
-        self.assertNotIn('"dataset/validation_size"', source)
+            with self.assertRaisesRegex(ValueError, "requires a valid IA file"):
+                GRPO.validate_spec_inputs(args)
 
-    def test_grpo_converter_saves_protein_model_weights(self):
-        source = (ROOT / "bioreason2" / "utils" / "save_grpo_ckpt.py").read_text()
+    def test_run_preflight_reports_missing_dependencies(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            model_dir = self.create_model_bundle(tmp_path)
+            dataset_dir = self.create_dataset_dir(tmp_path)
+            ia_path = Path(tmpdir) / "ia.txt"
+            obo_path = Path(tmpdir) / "mini.obo"
+            ia_path.write_text("GO:0000001 1.0\n", encoding="utf-8")
+            obo_path.write_text("[Term]\nid: GO:0000001\nname: root\n", encoding="utf-8")
+            args = GRPO.parse_args(
+                [
+                    "--text_model_name",
+                    str(model_dir),
+                    "--cafa5_dataset",
+                    str(dataset_dir),
+                    "--ia_file_path",
+                    str(ia_path),
+                    "--go_obo_path",
+                    str(obo_path),
+                    "--debug_single_process",
+                    "true",
+                ]
+            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                ok = GRPO.run_preflight(args)
+            self.assertFalse(ok)
+            self.assertIn("Missing runtime dependencies", stdout.getvalue())
 
-        self.assertIn('protein_model_dir = os.path.join(args.save_dir, "protein_model")', source)
-        self.assertIn('torch.save(model.protein_model.state_dict(), os.path.join(protein_model_dir, "pytorch_model.bin"))', source)
+    def test_run_preflight_reports_resolved_paths_and_artifact_refs_on_success(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            model_dir = self.create_model_bundle(tmp_path)
+            dataset_dir = self.create_dataset_dir(tmp_path)
+            ia_path = tmp_path / "IA.txt"
+            obo_path = tmp_path / "mini.obo"
+            ia_path.write_text("GO:0000001 1.0\n", encoding="utf-8")
+            obo_path.write_text("[Term]\nid: GO:0000001\nname: root\n", encoding="utf-8")
+            args = GRPO.parse_args(
+                [
+                    "--text_model_name",
+                    str(model_dir),
+                    "--base_checkpoint",
+                    "wandb-healthcare/bioreasoning-pro/bioreason-pro-rl-paper:production",
+                    "--cafa5_dataset",
+                    str(dataset_dir),
+                    "--ia_file_path",
+                    str(ia_path),
+                    "--go_obo_path",
+                    str(obo_path),
+                    "--temporal_split_artifact",
+                    "wandb-healthcare/bioreasoning-pro/disease-temporal-split:production",
+                    "--dataset_artifact",
+                    "wandb-healthcare/bioreasoning-pro/disease-temporal-reasoning:production",
+                    "--debug_single_process",
+                    "true",
+                ]
+            )
+            stdout = io.StringIO()
+            with mock.patch.object(
+                GRPO,
+                "collect_runtime_dependency_statuses",
+                return_value={
+                    "torch": True,
+                    "deepspeed": True,
+                    "peft": True,
+                    "transformers": True,
+                    "vllm": True,
+                },
+            ), redirect_stdout(stdout):
+                ok = GRPO.run_preflight(args)
+            self.assertTrue(ok)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(
+                payload["artifact_refs"]["base_checkpoint"],
+                "wandb-healthcare/bioreasoning-pro/bioreason-pro-rl-paper:production",
+            )
+            self.assertEqual(payload["artifact_refs"]["dataset_artifact"], "wandb-healthcare/bioreasoning-pro/disease-temporal-reasoning:production")
+            self.assertEqual(payload["resolved_paths"]["text_model_name"], str(model_dir))
+            self.assertEqual(payload["resolved_paths"]["cafa5_dataset"], str(dataset_dir))
+            self.assertEqual(payload["launch_contract"]["target_world_size"], 8)
+            self.assertEqual(payload["launch_contract"]["attn_implementation"], "auto")
+            self.assertEqual(payload["launch_contract"]["dataset_num_proc"], 4)
+            self.assertEqual(payload["launch_contract"]["vllm_attention_backend"], "XFORMERS")
+            self.assertEqual(payload["launch_contract"]["vllm_worker_multiproc_method"], "spawn")
+            self.assertFalse(payload["launch_contract"]["vllm_use_v1"])
+            self.assertEqual(payload["failures"], [])
 
-    def test_sft_script_registers_input_artifact_lineage(self):
-        source = SFT_SCRIPT_PATH.read_text()
+    def test_go_graph_loading_and_propagation_supports_part_of_and_is_a(self):
+        obo_text = """
+[Term]
+id: GO:0000001
+name: root
 
-        self.assertIn("maybe_use_artifact_refs(", source)
-        self.assertIn('"temporal_split_artifact": args.temporal_split_artifact', source)
-        self.assertIn('"dataset_artifact": args.dataset_artifact', source)
-        self.assertIn('"base_checkpoint": args.base_checkpoint', source)
+[Term]
+id: GO:0000002
+name: child
+is_a: GO:0000001 ! root
 
-    def test_sft_wrapper_supports_search_hyperparameters(self):
-        wrapper_text = SFT_WRAPPER_PATH.read_text()
+[Term]
+id: GO:0000003
+name: part child
+relationship: part_of GO:0000002 ! child
+""".strip()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            obo_path = Path(tmpdir) / "mini.obo"
+            obo_path.write_text(obo_text, encoding="utf-8")
+            graph = GRPO.load_go_term_graph(str(obo_path))
+            propagated = GRPO.propagate_go_ids(["GO:0000003"], graph)
+            self.assertEqual(propagated, ["GO:0000003", "GO:0000002", "GO:0000001"])
 
+    def test_wrapper_is_minimal_deepspeed_launcher(self):
+        wrapper_text = WRAPPER_PATH.read_text(encoding="utf-8")
         self.assertIn("source_env_file_without_overrides()", wrapper_text)
-        self.assertIn('source_env_file_without_overrides "$REGISTRY_ENV_FILE"', wrapper_text)
-        self.assertIn('TRAIN_EXCLUSIVE=${TRAIN_EXCLUSIVE:-"True"}', wrapper_text)
-        self.assertIn('STAGE2_LEARNING_RATE=${STAGE2_LEARNING_RATE:-1e-4}', wrapper_text)
-        self.assertIn('STAGE2_WARMUP_RATIO=${STAGE2_WARMUP_RATIO:-0.05}', wrapper_text)
-        self.assertIn('STAGE2_BATCH_SIZE=${STAGE2_BATCH_SIZE:-4}', wrapper_text)
-        self.assertIn('STAGE2_GRADIENT_ACCUMULATION_STEPS=${STAGE2_GRADIENT_ACCUMULATION_STEPS:-1}', wrapper_text)
-        self.assertIn('STAGE2_EARLY_STOPPING_PATIENCE=${STAGE2_EARLY_STOPPING_PATIENCE:-2}', wrapper_text)
-        self.assertIn('STAGE2_RUN_LABEL=${STAGE2_RUN_LABEL:-""}', wrapper_text)
-        self.assertIn('--early_stopping_patience "$STAGE2_EARLY_STOPPING_PATIENCE"', wrapper_text)
-        self.assertIn('--learning_rate "$STAGE2_LEARNING_RATE"', wrapper_text)
+        self.assertIn('REGISTRY_ENV_FILE=${REGISTRY_ENV_FILE:-"configs/disease_benchmark/wandb_registry_paths.env"}', wrapper_text)
+        self.assertIn('MODEL_SOURCE_RESOLVER=${MODEL_SOURCE_RESOLVER:-"scripts/materialize_model_source.py"}', wrapper_text)
+        self.assertIn('DATA_BUNDLE_RESOLVER=${DATA_BUNDLE_RESOLVER:-"scripts/materialize_data_bundle.py"}', wrapper_text)
+        self.assertIn('BASE_CHECKPOINT=${BASE_CHECKPOINT:-"${BIOREASON_RL_PAPER_MODEL_REGISTRY_PATH:-}"}', wrapper_text)
+        self.assertIn('--hostfile "$HOSTFILE"', wrapper_text)
+        self.assertIn("--no_ssh", wrapper_text)
+        self.assertIn('--num_nodes "$NNODES"', wrapper_text)
+        self.assertIn('--num_gpus "$GPUS_PER_NODE"', wrapper_text)
+        self.assertIn('--preflight_only', wrapper_text)
+        self.assertNotIn("srun", wrapper_text)
+        self.assertNotIn("torch.distributed.run", wrapper_text)
+
+    def test_wrapper_preflight_uses_python_and_prefers_explicit_env(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            harness = self.create_wrapper_harness(Path(tmpdir))
+            env = os.environ.copy()
+            env.update(harness)
+            env.update(
+                {
+                    "BASE_CHECKPOINT": "explicit/project/custom-paper:production",
+                    "WANDB_PROJECT": "explicit-project",
+                }
+            )
+
+            result = subprocess.run(
+                ["bash", str(WRAPPER_PATH), "--preflight_only", "true"],
+                cwd=ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr or result.stdout)
+            entries = self.read_tool_log(Path(harness["FAKE_LOG_PATH"]))
+            model_entry = next(
+                entry
+                for entry in entries
+                if entry["tool"] == "python" and Path(entry["argv"][0]).name == "materialize_model_source.py"
+            )
+            self.assertEqual(self.value_after(model_entry["argv"], "--wandb-registry-path"), "explicit/project/custom-paper:production")
+            train_entry = next(
+                entry for entry in entries if entry["tool"] == "python" and Path(entry["argv"][0]).name == "train_protein_grpo.py"
+            )
+            self.assertEqual(self.value_after(train_entry["argv"], "--wandb_project"), "explicit-project")
+            self.assertEqual(self.value_after(train_entry["argv"], "--vllm_attention_backend"), "XFORMERS")
+            self.assertEqual(self.value_after(train_entry["argv"], "--vllm_worker_multiproc_method"), "spawn")
+            self.assertEqual(self.value_after(train_entry["argv"], "--vllm_use_v1"), "0")
+            self.assertFalse(any(entry["tool"] == "deepspeed" for entry in entries))
+            asset_keys = {
+                self.value_after(entry["argv"], "--asset-key")
+                for entry in entries
+                if entry["tool"] == "python" and Path(entry["argv"][0]).name == "materialize_data_bundle.py"
+            }
+            self.assertEqual(asset_keys, {"reasoning_dataset", "temporal_split_artifact", "ia_file"})
+
+    def test_wrapper_requires_master_env_when_hostfile_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            harness = self.create_wrapper_harness(Path(tmpdir))
+            env = os.environ.copy()
+            env.update(harness)
+
+            result = subprocess.run(
+                ["bash", str(WRAPPER_PATH)],
+                cwd=ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("MASTER_ADDR is required", result.stdout)
+
+    def test_wrapper_uses_explicit_multinode_deepspeed_args_without_hostfile(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            harness = self.create_wrapper_harness(Path(tmpdir))
+            env = os.environ.copy()
+            env.update(harness)
+            env.update(
+                {
+                    "MASTER_ADDR": "10.0.0.1",
+                    "MASTER_PORT": "29500",
+                    "NODE_RANK": "0",
+                }
+            )
+
+            result = subprocess.run(
+                ["bash", str(WRAPPER_PATH)],
+                cwd=ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr or result.stdout)
+            entries = self.read_tool_log(Path(harness["FAKE_LOG_PATH"]))
+            deepspeed_entry = next(entry for entry in entries if entry["tool"] == "deepspeed")
+            self.assertIn("--num_nodes", deepspeed_entry["argv"])
+            self.assertIn("--num_gpus", deepspeed_entry["argv"])
+            self.assertIn("--no_ssh", deepspeed_entry["argv"])
+            self.assertEqual(self.value_after(deepspeed_entry["argv"], "--master_addr"), "10.0.0.1")
+            self.assertEqual(self.value_after(deepspeed_entry["argv"], "--master_port"), "29500")
+            self.assertEqual(self.value_after(deepspeed_entry["argv"], "--node_rank"), "0")
+            self.assertEqual(self.value_after(deepspeed_entry["argv"], "--vllm_attention_backend"), "XFORMERS")
+            self.assertEqual(self.value_after(deepspeed_entry["argv"], "--vllm_worker_multiproc_method"), "spawn")
+            self.assertEqual(self.value_after(deepspeed_entry["argv"], "--vllm_use_v1"), "0")
+            self.assertNotIn("--hostfile", deepspeed_entry["argv"])
+
+    def test_wrapper_uses_hostfile_when_provided(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            harness = self.create_wrapper_harness(Path(tmpdir))
+            env = os.environ.copy()
+            env.update(harness)
+            env["HOSTFILE"] = harness["HOSTFILE_PATH"]
+
+            result = subprocess.run(
+                ["bash", str(WRAPPER_PATH)],
+                cwd=ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr or result.stdout)
+            entries = self.read_tool_log(Path(harness["FAKE_LOG_PATH"]))
+            deepspeed_entry = next(entry for entry in entries if entry["tool"] == "deepspeed")
+            self.assertEqual(self.value_after(deepspeed_entry["argv"], "--hostfile"), harness["HOSTFILE_PATH"])
+            self.assertNotIn("--num_nodes", deepspeed_entry["argv"])
+            self.assertNotIn("--no_ssh", deepspeed_entry["argv"])
+
+    def test_wrapper_uses_hostfile_with_no_ssh_when_node_rank_is_provided(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            harness = self.create_wrapper_harness(Path(tmpdir))
+            env = os.environ.copy()
+            env.update(harness)
+            env.update(
+                {
+                    "HOSTFILE": harness["HOSTFILE_PATH"],
+                    "MASTER_ADDR": "10.0.0.1",
+                    "MASTER_PORT": "29500",
+                    "NODE_RANK": "1",
+                }
+            )
+
+            result = subprocess.run(
+                ["bash", str(WRAPPER_PATH)],
+                cwd=ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr or result.stdout)
+            entries = self.read_tool_log(Path(harness["FAKE_LOG_PATH"]))
+            deepspeed_entry = next(entry for entry in entries if entry["tool"] == "deepspeed")
+            self.assertEqual(self.value_after(deepspeed_entry["argv"], "--hostfile"), harness["HOSTFILE_PATH"])
+            self.assertIn("--no_ssh", deepspeed_entry["argv"])
+            self.assertEqual(self.value_after(deepspeed_entry["argv"], "--master_addr"), "10.0.0.1")
+            self.assertEqual(self.value_after(deepspeed_entry["argv"], "--master_port"), "29500")
+            self.assertEqual(self.value_after(deepspeed_entry["argv"], "--node_rank"), "1")
+            self.assertNotIn("--num_nodes", deepspeed_entry["argv"])
+
+    def test_run_tracker_initializes_weave_with_cache_dir_and_run_name_attributes(self):
+        fake_weave = FakeWeaveModule()
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.dict(os.environ, {}, clear=True):
+            output_dir = Path(tmpdir) / "train-output"
+            args = GRPO.parse_args(
+                [
+                    "--text_model_name",
+                    "/tmp/demo-model",
+                    "--output_dir",
+                    str(output_dir),
+                ]
+            )
+            args.trace_rollouts_to_weave = True
+            args.weave_project = "demo-entity/demo-project"
+            args.run_name = "demo-run"
+            runtime = GRPO.DistributedRuntime(enabled=False, rank=0, world_size=1, local_rank=0, device="cpu")
+            observed: dict[str, str] = {}
+
+            def fake_wandb_init(_tracker_self, _config):
+                observed["cache_dir_at_wandb_init"] = os.environ.get("WEAVE_SERVER_CACHE_DIR", "")
+                return None
+
+            with mock.patch.object(GRPO, "weave", fake_weave), mock.patch.object(GRPO.RunTracker, "_maybe_init_wandb", fake_wandb_init):
+                tracker = GRPO.RunTracker(args=args, config={}, output_dir=output_dir, runtime=runtime)
+
+            self.assertTrue(callable(tracker.weave_trace_fn))
+            self.assertEqual(os.environ["WEAVE_SERVER_CACHE_DIR"], str((output_dir / "weave_server_cache").resolve()))
+            self.assertEqual(observed["cache_dir_at_wandb_init"], str((output_dir / "weave_server_cache").resolve()))
+            self.assertEqual(fake_weave.init_calls[0]["project"], "demo-entity/demo-project")
+            self.assertEqual(fake_weave.init_calls[0]["global_attributes"]["run_name"], "demo-run")
+            self.assertEqual(fake_weave.init_calls[0]["global_attributes"]["job_type"], "train_rl")
+
+    def test_log_rollout_trace_includes_run_name_in_jsonl(self):
+        fake_weave = FakeWeaveModule()
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.dict(os.environ, {}, clear=True):
+            output_dir = Path(tmpdir) / "train-output"
+            args = GRPO.parse_args(
+                [
+                    "--text_model_name",
+                    "/tmp/demo-model",
+                    "--output_dir",
+                    str(output_dir),
+                ]
+            )
+            args.trace_rollouts_to_weave = True
+            args.weave_project = "demo-entity/demo-project"
+            args.run_name = "demo-run"
+            runtime = GRPO.DistributedRuntime(enabled=False, rank=0, world_size=1, local_rank=0, device="cpu")
+
+            with mock.patch.object(GRPO, "weave", fake_weave), mock.patch.object(
+                GRPO.RunTracker, "_maybe_init_wandb", return_value=None
+            ):
+                tracker = GRPO.RunTracker(args=args, config={}, output_dir=output_dir, runtime=runtime)
+                tracker.log_rollout_trace(
+                    {
+                        "step": 3,
+                        "rank": 0,
+                        "split": "train",
+                        "protein_id": "P12345",
+                        "rollout_idx": 2,
+                        "reward": 1.0,
+                    },
+                    trace_to_weave=True,
+                )
+
+            lines = tracker.trace_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(lines), 1)
+            payload = json.loads(lines[0])
+            self.assertEqual(payload["run_name"], "demo-run")
+            self.assertEqual(payload["job_type"], "train_rl")
+            self.assertEqual(fake_weave.trace_payloads, [])
+            self.assertEqual(fake_weave.attribute_calls, [])
+
+    def test_trace_rollout_call_uses_weave_op_with_input_and_output(self):
+        fake_weave = FakeWeaveModule()
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.dict(os.environ, {}, clear=True):
+            output_dir = Path(tmpdir) / "train-output"
+            args = GRPO.parse_args(
+                [
+                    "--text_model_name",
+                    "/tmp/demo-model",
+                    "--output_dir",
+                    str(output_dir),
+                ]
+            )
+            args.trace_rollouts_to_weave = True
+            args.weave_project = "demo-entity/demo-project"
+            args.run_name = "demo-run"
+            runtime = GRPO.DistributedRuntime(enabled=False, rank=0, world_size=1, local_rank=0, device="cpu")
+            query = GRPO.PreparedQuery(
+                input_ids=None,
+                attention_mask=None,
+                protein_sequences=["MSEQ"],
+                batch_idx_map=[0],
+                structure_coords=None,
+                go_aspects=["bp"],
+                sample_meta={
+                    "protein_id": "P12345",
+                    "split": "train",
+                    "go_bp": "GO:0000001",
+                    "reasoning": "teacher reasoning",
+                    "final_answer": "teacher answer",
+                },
+                prompt_text="Predict GO terms.",
+                multimodal_cache=None,
+            )
+            sampling = GRPO.SamplingSpec(max_new_tokens=32)
+
+            with mock.patch.object(GRPO, "weave", fake_weave), mock.patch.object(
+                GRPO.RunTracker, "_maybe_init_wandb", return_value=None
+            ):
+                tracker = GRPO.RunTracker(args=args, config={}, output_dir=output_dir, runtime=runtime)
+                outputs = tracker.trace_rollout_call(
+                    step=4,
+                    split="train",
+                    query=query,
+                    repeat_count=3,
+                    sampling=sampling,
+                    generator=lambda: ["<|FINAL_ANSWER|>GO:0000001<|/FINAL_ANSWER|>"],
+                )
+
+            self.assertEqual(outputs, ["<|FINAL_ANSWER|>GO:0000001<|/FINAL_ANSWER|>"])
+            self.assertEqual(fake_weave.trace_payloads[0]["run_name"], "demo-run")
+            self.assertEqual(fake_weave.trace_payloads[0]["query"]["prompt_text"], "Predict GO terms.")
+            self.assertEqual(fake_weave.trace_payloads[0]["repeat_count"], 3)
+            self.assertEqual(fake_weave.trace_payloads[0]["stage"], "rollout")
+            self.assertEqual(fake_weave.trace_payloads[0]["query"]["sample_meta"], {"protein_id": "P12345", "split": "train"})
+            self.assertNotIn("target_go_ids", fake_weave.trace_payloads[0]["query"])
+            self.assertNotIn("reasoning", fake_weave.trace_payloads[0]["query"]["sample_meta"])
+            self.assertNotIn("final_answer", fake_weave.trace_payloads[0]["query"]["sample_meta"])
+            self.assertEqual(fake_weave.attribute_calls[0]["run_name"], "demo-run")
+            self.assertEqual(fake_weave.attribute_calls[0]["step"], 4)
+            self.assertEqual(tracker.weave_remaining_budget, args.weave_trace_budget - 1)
+
+    def test_trace_reward_call_uses_stage_specific_targets(self):
+        fake_weave = FakeWeaveModule()
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.dict(os.environ, {}, clear=True):
+            output_dir = Path(tmpdir) / "train-output"
+            args = GRPO.parse_args(
+                [
+                    "--text_model_name",
+                    "/tmp/demo-model",
+                    "--output_dir",
+                    str(output_dir),
+                ]
+            )
+            args.trace_rollouts_to_weave = True
+            args.weave_project = "demo-entity/demo-project"
+            args.run_name = "demo-run"
+            runtime = GRPO.DistributedRuntime(enabled=False, rank=0, world_size=1, local_rank=0, device="cpu")
+            query = GRPO.PreparedQuery(
+                input_ids=None,
+                attention_mask=None,
+                protein_sequences=["MSEQ"],
+                batch_idx_map=[0],
+                structure_coords=None,
+                go_aspects=["bp"],
+                sample_meta={"protein_id": "P12345", "go_bp": "GO:0000001", "reasoning": "teacher"},
+                prompt_text="Predict GO terms.",
+                multimodal_cache=None,
+            )
+
+            with mock.patch.object(GRPO, "weave", fake_weave), mock.patch.object(
+                GRPO.RunTracker, "_maybe_init_wandb", return_value=None
+            ):
+                tracker = GRPO.RunTracker(args=args, config={}, output_dir=output_dir, runtime=runtime)
+                rewards = tracker.trace_reward_call(
+                    step=5,
+                    split="train",
+                    query=query,
+                    completions=["<|FINAL_ANSWER|>GO:0000001<|/FINAL_ANSWER|>"],
+                    callback=lambda: [1.0],
+                )
+
+            self.assertEqual(rewards, [1.0])
+            self.assertEqual(fake_weave.trace_payloads[0]["stage"], "reward")
+            self.assertEqual(fake_weave.trace_payloads[0]["target_go_ids"], ["GO:0000001"])
+            self.assertEqual(fake_weave.trace_payloads[0]["completions"], ["<|FINAL_ANSWER|>GO:0000001<|/FINAL_ANSWER|>"])
+            self.assertEqual(fake_weave.attribute_calls[0]["stage"], "reward")
+
+    def test_trace_policy_update_call_uses_stage_specific_op(self):
+        fake_weave = FakeWeaveModule()
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.dict(os.environ, {}, clear=True):
+            output_dir = Path(tmpdir) / "train-output"
+            args = GRPO.parse_args(
+                [
+                    "--text_model_name",
+                    "/tmp/demo-model",
+                    "--output_dir",
+                    str(output_dir),
+                ]
+            )
+            args.trace_rollouts_to_weave = True
+            args.weave_project = "demo-entity/demo-project"
+            args.run_name = "demo-run"
+            runtime = GRPO.DistributedRuntime(enabled=False, rank=0, world_size=1, local_rank=0, device="cpu")
+
+            with mock.patch.object(GRPO, "weave", fake_weave), mock.patch.object(
+                GRPO.RunTracker, "_maybe_init_wandb", return_value=None
+            ):
+                tracker = GRPO.RunTracker(args=args, config={}, output_dir=output_dir, runtime=runtime)
+                summary = tracker.trace_policy_update_call(
+                    step=6,
+                    split="train",
+                    payload={"steps_per_generation": 2, "valid_rollout_counts": [24]},
+                    callback=lambda: {"update_chunk_count": 8, "policy_loss_mean": 0.12},
+                )
+
+            self.assertEqual(summary["stage"], "policy_update")
+            self.assertEqual(summary["update_chunk_count"], 8)
+            self.assertEqual(fake_weave.trace_payloads[0]["stage"], "policy_update")
+            self.assertEqual(fake_weave.attribute_calls[0]["stage"], "policy_update")
+
+    def test_finish_flushes_weave_client(self):
+        fake_weave = FakeWeaveModule()
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.dict(os.environ, {}, clear=True):
+            output_dir = Path(tmpdir) / "train-output"
+            args = GRPO.parse_args(
+                [
+                    "--text_model_name",
+                    "/tmp/demo-model",
+                    "--output_dir",
+                    str(output_dir),
+                ]
+            )
+            args.trace_rollouts_to_weave = True
+            args.weave_project = "demo-entity/demo-project"
+            args.run_name = "demo-run"
+            runtime = GRPO.DistributedRuntime(enabled=False, rank=0, world_size=1, local_rank=0, device="cpu")
+
+            with mock.patch.object(GRPO, "weave", fake_weave), mock.patch.object(
+                GRPO.RunTracker, "_maybe_init_wandb", return_value=None
+            ):
+                tracker = GRPO.RunTracker(args=args, config={}, output_dir=output_dir, runtime=runtime)
+                tracker.finish()
+
+            self.assertTrue(fake_weave.client.flush_called)
 
 
 if __name__ == "__main__":

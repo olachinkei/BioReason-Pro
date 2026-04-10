@@ -27,7 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--asset-key",
         type=str,
-        choices=["temporal_split_artifact", "reasoning_dataset"],
+        choices=["temporal_split_artifact", "reasoning_dataset", "ia_file"],
         required=True,
     )
     parser.add_argument(

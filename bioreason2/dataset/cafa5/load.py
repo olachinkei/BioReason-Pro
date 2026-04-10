@@ -39,6 +39,34 @@ ASPECT_DISPLAY_NAMES = {
 }
 
 
+def _coerce_positive_int(value):
+    try:
+        resolved = int(value)
+    except (TypeError, ValueError):
+        return None
+    return resolved if resolved > 0 else None
+
+
+def _resolve_num_proc(num_proc):
+    explicit = _coerce_positive_int(num_proc)
+    if explicit is not None:
+        return explicit
+
+    env_override = _coerce_positive_int(os.environ.get("BIOREASON_DATASET_NUM_PROC"))
+    if env_override is not None:
+        return env_override
+
+    cpu_count = os.cpu_count() or 1
+    local_world_size = (
+        _coerce_positive_int(os.environ.get("LOCAL_WORLD_SIZE"))
+        or _coerce_positive_int(os.environ.get("WORLD_SIZE"))
+        or 1
+    )
+    cap = _coerce_positive_int(os.environ.get("BIOREASON_DATASET_NUM_PROC_CAP")) or 8
+    per_rank_budget = max(1, max(cpu_count - 2, 1) // max(local_world_size, 1))
+    return max(1, min(per_rank_budget, cap))
+
+
 def _load_dataset_source(dataset, dataset_name=None, cache_dir=None, dataset_subset=None):
     """Load either a Hub dataset or a local DatasetDict artifact."""
     dataset_path = Path(os.path.expanduser(str(dataset)))
@@ -890,8 +918,7 @@ def load_cafa5_dataset(
     """
     try:
         # Auto-detect number of processes if not specified
-        if num_proc is None:
-            num_proc = os.cpu_count() - 2
+        num_proc = _resolve_num_proc(num_proc)
 
         print(f"Using {num_proc} CPU cores for parallel processing")
 

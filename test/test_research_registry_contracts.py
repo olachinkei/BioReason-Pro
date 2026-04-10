@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -126,7 +127,15 @@ class ResearchRegistryContractsTest(unittest.TestCase):
                     }
                 )
 
-        artifact_mock.assert_called_once_with("demo/project/train-sft-output:v2", str(local_dir))
+        artifact_mock.assert_called_once_with(
+            "demo/project/train-sft-output:v2",
+            str(local_dir),
+            required_paths=[
+                "config.json",
+                "go_embedding.pt",
+                "protein_model/pytorch_model.bin",
+            ],
+        )
         self.assertEqual(result["source_ref"], "demo/project/train-sft-output:v2")
         self.assertTrue(result["downloaded"])
 
@@ -172,6 +181,52 @@ class ResearchRegistryContractsTest(unittest.TestCase):
 
         artifact_mock.assert_called_once()
         self.assertEqual(result["source_ref"], "demo/project/bioreason-pro-base:production")
+
+    def test_download_wandb_artifact_replaces_symlink_target(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_root = Path(tmpdir) / "artifact"
+            artifact_root.mkdir(parents=True, exist_ok=True)
+            (artifact_root / "stale.txt").write_text("old", encoding="utf-8")
+
+            target_dir = Path(tmpdir) / "materialized"
+            target_dir.symlink_to(artifact_root, target_is_directory=True)
+
+            class FakeArtifact:
+                def download(self, root):
+                    Path(root).mkdir(parents=True, exist_ok=True)
+                    (Path(root) / "summary.json").write_text("{}", encoding="utf-8")
+
+            fake_wandb = types.SimpleNamespace(Api=lambda: types.SimpleNamespace(artifact=lambda _: FakeArtifact()))
+            with mock.patch.dict(sys.modules, {"wandb": fake_wandb}):
+                resolved = REGISTRY.download_wandb_artifact(
+                    "demo/project/disease-temporal-split:production",
+                    str(target_dir),
+                    required_paths=["summary.json"],
+                )
+
+            self.assertEqual(resolved, str(target_dir))
+            self.assertTrue(target_dir.is_dir())
+            self.assertFalse(target_dir.is_symlink())
+            self.assertTrue((target_dir / "summary.json").is_file())
+            self.assertFalse((artifact_root / "summary.json").exists())
+
+    def test_download_wandb_artifact_skips_redownload_when_required_paths_exist(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target_dir = Path(tmpdir) / "materialized"
+            target_dir.mkdir(parents=True, exist_ok=True)
+            (target_dir / "summary.json").write_text("{}", encoding="utf-8")
+
+            api_mock = mock.Mock()
+            fake_wandb = types.SimpleNamespace(Api=api_mock)
+            with mock.patch.dict(sys.modules, {"wandb": fake_wandb}):
+                resolved = REGISTRY.download_wandb_artifact(
+                    "demo/project/disease-temporal-split:production",
+                    str(target_dir),
+                    required_paths=["summary.json"],
+                )
+
+        self.assertEqual(resolved, str(target_dir))
+        api_mock.assert_not_called()
 
 
 if __name__ == "__main__":

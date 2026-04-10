@@ -26,6 +26,13 @@
         "local_dir": "data/artifacts/datasets/disease_temporal_hc_reasoning_v1/213_221_225_228",
         "dataset_source": "wanglab/cafa5",
         "dataset_name": "disease_temporal_hc_reasoning_v1"
+      },
+      "ia_file": {
+        "wandb_registry_path": "${BIOREASON_MAIN_IA_REGISTRY_PATH}",
+        "local_dir": "data/artifacts/benchmarks/213_221_225_228/temporal_split",
+        "required_paths": [
+          "IA.txt"
+        ]
       }
     },
     "comparison_214_start": {
@@ -53,6 +60,13 @@
         "local_dir": "data/artifacts/datasets/disease_temporal_hc_reasoning_v1/214_221_225_228",
         "dataset_source": "wanglab/cafa5",
         "dataset_name": "disease_temporal_hc_reasoning_v1"
+      },
+      "ia_file": {
+        "wandb_registry_path": "${BIOREASON_COMPARISON_IA_REGISTRY_PATH}",
+        "local_dir": "data/artifacts/benchmarks/214_221_225_228/temporal_split",
+        "required_paths": [
+          "IA.txt"
+        ]
       }
     }
   }

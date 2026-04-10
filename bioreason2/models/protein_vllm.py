@@ -1,5 +1,6 @@
 import os
 import glob
+import inspect
 from typing import Optional, List, Union
 
 import torch
@@ -21,6 +22,60 @@ def _load_text_tokenizer(model_name: str, **kwargs):
         return AutoTokenizer.from_pretrained(model_name, fix_mistral_regex=True, **kwargs)
     except TypeError:
         return AutoTokenizer.from_pretrained(model_name, **kwargs)
+
+
+def _normalize_optional_text(value: Optional[Union[str, int, float]]) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
+def _configure_vllm_runtime_env(
+    *,
+    attention_backend: Optional[str] = None,
+    worker_multiproc_method: Optional[str] = None,
+    use_v1: Optional[bool] = None,
+) -> dict[str, str]:
+    applied: dict[str, str] = {}
+    normalized_backend = _normalize_optional_text(attention_backend)
+    normalized_method = _normalize_optional_text(worker_multiproc_method)
+
+    if normalized_backend is not None:
+        os.environ["VLLM_ATTENTION_BACKEND"] = normalized_backend
+        applied["VLLM_ATTENTION_BACKEND"] = normalized_backend
+    if normalized_method is not None:
+        os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = normalized_method
+        applied["VLLM_WORKER_MULTIPROC_METHOD"] = normalized_method
+    if use_v1 is not None:
+        os.environ["VLLM_USE_V1"] = "1" if bool(use_v1) else "0"
+        applied["VLLM_USE_V1"] = os.environ["VLLM_USE_V1"]
+    return applied
+
+
+def _resolve_prompt_embed_runtime(
+    *,
+    attention_backend: Optional[str],
+    use_v1: Optional[bool],
+) -> tuple[Optional[str], Optional[bool]]:
+    normalized_backend = _normalize_optional_text(attention_backend)
+    resolved_use_v1 = use_v1
+
+    if resolved_use_v1:
+        print("Warning: vLLM V1 does not support prompt embeds; falling back to the V0 engine.")
+        resolved_use_v1 = False
+
+    if not resolved_use_v1:
+        if normalized_backend is None:
+            normalized_backend = "XFORMERS"
+        elif normalized_backend.endswith("_VLLM_V1"):
+            print(
+                "Warning: vLLM V0 cannot use a V1-only attention backend; "
+                f"remapping {normalized_backend!r} to 'XFORMERS'."
+            )
+            normalized_backend = "XFORMERS"
+
+    return normalized_backend, resolved_use_v1
 
 
 class ProteinLLMModel(nn.Module):
@@ -57,6 +112,14 @@ class ProteinLLMModel(nn.Module):
         gpu_memory_utilization: float = 0.4,
         max_model_len: int = 32768,
         max_num_seqs: int = 256,
+        cpu_offload_gb: float = 0.0,
+        swap_space: float = 4.0,
+        enforce_eager: bool = False,
+        enable_sleep_mode: bool = False,
+        tensor_parallel_size: int = 1,
+        attention_backend: Optional[str] = None,
+        worker_multiproc_method: str = "spawn",
+        use_v1: Optional[bool] = None,
     ):
         """
         Initialize the ProteinLLMModel for vLLM inference.
@@ -85,6 +148,14 @@ class ProteinLLMModel(nn.Module):
             gpu_memory_utilization: GPU memory utilization for vLLM. Defaults to 0.4.
             max_model_len: Maximum length of the model. Defaults to 32768.
             max_num_seqs: Maximum number of sequences to process concurrently in vLLM. Defaults to 256.
+            cpu_offload_gb: CPU offload budget for vLLM weights. Defaults to 0.0.
+            swap_space: CPU swap-space budget for vLLM. Defaults to 4.0.
+            enforce_eager: Whether to force eager execution in vLLM. Defaults to False.
+            enable_sleep_mode: Whether to enable vLLM sleep mode for colocated use. Defaults to False.
+            tensor_parallel_size: vLLM tensor parallel size. Defaults to 1.
+            attention_backend: Explicit vLLM attention backend override. Defaults to None.
+            worker_multiproc_method: vLLM worker multiprocessing method. Defaults to "spawn".
+            use_v1: Whether to force the vLLM V1 engine. Defaults to None.
         """
         super().__init__()
 
@@ -97,19 +168,46 @@ class ProteinLLMModel(nn.Module):
         self.max_length_text = max_length_text
         self.max_model_len = max_model_len
         self.unified_go_encoder = unified_go_encoder
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = torch.bfloat16
+        self.enable_sleep_mode = enable_sleep_mode
+        attention_backend, use_v1 = _resolve_prompt_embed_runtime(
+            attention_backend=attention_backend,
+            use_v1=use_v1,
+        )
+        self.vllm_runtime_env = _configure_vllm_runtime_env(
+            attention_backend=attention_backend,
+            worker_multiproc_method=worker_multiproc_method,
+            use_v1=use_v1,
+        )
+        if self.vllm_runtime_env:
+            print(f"🚀 Applying vLLM runtime overrides: {self.vllm_runtime_env}")
 
         # Load the text model and tokenizer
-        self.text_model = LLM(
-            model=ckpt_dir,
-            gpu_memory_utilization=gpu_memory_utilization,
-            enable_prompt_embeds=True,
-            trust_remote_code=True,
-            max_model_len=self.max_model_len,
-            max_num_seqs=max_num_seqs,
-            dtype=self.dtype
+        llm_kwargs = {
+            "model": ckpt_dir,
+            "gpu_memory_utilization": gpu_memory_utilization,
+            "enable_prompt_embeds": True,
+            "trust_remote_code": True,
+            "max_model_len": self.max_model_len,
+            "max_num_seqs": max_num_seqs,
+            "dtype": self.dtype,
+            "cpu_offload_gb": cpu_offload_gb,
+            "swap_space": swap_space,
+            "enforce_eager": enforce_eager,
+            "enable_sleep_mode": enable_sleep_mode,
+            "tensor_parallel_size": tensor_parallel_size,
+        }
+        llm_signature = inspect.signature(LLM.__init__)
+        accepts_var_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in llm_signature.parameters.values()
         )
+        if not accepts_var_kwargs:
+            llm_kwargs = {key: value for key, value in llm_kwargs.items() if key in llm_signature.parameters}
+        self.text_model = LLM(**llm_kwargs)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if self.device.type != "cuda":
+            raise RuntimeError("ProteinLLMModel for vLLM rollouts requires a CUDA device.")
 
         self.text_tokenizer = _load_text_tokenizer(ckpt_dir, trust_remote_code=True)
         self.text_config = AutoConfig.from_pretrained(ckpt_dir, trust_remote_code=True)
@@ -569,13 +667,19 @@ class ProteinLLMModel(nn.Module):
                 text_inputs_embeds[go_mask] = go_embeds_flat
 
         # Generation with embeddings using vLLM
-        sampling_params = SamplingParams(
-            temperature=generation_kwargs.get("temperature", 0),
-            top_p=generation_kwargs.get("top_p", 0.95),
-            top_k=generation_kwargs.get("top_k", -1),
-            max_tokens=generation_kwargs.get("max_new_tokens", 1000),
-            stop=generation_kwargs.get("stop", ["<|im_end|>"]) + ["- Hypothesized Interaction Partners"],
-        )
+        sampling_kwargs = {
+            "temperature": generation_kwargs.get("temperature", 0),
+            "top_p": generation_kwargs.get("top_p", 0.95),
+            "top_k": generation_kwargs.get("top_k", -1),
+            "max_tokens": generation_kwargs.get("max_new_tokens", 1000),
+            "stop": generation_kwargs.get("stop", ["<|im_end|>"]) + ["- Hypothesized Interaction Partners"],
+            "include_stop_str_in_output": True,
+        }
+        if generation_kwargs.get("min_p") is not None:
+            sampling_kwargs["min_p"] = generation_kwargs.get("min_p")
+        if generation_kwargs.get("repetition_penalty") is not None:
+            sampling_kwargs["repetition_penalty"] = generation_kwargs.get("repetition_penalty")
+        sampling_params = SamplingParams(**sampling_kwargs)
 
         # Build requests for vLLM generation
         requests = []
@@ -587,3 +691,17 @@ class ProteinLLMModel(nn.Module):
 
         # Extract the generated text from the output objects
         return [output.outputs[0].text for output in vllm_outputs]
+
+    def sleep(self, level: int = 1) -> None:
+        if hasattr(self.text_model, "sleep"):
+            self.text_model.sleep(level=level)
+
+    def wake_up(self) -> None:
+        if hasattr(self.text_model, "wake_up"):
+            self.text_model.wake_up()
+
+    def shutdown(self) -> None:
+        self.wake_up()
+        engine = getattr(self.text_model, "llm_engine", None)
+        if engine is not None and hasattr(engine, "shutdown"):
+            engine.shutdown()

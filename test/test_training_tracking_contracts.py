@@ -318,6 +318,10 @@ class TrainingTrackingContractsTest(unittest.TestCase):
         self.assertTrue(config["multimodal_cache_enabled"])
         self.assertTrue(config["ref_logprob_cache_enabled"])
         self.assertEqual(config["rotating_eval_every_n_steps"], 100)
+        self.assertLessEqual(len(metadata), 100)
+        self.assertTrue(metadata["tracking_config_compact"])
+        self.assertEqual(metadata["tracking_config_full_path"], "training_metadata.json")
+        self.assertEqual(metadata["tracking_config_key_count"], len(config))
         self.assertEqual(metadata["checkpoint_dir"], "data/artifacts/models/train_rl_output/demo")
 
     def test_build_sft_sample_row_is_one_row_per_sample(self):
@@ -381,6 +385,7 @@ class TrainingTrackingContractsTest(unittest.TestCase):
         self.assertEqual(run.artifacts[0].added_dirs, [status["directory"]])
         self.assertEqual(run.artifacts[0].logged_aliases, ["latest", "best"])
         self.assertEqual(run.artifacts[0].metadata["run_name"], "demo-run")
+        self.assertLessEqual(len(run.artifacts[0].metadata), 100)
 
     def test_prepare_model_artifact_directory_selects_single_checkpoint(self):
         with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as export:

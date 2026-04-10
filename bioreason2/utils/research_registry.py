@@ -1,3 +1,4 @@
+import fcntl
 import json
 import os
 import shlex
@@ -124,6 +125,21 @@ def ensure_directory(path_value: str) -> str:
     return path_value
 
 
+def _artifact_lock_path(local_path: Path) -> Path:
+    """Return the lock file used to serialize shared artifact downloads."""
+    return local_path.parent / f".{local_path.name}.artifact.lock"
+
+
+def _remove_download_target(path_value: Path) -> None:
+    """Remove a download target regardless of whether it is a dir, file, or symlink."""
+    if not path_value.exists() and not path_value.is_symlink():
+        return
+    if path_value.is_symlink() or path_value.is_file():
+        path_value.unlink()
+        return
+    shutil.rmtree(path_value)
+
+
 def _load_registry(path_value: str, repo_root: Path) -> Dict[str, Any]:
     registry_path = resolve_repo_path(path_value, repo_root)
     registry = expand_placeholders(load_json(registry_path))
@@ -143,7 +159,7 @@ def load_data_bundle(path_value: str, bundle_name: Optional[str], repo_root: Pat
     bundle["bundle_name"] = resolved_name
     bundle["registry_path"] = registry["_registry_path"]
 
-    for asset_name in ("temporal_split_artifact", "reasoning_dataset"):
+    for asset_name in ("temporal_split_artifact", "reasoning_dataset", "ia_file"):
         asset = dict(bundle.get(asset_name, {}))
         if not asset:
             continue
@@ -225,20 +241,35 @@ def get_wandb_artifact_metadata(wandb_registry_path: str) -> Dict[str, Any]:
     return dict(getattr(artifact, "metadata", {}) or {})
 
 
-def download_wandb_artifact(wandb_registry_path: str, local_dir: str) -> str:
+def download_wandb_artifact(
+    wandb_registry_path: str,
+    local_dir: str,
+    required_paths: Optional[Sequence[str]] = None,
+) -> str:
     """Download a W&B artifact into a deterministic local directory."""
     try:
         import wandb
     except ImportError as exc:  # pragma: no cover - depends on runtime environment
         raise RegistryError("wandb is required to download registry artifacts.") from exc
 
-    api = wandb.Api()
     local_path = Path(local_dir)
-    if local_path.exists():
-        shutil.rmtree(local_path)
-    ensure_directory(local_dir)
-    artifact = api.artifact(wandb_registry_path)
-    artifact.download(root=local_dir)
+    ensure_directory(str(local_path.parent))
+    lock_path = _artifact_lock_path(local_path)
+
+    with lock_path.open("w", encoding="utf-8") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        if directory_has_content(local_dir, required_paths):
+            return local_dir
+        _remove_download_target(local_path)
+        ensure_directory(local_dir)
+        api = wandb.Api()
+        artifact = api.artifact(wandb_registry_path)
+        artifact.download(root=local_dir)
+        if required_paths and not directory_has_content(local_dir, required_paths):
+            raise RegistryError(
+                "Downloaded W&B artifact is missing required paths. "
+                f"artifact={wandb_registry_path} required_paths={list(required_paths)}"
+            )
     return local_dir
 
 
@@ -351,7 +382,7 @@ def materialize_source(
             if required:
                 raise RegistryError("wandb_artifact source is missing wandb_registry_path.")
             return None
-        download_wandb_artifact(wandb_registry_path, local_dir)
+        download_wandb_artifact(wandb_registry_path, local_dir, required_paths=required_paths)
         return {
             "source_type": source_type,
             "local_path": local_dir,
@@ -429,14 +460,6 @@ def materialize_bundle_asset(asset: Mapping[str, Any]) -> Dict[str, Any]:
     dataset_source = normalize_text(asset.get("dataset_source"))
     dataset_name = normalize_text(asset.get("dataset_name"))
 
-    if wandb_registry_path and (not dataset_source or not dataset_name):
-        try:
-            artifact_metadata = get_wandb_artifact_metadata(wandb_registry_path)
-        except RegistryError:
-            artifact_metadata = {}
-        dataset_source = normalize_text(dataset_source or artifact_metadata.get("dataset_source"))
-        dataset_name = normalize_text(dataset_name or artifact_metadata.get("dataset_name"))
-
     if local_dir and directory_has_content(local_dir, required_paths):
         return {
             "local_dir": local_dir,
@@ -448,8 +471,16 @@ def materialize_bundle_asset(asset: Mapping[str, Any]) -> Dict[str, Any]:
             "artifact_metadata": artifact_metadata,
         }
 
+    if wandb_registry_path and (not dataset_source or not dataset_name):
+        try:
+            artifact_metadata = get_wandb_artifact_metadata(wandb_registry_path)
+        except RegistryError:
+            artifact_metadata = {}
+        dataset_source = normalize_text(dataset_source or artifact_metadata.get("dataset_source"))
+        dataset_name = normalize_text(dataset_name or artifact_metadata.get("dataset_name"))
+
     if wandb_registry_path and local_dir:
-        download_wandb_artifact(wandb_registry_path, local_dir)
+        download_wandb_artifact(wandb_registry_path, local_dir, required_paths=required_paths)
         return {
             "local_dir": local_dir,
             "wandb_registry_path": wandb_registry_path,

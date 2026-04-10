@@ -34,7 +34,8 @@
 |---|---|
 | temporal split artifact | `wandb-healthcare/bioreasoning-pro/disease-temporal-split:production` |
 | reasoning dataset artifact | `wandb-healthcare/bioreasoning-pro/disease-temporal-reasoning:production` |
-| comparison model artifact | `wandb-healthcare/bioreasoning-pro/bioreason-pro-rl:production` |
+| IA file artifact | `wandb-healthcare/bioreasoning-pro/disease-temporal-ia:production` |
+| comparison model artifact | `wandb-healthcare/bioreasoning-pro/bioreason-pro-rl-paper:production` |
 
 local の build / download 結果は scratch であり、source-of-truth ではない。
 
@@ -61,13 +62,14 @@ repo 内の JSON は artifact 自体ではなく、**どの W&B Artifact ref を
 
 Artifact ref は browser URL ではなく、`entity/project/artifact_name:alias` 形式を使う。
 
-初期状態で人が明示的に用意する ref は次の 3 つだけでよい。
+初期状態で人が明示的に用意する ref は次の 4 つだけでよい。
 
 | env var | 用途 | 現在の ref |
 |---|---|---|
 | `BIOREASON_MAIN_TEMPORAL_SPLIT_REGISTRY_PATH` | main temporal split artifact | `wandb-healthcare/bioreasoning-pro/disease-temporal-split:production` |
 | `BIOREASON_MAIN_REASONING_DATASET_REGISTRY_PATH` | main reasoning dataset artifact | `wandb-healthcare/bioreasoning-pro/disease-temporal-reasoning:production` |
-| `BIOREASON_RL_PAPER_MODEL_REGISTRY_PATH` | tuning 前の比較モデル | `wandb-healthcare/bioreasoning-pro/bioreason-pro-rl:production` |
+| `BIOREASON_MAIN_IA_REGISTRY_PATH` | main IA file artifact | `wandb-healthcare/bioreasoning-pro/disease-temporal-ia:production` |
+| `BIOREASON_RL_PAPER_MODEL_REGISTRY_PATH` | tuning 前の比較モデル | `wandb-healthcare/bioreasoning-pro/bioreason-pro-rl-paper:production` |
 
 `BIOREASON_TRAIN_RL_MODEL_REGISTRY_PATH` は、RL run の完了後に成果物として決まる。
 
@@ -218,15 +220,16 @@ export BIOREASON_STRUCTURE_DIR="$HOME/BioReason-Pro/data/structures"
 export BIOREASON_DATASET_CACHE_DIR="$HOME/BioReason-Pro/data/artifacts/hf_cache"
 ```
 
-通常この段階で入れるべき Artifact ref は次の 3 つだけでよい。
+通常この段階で入れるべき Artifact ref は次の 4 つだけでよい。
 
 - `BIOREASON_MAIN_TEMPORAL_SPLIT_REGISTRY_PATH`
 - `BIOREASON_MAIN_REASONING_DATASET_REGISTRY_PATH`
+- `BIOREASON_MAIN_IA_REGISTRY_PATH`
 - `BIOREASON_RL_PAPER_MODEL_REGISTRY_PATH`
 
 ### 2.5 比較モデルを一度 W&B Artifact に固定する
 
-`BIOREASON_RL_PAPER_MODEL_REGISTRY_PATH` が既に `wandb-healthcare/bioreasoning-pro/bioreason-pro-rl:production` を指しているなら、この工程はスキップしてよい。  
+`BIOREASON_RL_PAPER_MODEL_REGISTRY_PATH` が既に `wandb-healthcare/bioreasoning-pro/bioreason-pro-rl-paper:production` を指しているなら、この工程はスキップしてよい。  
 未 publish の場合だけ、一度 materialize して W&B Artifact に固定する。
 
 ```bash
@@ -359,7 +362,7 @@ local に残したいときだけ `--keep-local-eval-outputs` を付ける。
 RL は `train_rl` phase として扱う。  
 canonical input は `bioreason-pro-rl-paper` checkpoint である。
 
-entry point は [train_protein_grpo.py](/Users/keisuke/Project/learning/drug_discovery/BioReason-Pro/train_protein_grpo.py) と [sh_train_protein_grpo.sh](/Users/keisuke/Project/learning/drug_discovery/BioReason-Pro/scripts/sh_train_protein_grpo.sh) に固定する。  
+entry point は [train_protein_grpo.py](/Users/keisuke/Project/learning/drug_discovery/BioReason-Pro/train_protein_grpo.py) と [sh_train_protein_grpo.sh](/Users/keisuke/Project/learning/drug_discovery/BioReason-Pro/scripts/sh_train_protein_grpo.sh) に固定する。production の公式 runner は [run_registered_train_rl.py](/Users/keisuke/Project/learning/drug_discovery/BioReason-Pro/scripts/run_registered_train_rl.py) とする。  
 運用ルールは次で固定する。
 
 - RL の rollout / reward 最適化には benchmark の `train` split を使う
@@ -369,24 +372,68 @@ entry point は [train_protein_grpo.py](/Users/keisuke/Project/learning/drug_dis
 - RL 用派生 dataset を作る場合も、元データは `train` split のみから作る
 - canonical input は `BIOREASON_RL_PAPER_MODEL_REGISTRY_PATH` が指す `bioreason-pro-rl-paper` artifact
 
-RL checkpoint artifact ができたら、その ref を `configs/disease_benchmark/wandb_registry_paths.env` に追記する。
+`scripts/sh_train_protein_grpo.sh` は wrapper resolves を採用し、既定では次を自動で解決する。
 
-```bash
-export BIOREASON_TRAIN_RL_MODEL_REGISTRY_PATH="entity/project/train-rl-output:alias"
-```
+- `BASE_CHECKPOINT` は `BIOREASON_RL_PAPER_MODEL_REGISTRY_PATH`
+- `CAFA5_DATASET` は `main_production` bundle の `reasoning_dataset`
+- `IA_FILE_PATH` は `main_production` bundle の `ia_file`
+- `TEMPORAL_SPLIT_ARTIFACT` と `DATASET_ARTIFACT` は `main_production` bundle
+
+明示 env がある場合は registry env file よりそちらを優先する。`orchestrate_best_sft_to_rl_eval.py` は ablation / 旧系導線であり、本番既定には使わない。
 
 ### 4.1 実行コマンド
 
 ```bash
 cd ~/BioReason-Pro
 source .venv-gpu/bin/activate
+export REGISTRY_ENV_FILE=configs/disease_benchmark/wandb_registry_paths.env
+export WANDB_ENTITY=wandb-healthcare
+export WANDB_PROJECT=bioreasoning-pro
+export NNODES=2
+export GPUS_PER_NODE=4
+export MASTER_ADDR=10.0.0.1
+export MASTER_PORT=29500
+export NODE_RANK=0
 
-bash scripts/sh_train_protein_grpo.sh
+bash scripts/sh_train_protein_grpo.sh --preflight_only true
 ```
 
-この wrapper は内部で `srun python train_protein_grpo.py ...` を呼ぶ。  
-canonical には `BIOREASON_RL_PAPER_MODEL_REGISTRY_PATH` を使う。
-既定では artifact 側で `validation=200 proteins` が固定されている。wrapper 側では `MAX_EVAL_SAMPLES=200` を維持するが、実際には full validation split を使う。
+preflight が通ったら、本番 launch は production runner から行う。
+
+```bash
+cd ~/BioReason-Pro
+source .venv-gpu/bin/activate
+
+python scripts/run_registered_train_rl.py \
+  --registry-env-file configs/disease_benchmark/wandb_registry_paths.env \
+  --wandb-entity "$WANDB_ENTITY" \
+  --wandb-project "$WANDB_PROJECT" \
+  --master-addr "$MASTER_ADDR" \
+  --master-port "$MASTER_PORT" \
+  --node-rank "$NODE_RANK"
+```
+
+`HOSTFILE` を使う環境では `--hostfile /path/to/hosts` を使う。  
+manual launch が必要なときだけ、同じ env を与えた状態で `bash scripts/sh_train_protein_grpo.sh` を直接呼ぶ。  
+この wrapper は exact `2 nodes x 4 GPUs` を production 既定とし、通常実行時は内部で `deepspeed train_protein_grpo.py ...` を呼ぶ。  
+`run_registered_train_rl.py` が成功した場合は `BIOREASON_TRAIN_RL_MODEL_REGISTRY_PATH` を `configs/disease_benchmark/wandb_registry_paths.env` に自動で追記する。
+
+実GPU向けの既定 runtime adaptation は次である。
+
+- `rollout_backend=subprocess`
+- `vllm_enable_sleep_mode=true`
+- `rollout_logprob_microbatch_size=4`
+
+より保守的な smoke run にしたい場合だけ、wrapper 呼び出し前に次の env を上書きしてよい。
+
+```bash
+export ROLLOUT_LOGPROB_MICROBATCH_SIZE=2
+export MAX_LOSS_COMPLETION_TOKENS=1024
+export VLLM_GPU_MEMORY_UTILIZATION=0.25
+export VLLM_CPU_OFFLOAD_GB=8
+```
+
+`MAX_LOSS_COMPLETION_TOKENS` は rollout 観測長ではなく loss に載せる completion 長の上限であり、`0` のときは full completion をそのまま使う。
 
 ### 4.2 RL 後の評価
 
@@ -418,11 +465,11 @@ srun \
 
 1. ローカル Mac で `uv` 環境を作る
 2. `scripts/run_temporal_split_artifact_pipeline.py` を `--variant main --build-datasets --upload-to-wandb` で実行する
-3. CoreWeave にコードだけ送る
-4. CoreWeave 上で `uv` 環境を作り、`wandb_registry_paths.env` を用意する
+3. GPU 環境にコードを送る
+4. GPU 環境上で `uv` 環境を作り、`wandb_registry_paths.env` を用意する
 5. 必要なら `bioreason-pro-rl-paper` を一度 W&B Artifact に固定する
 6. `comparison-family` を `validation` で評価する
-7. `bioreason-pro-rl-paper` を初期値にして RL に進む
-8. `BIOREASON_TRAIN_RL_MODEL_REGISTRY_PATH` を更新する
+7. `bioreason-pro-rl-paper` を初期値にして `bash scripts/sh_train_protein_grpo.sh --preflight_only true` を通す
+8. `python scripts/run_registered_train_rl.py ...` で RL を実行し、`BIOREASON_TRAIN_RL_MODEL_REGISTRY_PATH` を更新する
 9. `tuned-family` を `validation` で評価する
 10. `spec-comparison` を `test` で評価する
