@@ -390,7 +390,7 @@ export REGISTRY_ENV_FILE=configs/disease_benchmark/wandb_registry_paths.env
 export WANDB_ENTITY=wandb-healthcare
 export WANDB_PROJECT=bioreasoning-pro
 export NNODES=2
-export GPUS_PER_NODE=4
+export GPUS_PER_NODE=8
 export MASTER_ADDR=10.0.0.1
 export MASTER_PORT=29500
 export NODE_RANK=0
@@ -415,13 +415,17 @@ python scripts/run_registered_train_rl.py \
 
 `HOSTFILE` を使う環境では `--hostfile /path/to/hosts` を使う。  
 manual launch が必要なときだけ、同じ env を与えた状態で `bash scripts/sh_train_protein_grpo.sh` を直接呼ぶ。  
-この wrapper は exact `2 nodes x 4 GPUs` を production 既定とし、通常実行時は内部で `deepspeed train_protein_grpo.py ...` を呼ぶ。  
+この wrapper は exact `2 nodes x 8 GPUs` を production 既定とし、通常実行時は内部で `deepspeed train_protein_grpo.py ...` を呼ぶ。  
+production default では `queries_per_step=8`, `rollouts_per_query=24`, `gradient_accumulation_steps=2` とし、`16 ranks` を `2 ranks/query` で使う。  
+これにより global shape は `8 proteins x 24 rollouts = 192 trajectories` を維持しつつ、hardware shape だけが paper の `8 GPU` から `16 GPU` へ拡張される。  
 `run_registered_train_rl.py` が成功した場合は `BIOREASON_TRAIN_RL_MODEL_REGISTRY_PATH` を `configs/disease_benchmark/wandb_registry_paths.env` に自動で追記する。
 
 実GPU向けの既定 runtime adaptation は次である。
 
 - `rollout_backend=subprocess`
-- `vllm_enable_sleep_mode=true`
+- `vllm_enable_sleep_mode=false`
+- `max_new_tokens=10000`
+- `dataset_num_proc=1` during distributed preprocessing
 - `rollout_logprob_microbatch_size=4`
 
 より保守的な smoke run にしたい場合だけ、wrapper 呼び出し前に次の env を上書きしてよい。
@@ -429,6 +433,7 @@ manual launch が必要なときだけ、同じ env を与えた状態で `bash 
 ```bash
 export ROLLOUT_LOGPROB_MICROBATCH_SIZE=2
 export MAX_LOSS_COMPLETION_TOKENS=1024
+export MAX_NEW_TOKENS=1024
 export VLLM_GPU_MEMORY_UTILIZATION=0.25
 export VLLM_CPU_OFFLOAD_GB=8
 ```

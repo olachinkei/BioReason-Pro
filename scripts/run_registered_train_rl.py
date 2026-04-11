@@ -31,7 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-artifact-aliases", type=str, default="latest,213.221.225.228")
     parser.add_argument("--weave-project", type=str, default=None)
     parser.add_argument("--nnodes", type=int, default=int(os.environ.get("NNODES", "2")))
-    parser.add_argument("--gpus-per-node", type=int, default=int(os.environ.get("GPUS_PER_NODE", "4")))
+    parser.add_argument("--gpus-per-node", type=int, default=int(os.environ.get("GPUS_PER_NODE", "8")))
     parser.add_argument("--hostfile", type=Path, default=Path(os.environ["HOSTFILE"]) if os.environ.get("HOSTFILE") else None)
     parser.add_argument("--master-addr", type=str, default=os.environ.get("MASTER_ADDR"))
     parser.add_argument("--master-port", type=str, default=os.environ.get("MASTER_PORT"))
@@ -112,8 +112,8 @@ def build_launch_env(args: argparse.Namespace) -> dict[str, str]:
 
     if args.nnodes != 2:
         raise ValueError(f"Spec-first production launch requires --nnodes 2, got {args.nnodes}.")
-    if args.gpus_per_node != 4:
-        raise ValueError(f"Spec-first production launch requires --gpus-per-node 4, got {args.gpus_per_node}.")
+    if args.gpus_per_node != 8:
+        raise ValueError(f"Spec-first production launch requires --gpus-per-node 8, got {args.gpus_per_node}.")
 
     env = {
         "REGISTRY_ENV_FILE": str(args.registry_env_file),
@@ -125,6 +125,10 @@ def build_launch_env(args: argparse.Namespace) -> dict[str, str]:
         "CHECKPOINT_ARTIFACT_ALIASES": normalize_text(args.checkpoint_artifact_aliases).strip(),
         "NNODES": str(args.nnodes),
         "GPUS_PER_NODE": str(args.gpus_per_node),
+        "QUERIES_PER_STEP": "8",
+        "ROLLOUTS_PER_QUERY": "24",
+        "OPTIMIZER_MICRO_BATCH_SIZE_PER_GPU": "6",
+        "GRADIENT_ACCUMULATION_STEPS": "2",
     }
     if weave_project:
         env["WEAVE_PROJECT"] = weave_project

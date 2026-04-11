@@ -113,7 +113,7 @@ class RunRegisteredTrainRlContractsTest(unittest.TestCase):
             "checkpoint_artifact_aliases": "latest,production",
             "weave_project": "",
             "nnodes": 2,
-            "gpus_per_node": 4,
+            "gpus_per_node": 8,
             "hostfile": None,
             "master_addr": "127.0.0.1",
             "master_port": "29500",
@@ -126,11 +126,11 @@ class RunRegisteredTrainRlContractsTest(unittest.TestCase):
         resolved = REGISTERED_TRAIN_RL.resolve_registry_env_file(Path("configs/disease_benchmark/wandb_registry_paths.env"))
         self.assertEqual(resolved, (ROOT / "configs" / "disease_benchmark" / "wandb_registry_paths.env").resolve())
 
-    def test_build_launch_env_requires_exact_2x4_shape(self):
+    def test_build_launch_env_requires_exact_2x8_shape(self):
         with self.assertRaisesRegex(ValueError, "--nnodes 2"):
             REGISTERED_TRAIN_RL.build_launch_env(self.make_args(nnodes=1))
-        with self.assertRaisesRegex(ValueError, "--gpus-per-node 4"):
-            REGISTERED_TRAIN_RL.build_launch_env(self.make_args(gpus_per_node=8))
+        with self.assertRaisesRegex(ValueError, "--gpus-per-node 8"):
+            REGISTERED_TRAIN_RL.build_launch_env(self.make_args(gpus_per_node=4))
 
     def test_build_launch_env_supports_hostfile_without_master_env(self):
         hostfile = Path("/tmp/hosts.txt")
@@ -188,7 +188,10 @@ class RunRegisteredTrainRlContractsTest(unittest.TestCase):
             self.assertEqual(command, ["bash", "scripts/sh_train_protein_grpo.sh"])
             self.assertTrue(Path(env_updates["REGISTRY_ENV_FILE"]).samefile(env_file))
             self.assertEqual(env_updates["NNODES"], "2")
-            self.assertEqual(env_updates["GPUS_PER_NODE"], "4")
+            self.assertEqual(env_updates["GPUS_PER_NODE"], "8")
+            self.assertEqual(env_updates["QUERIES_PER_STEP"], "8")
+            self.assertEqual(env_updates["ROLLOUTS_PER_QUERY"], "24")
+            self.assertEqual(env_updates["GRADIENT_ACCUMULATION_STEPS"], "2")
             self.assertEqual(env_updates["MASTER_ADDR"], "10.0.0.1")
             self.assertEqual(env_updates["MASTER_PORT"], "29500")
             self.assertEqual(env_updates["NODE_RANK"], "0")

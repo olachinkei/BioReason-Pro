@@ -55,8 +55,26 @@ require_env() {
   local key="$1"
   local value="${!key:-}"
   if [ -z "$value" ]; then
-    echo "Error: $key is required for the exact 2x4 launch contract."
+    echo "Error: $key is required for the exact 2-node launch contract."
     exit 1
+  fi
+}
+
+maybe_generate_slurm_hostfile() {
+  local hostfile_path
+  if [ -n "$HOSTFILE" ] || [ -z "${SLURM_JOB_NODELIST:-}" ]; then
+    return 0
+  fi
+  if ! command -v scontrol >/dev/null 2>&1; then
+    return 0
+  fi
+  hostfile_path="${HOSTFILE_AUTO_PATH:-"$(pwd)/runtime_logs/deepspeed_hosts.${SLURM_JOB_ID:-$$}.txt"}"
+  mkdir -p "$(dirname "$hostfile_path")"
+  scontrol show hostnames "$SLURM_JOB_NODELIST" | awk -v slots="$GPUS_PER_NODE" '{print $1 " slots=" slots}' > "$hostfile_path"
+  if [ -s "$hostfile_path" ]; then
+    HOSTFILE="$hostfile_path"
+    export HOSTFILE
+    echo "Info: auto-generated DeepSpeed hostfile at $HOSTFILE from SLURM_JOB_NODELIST."
   fi
 }
 
@@ -105,6 +123,11 @@ CHECKPOINT_ARTIFACT_ALIASES=${CHECKPOINT_ARTIFACT_ALIASES:-"latest"}
 OUTPUT_DIR=${OUTPUT_DIR:-"data/artifacts/models/train_rl_output"}
 ROLLOUT_BACKEND=${ROLLOUT_BACKEND:-"subprocess"}
 ROLLOUT_WORKER_START_METHOD=${ROLLOUT_WORKER_START_METHOD:-"spawn"}
+QUERIES_PER_STEP=${QUERIES_PER_STEP:-8}
+ROLLOUTS_PER_QUERY=${ROLLOUTS_PER_QUERY:-24}
+OPTIMIZER_MICRO_BATCH_SIZE_PER_GPU=${OPTIMIZER_MICRO_BATCH_SIZE_PER_GPU:-6}
+GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-2}
+MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-10000}
 ROLLOUT_LOGPROB_MICROBATCH_SIZE=${ROLLOUT_LOGPROB_MICROBATCH_SIZE:-4}
 MAX_LOSS_COMPLETION_TOKENS=${MAX_LOSS_COMPLETION_TOKENS:-0}
 VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION:-0.35}
@@ -113,7 +136,7 @@ VLLM_MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:-256}
 VLLM_CPU_OFFLOAD_GB=${VLLM_CPU_OFFLOAD_GB:-0}
 VLLM_SWAP_SPACE_GB=${VLLM_SWAP_SPACE_GB:-4}
 VLLM_ENFORCE_EAGER=${VLLM_ENFORCE_EAGER:-true}
-VLLM_ENABLE_SLEEP_MODE=${VLLM_ENABLE_SLEEP_MODE:-true}
+VLLM_ENABLE_SLEEP_MODE=${VLLM_ENABLE_SLEEP_MODE:-false}
 VLLM_SLEEP_LEVEL=${VLLM_SLEEP_LEVEL:-1}
 VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-${BIOREASON_VLLM_ATTENTION_BACKEND:-XFORMERS}}
 VLLM_WORKER_MULTIPROC_METHOD=${VLLM_WORKER_MULTIPROC_METHOD:-${BIOREASON_VLLM_WORKER_MULTIPROC_METHOD:-spawn}}
@@ -124,7 +147,7 @@ export VLLM_WORKER_MULTIPROC_METHOD
 export VLLM_USE_V1
 
 NNODES=${NNODES:-2}
-GPUS_PER_NODE=${GPUS_PER_NODE:-4}
+GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 HOSTFILE=${HOSTFILE:-""}
 MASTER_ADDR=${MASTER_ADDR:-""}
 MASTER_PORT=${MASTER_PORT:-""}
@@ -134,8 +157,8 @@ if [ "$NNODES" != "2" ]; then
   echo "Error: exact production launch requires NNODES=2 (got $NNODES)."
   exit 1
 fi
-if [ "$GPUS_PER_NODE" != "4" ]; then
-  echo "Error: exact production launch requires GPUS_PER_NODE=4 (got $GPUS_PER_NODE)."
+if [ "$GPUS_PER_NODE" != "8" ]; then
+  echo "Error: exact production launch requires GPUS_PER_NODE=8 (got $GPUS_PER_NODE)."
   exit 1
 fi
 
@@ -221,6 +244,8 @@ TRAIN_ARGS=(
   --go_obo_path "$GO_OBO_PATH"
   --ia_file_path "$IA_FILE_PATH"
   --benchmark_version "$BENCHMARK_VERSION"
+  --queries_per_step "$QUERIES_PER_STEP"
+  --rollouts_per_query "$ROLLOUTS_PER_QUERY"
   --train_start_release "$TRAIN_START_RELEASE"
   --train_end_release "$TRAIN_END_RELEASE"
   --dev_end_release "$DEV_END_RELEASE"
@@ -229,6 +254,9 @@ TRAIN_ARGS=(
   --target_gpus_per_node "$GPUS_PER_NODE"
   --rollout_backend "$ROLLOUT_BACKEND"
   --rollout_worker_start_method "$ROLLOUT_WORKER_START_METHOD"
+  --optimizer_micro_batch_size_per_gpu "$OPTIMIZER_MICRO_BATCH_SIZE_PER_GPU"
+  --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS"
+  --max_new_tokens "$MAX_NEW_TOKENS"
   --rollout_logprob_microbatch_size "$ROLLOUT_LOGPROB_MICROBATCH_SIZE"
   --max_loss_completion_tokens "$MAX_LOSS_COMPLETION_TOKENS"
   --vllm_gpu_memory_utilization "$VLLM_GPU_MEMORY_UTILIZATION"
@@ -261,6 +289,8 @@ fi
 if has_preflight_only "$@"; then
   exec "$PYTHON_BIN" train_protein_grpo.py "${TRAIN_ARGS[@]}" "$@"
 fi
+
+maybe_generate_slurm_hostfile
 
 if [ -n "$HOSTFILE" ]; then
   if [ ! -f "$HOSTFILE" ]; then

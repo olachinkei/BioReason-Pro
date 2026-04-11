@@ -679,6 +679,8 @@ class ProteinLLMModel(nn.Module):
             sampling_kwargs["min_p"] = generation_kwargs.get("min_p")
         if generation_kwargs.get("repetition_penalty") is not None:
             sampling_kwargs["repetition_penalty"] = generation_kwargs.get("repetition_penalty")
+        if generation_kwargs.get("seed") is not None:
+            sampling_kwargs["seed"] = int(generation_kwargs.get("seed"))
         sampling_params = SamplingParams(**sampling_kwargs)
 
         # Build requests for vLLM generation

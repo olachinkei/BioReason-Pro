@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import types
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -58,6 +59,7 @@ class FakeWeaveModule:
         self.init_calls: list[dict[str, object]] = []
         self.attribute_calls: list[dict[str, object]] = []
         self.trace_payloads: list[dict[str, object]] = []
+        self.trace_results: list[dict[str, object]] = []
 
     def init(self, project: str, global_attributes: dict[str, object] | None = None) -> FakeWeaveClient:
         self.init_calls.append(
@@ -73,7 +75,9 @@ class FakeWeaveModule:
             def wrapped(payload):
                 payload_dict = dict(payload)
                 self.trace_payloads.append(payload_dict)
-                return fn(payload_dict)
+                result = fn(payload_dict)
+                self.trace_results.append(dict(result))
+                return result
 
             wrapped._weave_name = name
             return wrapped
@@ -246,6 +250,23 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
                 """
             ),
         )
+        fake_scontrol = self.write_executable(
+            root / "scontrol",
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env python3
+                import os
+                import sys
+
+                if sys.argv[1:] != ["show", "hostnames", os.environ.get("SLURM_JOB_NODELIST", "")]:
+                    raise SystemExit(f"unexpected scontrol argv: {sys.argv[1:]}")
+                for host in os.environ.get("FAKE_SCONTROL_HOSTS", "worker-0\\nworker-1").splitlines():
+                    host = host.strip()
+                    if host:
+                        print(host)
+                """
+            ),
+        )
         model_resolver = root / "materialize_model_source.py"
         model_resolver.write_text("# resolver placeholder\n", encoding="utf-8")
         data_resolver = root / "materialize_data_bundle.py"
@@ -265,6 +286,8 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
             "FAKE_TEMPORAL_ARTIFACT": "env/project/disease-temporal-split:production",
             "FAKE_DATASET_ARTIFACT": "env/project/disease-temporal-reasoning:production",
             "HOSTFILE_PATH": str(hostfile),
+            "PATH": f"{root}:{os.environ['PATH']}",
+            "FAKE_SCONTROL_HOSTS": "worker-0\nworker-1\n",
         }
 
     def read_tool_log(self, log_path: Path) -> list[dict[str, object]]:
@@ -288,12 +311,13 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertEqual(algorithm.total_trajectories, 192)
         self.assertEqual(algorithm.steps_per_generation, 2)
         self.assertEqual(algorithm.num_iterations, 1)
-        self.assertEqual(algorithm.max_new_tokens, 2048)
+        self.assertEqual(algorithm.max_new_tokens, 10000)
         self.assertEqual(runtime_spec.optimizer_micro_batch_size_per_gpu, 6)
-        self.assertEqual(runtime_spec.gradient_accumulation_steps, 4)
+        self.assertEqual(runtime_spec.gradient_accumulation_steps, 2)
         self.assertEqual(runtime_spec.target_num_nodes, 2)
-        self.assertEqual(runtime_spec.target_gpus_per_node, 4)
-        self.assertEqual(runtime_spec.target_world_size, 8)
+        self.assertEqual(runtime_spec.target_gpus_per_node, 8)
+        self.assertEqual(runtime_spec.target_world_size, 16)
+        self.assertEqual(runtime_spec.local_trajectories_per_rank, 12)
         self.assertEqual(runtime_spec.runtime_stack, "deepspeed_vllm_colocate")
         self.assertEqual(args.attn_implementation, "auto")
         self.assertEqual(args.dataset_num_proc, 4)
@@ -363,9 +387,12 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
 
     def test_partition_queries_for_rank_matches_one_query_per_rank_layout(self):
         global_indices = list(range(8))
-        self.assertEqual(GRPO.partition_queries_for_rank(global_indices, rank=0, world_size=8), [0])
-        self.assertEqual(GRPO.partition_queries_for_rank(global_indices, rank=3, world_size=8), [3])
-        self.assertEqual(GRPO.partition_queries_for_rank(global_indices, rank=7, world_size=8), [7])
+        self.assertEqual(GRPO.partition_queries_for_rank(global_indices, rank=0, world_size=8, queries_per_step=8), [0])
+        self.assertEqual(GRPO.partition_queries_for_rank(global_indices, rank=3, world_size=8, queries_per_step=8), [3])
+        self.assertEqual(GRPO.partition_queries_for_rank(global_indices, rank=7, world_size=8, queries_per_step=8), [7])
+        self.assertEqual(GRPO.partition_queries_for_rank(global_indices, rank=0, world_size=16, queries_per_step=8), [0])
+        self.assertEqual(GRPO.partition_queries_for_rank(global_indices, rank=1, world_size=16, queries_per_step=8), [0])
+        self.assertEqual(GRPO.partition_queries_for_rank(global_indices, rank=14, world_size=16, queries_per_step=8), [7])
 
     def test_resolve_local_cuda_visible_device_prefers_single_visible_gpu(self):
         self.assertEqual(GRPO.resolve_local_cuda_visible_device(local_rank=3, cuda_visible_devices="5"), "5")
@@ -438,9 +465,10 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
                 "false",
             ]
         )
-        worker.runtime = mock.Mock()
+        worker.runtime = types.SimpleNamespace(rank=0)
         worker._connection = None
         worker._process = None
+        worker._generation_counter = 0
 
         with mock.patch.object(worker, "_stop_subprocess") as stop_mock:
             worker.unload()
@@ -480,7 +508,7 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         ds_config = GRPO.build_deepspeed_config(args, runtime_spec)
 
         self.assertEqual(ds_config["train_micro_batch_size_per_gpu"], 6)
-        self.assertEqual(ds_config["gradient_accumulation_steps"], 4)
+        self.assertEqual(ds_config["gradient_accumulation_steps"], 2)
         self.assertEqual(ds_config["gradient_clipping"], 1.0)
         self.assertEqual(ds_config["zero_optimization"]["stage"], 2)
         self.assertTrue(ds_config["bf16"]["enabled"])
@@ -514,7 +542,9 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertEqual(config["reward_extraction"], "final_answer_block_only")
         self.assertEqual(config["paper_target_rollouts_per_query"], 24.0)
         self.assertEqual(config["paper_target_max_new_tokens"], 10000.0)
-        self.assertEqual(config["paper_deviation_max_new_tokens"], 1.0)
+        self.assertEqual(config["paper_deviation_max_new_tokens"], 0.0)
+        self.assertEqual(config["query_parallel_degree"], 2)
+        self.assertEqual(config["local_rollouts_per_rank"], 12)
         self.assertEqual(config["wandb_project"], "bioreasoning-pro")
 
     def test_build_trace_path_is_rank_scoped_when_distributed(self):
@@ -539,7 +569,7 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         runtime_spec = GRPO.build_runtime_spec(args)
         runtime = GRPO.DistributedRuntime(enabled=False, rank=0, world_size=1, local_rank=0, device="cpu")
 
-        with self.assertRaisesRegex(ValueError, "target_num_nodes \\* target_gpus_per_node == queries_per_step"):
+        with self.assertRaisesRegex(ValueError, "integer multiple of queries_per_step"):
             GRPO.validate_runtime_shape(runtime, algorithm, runtime_spec, args)
 
     def test_validate_spec_inputs_requires_existing_ia_file(self):
@@ -645,7 +675,10 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
             self.assertEqual(payload["artifact_refs"]["dataset_artifact"], "wandb-healthcare/bioreasoning-pro/disease-temporal-reasoning:production")
             self.assertEqual(payload["resolved_paths"]["text_model_name"], str(model_dir))
             self.assertEqual(payload["resolved_paths"]["cafa5_dataset"], str(dataset_dir))
-            self.assertEqual(payload["launch_contract"]["target_world_size"], 8)
+            self.assertEqual(payload["launch_contract"]["target_world_size"], 16)
+            self.assertEqual(payload["launch_contract"]["queries_per_step"], 8)
+            self.assertEqual(payload["launch_contract"]["query_parallel_degree"], 2)
+            self.assertEqual(payload["launch_contract"]["local_rollouts_per_rank"], 12)
             self.assertEqual(payload["launch_contract"]["attn_implementation"], "auto")
             self.assertEqual(payload["launch_contract"]["dataset_num_proc"], 1)
             self.assertEqual(payload["launch_contract"]["vllm_attention_backend"], "XFORMERS")
@@ -689,6 +722,8 @@ relationship: part_of GO:0000002 ! child
         self.assertIn("--no_ssh", wrapper_text)
         self.assertIn('--num_nodes "$NNODES"', wrapper_text)
         self.assertIn('--num_gpus "$GPUS_PER_NODE"', wrapper_text)
+        self.assertIn('QUERIES_PER_STEP=${QUERIES_PER_STEP:-8}', wrapper_text)
+        self.assertIn('GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-2}', wrapper_text)
         self.assertIn('--preflight_only', wrapper_text)
         self.assertNotIn("srun", wrapper_text)
         self.assertNotIn("torch.distributed.run", wrapper_text)
@@ -726,7 +761,10 @@ relationship: part_of GO:0000002 ! child
                 entry for entry in entries if entry["tool"] == "python" and Path(entry["argv"][0]).name == "train_protein_grpo.py"
             )
             self.assertEqual(self.value_after(train_entry["argv"], "--wandb_project"), "explicit-project")
-            self.assertEqual(self.value_after(train_entry["argv"], "--max_new_tokens"), "2048")
+            self.assertEqual(self.value_after(train_entry["argv"], "--queries_per_step"), "8")
+            self.assertEqual(self.value_after(train_entry["argv"], "--rollouts_per_query"), "24")
+            self.assertEqual(self.value_after(train_entry["argv"], "--gradient_accumulation_steps"), "2")
+            self.assertEqual(self.value_after(train_entry["argv"], "--max_new_tokens"), "10000")
             self.assertEqual(self.value_after(train_entry["argv"], "--vllm_attention_backend"), "XFORMERS")
             self.assertEqual(self.value_after(train_entry["argv"], "--vllm_worker_multiproc_method"), "spawn")
             self.assertEqual(self.value_after(train_entry["argv"], "--vllm_enable_sleep_mode"), "false")
@@ -788,12 +826,50 @@ relationship: part_of GO:0000002 ! child
             self.assertEqual(self.value_after(deepspeed_entry["argv"], "--master_addr"), "10.0.0.1")
             self.assertEqual(self.value_after(deepspeed_entry["argv"], "--master_port"), "29500")
             self.assertEqual(self.value_after(deepspeed_entry["argv"], "--node_rank"), "0")
-            self.assertEqual(self.value_after(deepspeed_entry["argv"], "--max_new_tokens"), "2048")
+            self.assertEqual(self.value_after(deepspeed_entry["argv"], "--queries_per_step"), "8")
+            self.assertEqual(self.value_after(deepspeed_entry["argv"], "--rollouts_per_query"), "24")
+            self.assertEqual(self.value_after(deepspeed_entry["argv"], "--gradient_accumulation_steps"), "2")
+            self.assertEqual(self.value_after(deepspeed_entry["argv"], "--max_new_tokens"), "10000")
             self.assertEqual(self.value_after(deepspeed_entry["argv"], "--vllm_attention_backend"), "XFORMERS")
             self.assertEqual(self.value_after(deepspeed_entry["argv"], "--vllm_worker_multiproc_method"), "spawn")
             self.assertEqual(self.value_after(deepspeed_entry["argv"], "--vllm_enable_sleep_mode"), "false")
             self.assertEqual(self.value_after(deepspeed_entry["argv"], "--vllm_use_v1"), "0")
             self.assertNotIn("--hostfile", deepspeed_entry["argv"])
+
+    def test_wrapper_auto_generates_hostfile_from_slurm_nodelist(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            harness = self.create_wrapper_harness(Path(tmpdir))
+            env = os.environ.copy()
+            env.update(harness)
+            env.update(
+                {
+                    "MASTER_ADDR": "10.0.0.1",
+                    "MASTER_PORT": "29500",
+                    "NODE_RANK": "1",
+                    "SLURM_JOB_ID": "4242",
+                    "SLURM_JOB_NODELIST": "worker-[0-1]",
+                }
+            )
+
+            result = subprocess.run(
+                ["bash", str(WRAPPER_PATH)],
+                cwd=ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr or result.stdout)
+            self.assertIn("auto-generated DeepSpeed hostfile", result.stdout)
+            entries = self.read_tool_log(Path(harness["FAKE_LOG_PATH"]))
+            deepspeed_entry = next(entry for entry in entries if entry["tool"] == "deepspeed")
+            generated_hostfile = self.value_after(deepspeed_entry["argv"], "--hostfile")
+            self.assertTrue(generated_hostfile.endswith("deepspeed_hosts.4242.txt"))
+            self.assertIn("--no_ssh", deepspeed_entry["argv"])
+            self.assertEqual(self.value_after(deepspeed_entry["argv"], "--node_rank"), "1")
+            hostfile_text = Path(generated_hostfile).read_text(encoding="utf-8")
+            self.assertEqual(hostfile_text, "worker-0 slots=8\nworker-1 slots=8\n")
 
     def test_wrapper_uses_hostfile_when_provided(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -906,13 +982,13 @@ relationship: part_of GO:0000002 ! child
                 "queries_per_step": 8,
                 "rollouts_per_query": 24,
                 "total_trajectories_per_step": 192,
-                "max_new_tokens": 2048,
+                "max_new_tokens": 10000,
                 "steps_per_generation": 2,
                 "num_iterations": 1,
                 "paper_runtime_deviation_from_spec": 1.0,
                 "paper_target_rollouts_per_query": 24.0,
                 "paper_target_max_new_tokens": 10000.0,
-                "paper_deviation_max_new_tokens": 1.0,
+                "paper_deviation_max_new_tokens": 0.0,
             }
 
             tracker = GRPO.RunTracker(args=args, config=config, output_dir=output_dir, runtime=runtime)
@@ -1051,6 +1127,9 @@ relationship: part_of GO:0000002 ! child
                 multimodal_cache=None,
             )
             sampling = GRPO.SamplingSpec(max_new_tokens=32)
+            tokenizer = types.SimpleNamespace(
+                encode=lambda text, add_special_tokens=False: [ord(ch) % 17 for ch in str(text)],
+            )
 
             with mock.patch.object(GRPO, "weave", fake_weave), mock.patch.object(
                 GRPO.RunTracker, "_maybe_init_wandb", return_value=None
@@ -1063,6 +1142,7 @@ relationship: part_of GO:0000002 ! child
                     repeat_count=3,
                     sampling=sampling,
                     generator=lambda: ["<|FINAL_ANSWER|>GO:0000001<|/FINAL_ANSWER|>"],
+                    tokenizer=tokenizer,
                 )
 
             self.assertEqual(outputs, ["<|FINAL_ANSWER|>GO:0000001<|/FINAL_ANSWER|>"])
@@ -1076,6 +1156,18 @@ relationship: part_of GO:0000002 ! child
             self.assertNotIn("final_answer", fake_weave.trace_payloads[0]["query"]["sample_meta"])
             self.assertEqual(fake_weave.attribute_calls[0]["run_name"], "demo-run")
             self.assertEqual(fake_weave.attribute_calls[0]["step"], 4)
+            self.assertEqual(fake_weave.trace_results[0]["output_count"], 1)
+            self.assertEqual(
+                fake_weave.trace_results[0]["output_char_lengths"],
+                [len("<|FINAL_ANSWER|>GO:0000001<|/FINAL_ANSWER|>")],
+            )
+            self.assertEqual(fake_weave.trace_results[0]["output_word_lengths"], [1])
+            self.assertEqual(
+                fake_weave.trace_results[0]["output_token_lengths"],
+                [len("<|FINAL_ANSWER|>GO:0000001<|/FINAL_ANSWER|>")],
+            )
+            self.assertEqual(fake_weave.trace_results[0]["output_length_summary"]["chars"]["count"], 1)
+            self.assertEqual(fake_weave.trace_results[0]["output_length_summary"]["tokens"]["count"], 1)
             self.assertEqual(tracker.weave_remaining_budget, args.weave_trace_budget - 1)
 
     def test_trace_reward_call_uses_stage_specific_targets(self):

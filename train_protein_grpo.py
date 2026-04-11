@@ -29,7 +29,7 @@ import shutil
 import time
 import traceback
 from contextlib import nullcontext
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -259,7 +259,7 @@ class AlgorithmSpec:
     clip_epsilon_high: float = 9e-4
     importance_sampling_cap: float = 2.0
     kl_beta: float = 1e-4
-    max_new_tokens: int = 2_048
+    max_new_tokens: int = 10_000
     reward_std_epsilon: float = 1e-6
 
     @property
@@ -278,9 +278,9 @@ class AlgorithmSpec:
 @dataclass(frozen=True)
 class RuntimeSpec:
     optimizer_micro_batch_size_per_gpu: int = 6
-    gradient_accumulation_steps: int = 4
+    gradient_accumulation_steps: int = 2
     target_num_nodes: int = 2
-    target_gpus_per_node: int = 4
+    target_gpus_per_node: int = 8
     zero_stage: int = 2
     bf16: bool = True
     runtime_stack: str = "deepspeed_vllm_colocate"
@@ -301,7 +301,7 @@ class SamplingSpec:
     top_p: float = 0.95
     min_p: float = 0.0
     repetition_penalty: float = 1.0
-    max_new_tokens: int = 2_048
+    max_new_tokens: int = 10_000
 
 
 @dataclass(frozen=True)
@@ -318,6 +318,11 @@ class DistributedRuntime:
     world_size: int
     local_rank: int
     device: Any
+    query_parallel_degree: int = 1
+    query_group_index: int = 0
+    query_rank_in_group: int = 0
+    query_group_ranks: Tuple[int, ...] = field(default_factory=tuple)
+    query_process_group: Any = None
 
 
 @dataclass
@@ -407,9 +412,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
 
     parser.add_argument("--optimizer_micro_batch_size_per_gpu", type=int, default=6)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=2)
     parser.add_argument("--target_num_nodes", type=int, default=2)
-    parser.add_argument("--target_gpus_per_node", type=int, default=4)
+    parser.add_argument("--target_gpus_per_node", type=int, default=8)
     parser.add_argument("--zero_stage", type=int, default=2)
     parser.add_argument("--runtime_stack", type=str, default="deepspeed_vllm_colocate")
 
@@ -424,7 +429,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--min_p", type=float, default=0.0)
     parser.add_argument("--repetition_penalty", type=float, default=1.0)
-    parser.add_argument("--max_new_tokens", type=int, default=2_048)
+    parser.add_argument("--max_new_tokens", type=int, default=10_000)
     parser.add_argument("--max_loss_completion_tokens", type=int, default=0)
     parser.add_argument("--rollout_logprob_microbatch_size", type=int, default=4)
     parser.add_argument("--clip_epsilon_low", type=float, default=7e-4)
@@ -710,15 +715,15 @@ def run_preflight(args: argparse.Namespace) -> bool:
         failures.append(f"base_checkpoint points to a missing local path: {base_checkpoint}")
 
     env_world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    if env_world_size > 1 and env_world_size != algorithm.queries_per_step:
+    if env_world_size > 1 and env_world_size != runtime_spec.target_world_size:
         failures.append(
-            "Current WORLD_SIZE does not match the paper-faithful rollout shape: "
-            f"WORLD_SIZE={env_world_size}, required={algorithm.queries_per_step}."
+            "Current WORLD_SIZE does not match the configured distributed runtime shape: "
+            f"WORLD_SIZE={env_world_size}, required={runtime_spec.target_world_size}."
         )
     if env_world_size == 1 and not args.debug_single_process:
         warnings.append(
             "WORLD_SIZE is not set for a distributed launch in this shell. "
-            "That is fine for preflight, but the real run should use deepspeed with 8 ranks."
+            f"That is fine for preflight, but the real run should use deepspeed with {runtime_spec.target_world_size} ranks."
         )
 
     preflight_plan = {
@@ -730,6 +735,7 @@ def run_preflight(args: argparse.Namespace) -> bool:
         "total_trajectories": algorithm.total_trajectories,
         "steps_per_generation": algorithm.steps_per_generation,
         "target_world_size": runtime_spec.target_world_size,
+        "query_parallel_degree": resolve_query_parallel_degree(runtime_spec.target_world_size, algorithm.queries_per_step),
         "runtime_stack": runtime_spec.runtime_stack,
         "rollout_backend": normalize_text(args.rollout_backend).strip(),
         "attn_implementation": normalize_text(args.attn_implementation).strip() or "auto",
@@ -758,6 +764,8 @@ def run_preflight(args: argparse.Namespace) -> bool:
         "target_world_size": runtime_spec.target_world_size,
         "queries_per_step": algorithm.queries_per_step,
         "rollouts_per_query": algorithm.rollouts_per_query,
+        "query_parallel_degree": resolve_query_parallel_degree(runtime_spec.target_world_size, algorithm.queries_per_step),
+        "local_rollouts_per_rank": resolve_local_rollouts_per_rank(algorithm, runtime_spec.target_world_size),
         "local_trajectories_per_rank": runtime_spec.local_trajectories_per_rank,
         "optimizer_micro_batch_size_per_gpu": runtime_spec.optimizer_micro_batch_size_per_gpu,
         "gradient_accumulation_steps": runtime_spec.gradient_accumulation_steps,
@@ -822,6 +830,47 @@ def initialize_runtime(args: argparse.Namespace) -> DistributedRuntime:
     )
 
 
+def resolve_query_parallel_degree(world_size: int, queries_per_step: int) -> int:
+    if world_size <= 1 or queries_per_step <= 0:
+        return 1
+    if world_size % queries_per_step != 0:
+        raise ValueError(
+            "Configured WORLD_SIZE must be an integer multiple of queries_per_step. "
+            f"Got world_size={world_size}, queries_per_step={queries_per_step}."
+        )
+    return max(world_size // queries_per_step, 1)
+
+
+def resolve_local_rollouts_per_rank(algorithm: AlgorithmSpec, world_size: int) -> int:
+    query_parallel_degree = resolve_query_parallel_degree(world_size, algorithm.queries_per_step)
+    if algorithm.rollouts_per_query % query_parallel_degree != 0:
+        raise ValueError(
+            "rollouts_per_query must be divisible by query_parallel_degree for distributed rollout sharding. "
+            f"Got rollouts_per_query={algorithm.rollouts_per_query}, query_parallel_degree={query_parallel_degree}."
+        )
+    return max(algorithm.rollouts_per_query // query_parallel_degree, 1)
+
+
+def configure_query_parallel_runtime(runtime: DistributedRuntime, algorithm: AlgorithmSpec) -> None:
+    if not runtime.enabled:
+        runtime.query_parallel_degree = 1
+        runtime.query_group_index = 0
+        runtime.query_rank_in_group = 0
+        runtime.query_group_ranks = tuple()
+        runtime.query_process_group = None
+        return
+    query_parallel_degree = resolve_query_parallel_degree(runtime.world_size, algorithm.queries_per_step)
+    runtime.query_parallel_degree = query_parallel_degree
+    runtime.query_group_index = runtime.rank // query_parallel_degree
+    runtime.query_rank_in_group = runtime.rank % query_parallel_degree
+    group_start = runtime.query_group_index * query_parallel_degree
+    runtime.query_group_ranks = tuple(range(group_start, group_start + query_parallel_degree))
+    if query_parallel_degree > 1:
+        runtime.query_process_group = torch.distributed.new_group(ranks=list(runtime.query_group_ranks))
+    else:
+        runtime.query_process_group = None
+
+
 def rank0_print(runtime: DistributedRuntime, message: str) -> None:
     if runtime.rank == 0:
         print(message, flush=True)
@@ -853,25 +902,25 @@ def shutdown_runtime(runtime: DistributedRuntime) -> None:
     destroy_torch_distributed_process_group(log_prefix=f"[rank {runtime.rank}]")
 
 
-def all_reduce_sum_scalar(value: float, runtime: DistributedRuntime) -> float:
+def all_reduce_sum_scalar(value: float, runtime: DistributedRuntime, process_group: Any = None) -> float:
     if torch is None:
         if runtime.enabled:
             raise RuntimeError("Distributed scalar reduction requires torch.")
         return float(value)
     tensor = torch.tensor(float(value), device=runtime.device, dtype=torch.float64)
     if runtime.enabled:
-        torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM, group=process_group)
     return float(tensor.item())
 
 
-def all_reduce_max_scalar(value: float, runtime: DistributedRuntime) -> float:
+def all_reduce_max_scalar(value: float, runtime: DistributedRuntime, process_group: Any = None) -> float:
     if torch is None:
         if runtime.enabled:
             raise RuntimeError("Distributed scalar reduction requires torch.")
         return float(value)
     tensor = torch.tensor(float(value), device=runtime.device, dtype=torch.float64)
     if runtime.enabled:
-        torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MAX)
+        torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MAX, group=process_group)
     return float(tensor.item())
 
 
@@ -901,10 +950,18 @@ def sample_query_indices(dataset_length: int, queries_per_step: int, seed: int, 
     return broadcast_indices(indices, runtime)
 
 
-def partition_queries_for_rank(global_indices: Sequence[int], rank: int, world_size: int) -> List[int]:
+def partition_queries_for_rank(global_indices: Sequence[int], rank: int, world_size: int, queries_per_step: int) -> List[int]:
     if world_size <= 0:
         raise ValueError(f"world_size must be positive, got {world_size}")
-    return [int(global_indices[idx]) for idx in range(rank, len(global_indices), world_size)]
+    if world_size == 1:
+        return [int(item) for item in global_indices]
+    query_parallel_degree = resolve_query_parallel_degree(world_size, queries_per_step)
+    query_index = rank // query_parallel_degree
+    if query_index < 0 or query_index >= len(global_indices):
+        raise ValueError(
+            f"Rank {rank} resolved to query_index={query_index}, but only {len(global_indices)} queries were sampled."
+        )
+    return [int(global_indices[query_index])]
 
 
 def resolve_local_cuda_visible_device(local_rank: int, cuda_visible_devices: Optional[str] = None) -> str:
@@ -945,15 +1002,15 @@ def validate_runtime_shape(
     args: argparse.Namespace,
 ) -> None:
     validate_algorithm_runtime_contract(algorithm, runtime_spec)
-    if runtime.enabled and runtime.world_size != algorithm.queries_per_step:
+    if runtime.enabled and runtime.world_size != runtime_spec.target_world_size:
         raise ValueError(
-            "Spec-first distributed training requires world_size == queries_per_step so each rank owns one protein group. "
-            f"Got world_size={runtime.world_size}, queries_per_step={algorithm.queries_per_step}."
+            "Spec-first distributed training requires world_size == target_num_nodes * target_gpus_per_node. "
+            f"Got world_size={runtime.world_size}, target_world_size={runtime_spec.target_world_size}."
         )
     if (not runtime.enabled) and (not args.debug_single_process):
         raise ValueError(
             "Spec-first trainer expects a distributed DeepSpeed launch. "
-            "Use deepspeed to launch 8 ranks, or pass --debug_single_process true for a non-paper-faithful debug run."
+            f"Use deepspeed to launch {runtime_spec.target_world_size} ranks, or pass --debug_single_process true for a non-paper-faithful debug run."
         )
     if runtime.enabled and normalize_text(getattr(args, "rollout_backend", "subprocess")).strip() != "subprocess":
         raise ValueError(
@@ -970,16 +1027,20 @@ def validate_algorithm_runtime_contract(
         raise ValueError(
             f"Spec-first trainer only supports runtime_stack=deepspeed_vllm_colocate, got {runtime_spec.runtime_stack!r}."
         )
-    if runtime_spec.local_trajectories_per_rank != algorithm.rollouts_per_query:
+    query_parallel_degree = resolve_query_parallel_degree(runtime_spec.target_world_size, algorithm.queries_per_step)
+    expected_local_trajectories = resolve_local_rollouts_per_rank(algorithm, runtime_spec.target_world_size)
+    if runtime_spec.local_trajectories_per_rank != expected_local_trajectories:
         raise ValueError(
-            "The specification requires one query-owner rank to process exactly one 24-rollout group. "
+            "The configured runtime requires each rank to process the per-query rollout shard owned by its query-parallel group. "
             f"Got optimizer_micro_batch_size_per_gpu={runtime_spec.optimizer_micro_batch_size_per_gpu}, "
             f"gradient_accumulation_steps={runtime_spec.gradient_accumulation_steps}, "
-            f"which yields {runtime_spec.local_trajectories_per_rank} local trajectories."
+            f"which yields {runtime_spec.local_trajectories_per_rank} local trajectories, "
+            f"but expected {expected_local_trajectories} for rollouts_per_query={algorithm.rollouts_per_query} "
+            f"and query_parallel_degree={query_parallel_degree}."
         )
-    if runtime_spec.target_world_size != algorithm.queries_per_step:
+    if runtime_spec.target_world_size < algorithm.queries_per_step:
         raise ValueError(
-            "The paper-faithful runtime shape requires target_num_nodes * target_gpus_per_node == queries_per_step. "
+            "The configured distributed runtime shape must provide at least one rank per query. "
             f"Got target_world_size={runtime_spec.target_world_size}, queries_per_step={algorithm.queries_per_step}."
         )
 
@@ -1160,11 +1221,25 @@ def compute_global_reward_std(local_group_rewards: Sequence[Sequence[float]], ru
     return math.sqrt(variance) + epsilon
 
 
-def compute_group_advantages(group_rewards: Sequence[float], global_std: float) -> List[float]:
+def compute_group_advantages(group_rewards: Sequence[float], global_std: float, group_mean: Optional[float] = None) -> List[float]:
     if not group_rewards:
         return []
-    group_mean = sum(group_rewards) / len(group_rewards)
-    return [(float(reward) - group_mean) / global_std for reward in group_rewards]
+    resolved_group_mean = float(group_mean) if group_mean is not None else (sum(group_rewards) / len(group_rewards))
+    return [(float(reward) - resolved_group_mean) / global_std for reward in group_rewards]
+
+
+def compute_query_group_mean(group_rewards: Sequence[float], runtime: DistributedRuntime) -> float:
+    if not group_rewards:
+        return 0.0
+    if (not runtime.enabled) or runtime.query_parallel_degree <= 1:
+        return sum(float(reward) for reward in group_rewards) / float(len(group_rewards))
+    local_sum = sum(float(reward) for reward in group_rewards)
+    local_count = float(len(group_rewards))
+    total_sum = all_reduce_sum_scalar(local_sum, runtime, process_group=runtime.query_process_group)
+    total_count = all_reduce_sum_scalar(local_count, runtime, process_group=runtime.query_process_group)
+    if total_count <= 0.0:
+        return 0.0
+    return total_sum / total_count
 
 
 def build_tracking_config(
@@ -1197,6 +1272,8 @@ def build_tracking_config(
     tracking_args.rollout_group_size = algorithm.rollouts_per_query
     tracking_args.rollout_total_trajectories_target = algorithm.total_trajectories
     tracking_args.target_global_world_size = runtime_spec.target_world_size
+    tracking_args.query_parallel_degree = resolve_query_parallel_degree(runtime_spec.target_world_size, algorithm.queries_per_step)
+    tracking_args.local_rollouts_per_rank = resolve_local_rollouts_per_rank(algorithm, runtime_spec.target_world_size)
     tracking_args.actual_rollout_group_size = algorithm.rollouts_per_query
     tracking_args.actual_global_unique_proteins_per_step = algorithm.queries_per_step
     tracking_args.actual_global_num_trajectories_per_step = algorithm.total_trajectories
@@ -1246,6 +1323,8 @@ def build_tracking_config(
             "queries_per_step": algorithm.queries_per_step,
             "rollouts_per_query": algorithm.rollouts_per_query,
             "total_trajectories_per_step": algorithm.total_trajectories,
+            "query_parallel_degree": resolve_query_parallel_degree(runtime_spec.target_world_size, algorithm.queries_per_step),
+            "local_rollouts_per_rank": resolve_local_rollouts_per_rank(algorithm, runtime_spec.target_world_size),
             "steps_per_generation": algorithm.steps_per_generation,
             "num_iterations": algorithm.num_iterations,
             "clip_epsilon_low": algorithm.clip_epsilon_low,
@@ -1285,6 +1364,51 @@ def build_trace_path(output_dir: Path, trace_jsonl_name: str, runtime: Distribut
     stem = base.stem or "rollout_traces"
     suffix = base.suffix or ".jsonl"
     return output_dir / f"{stem}.rank{runtime.rank:02d}{suffix}"
+
+
+def summarize_length_values(lengths: Sequence[int]) -> Dict[str, Any]:
+    if not lengths:
+        return {"count": 0, "min": 0, "p50": 0, "p90": 0, "max": 0, "mean": 0.0}
+    ordered = sorted(int(length) for length in lengths)
+
+    def percentile(fraction: float) -> int:
+        index = min(len(ordered) - 1, max(0, round((len(ordered) - 1) * fraction)))
+        return int(ordered[index])
+
+    return {
+        "count": len(ordered),
+        "min": int(ordered[0]),
+        "p50": percentile(0.5),
+        "p90": percentile(0.9),
+        "max": int(ordered[-1]),
+        "mean": round(sum(ordered) / len(ordered), 2),
+    }
+
+
+def build_rollout_trace_result(outputs: Sequence[str], tokenizer: Any = None) -> Dict[str, Any]:
+    normalized_outputs = [normalize_text(output).strip() for output in outputs]
+    char_lengths = [len(output) for output in normalized_outputs]
+    word_lengths = [len(output.split()) for output in normalized_outputs]
+    token_lengths: List[int] = []
+    if tokenizer is not None:
+        try:
+            token_lengths = [len(tokenizer.encode(output, add_special_tokens=False)) for output in normalized_outputs]
+        except Exception:
+            token_lengths = []
+    result = {
+        "outputs": normalized_outputs,
+        "output_count": len(normalized_outputs),
+        "output_char_lengths": char_lengths,
+        "output_word_lengths": word_lengths,
+        "output_length_summary": {
+            "chars": summarize_length_values(char_lengths),
+            "words": summarize_length_values(word_lengths),
+        },
+    }
+    if token_lengths:
+        result["output_token_lengths"] = token_lengths
+        result["output_length_summary"]["tokens"] = summarize_length_values(token_lengths)
+    return result
 
 
 class RunTracker:
@@ -1518,7 +1642,7 @@ class RunTracker:
 
             @weave.op(name="train_rl_rollout_generate")
             def trace_generation(payload: Dict[str, Any]) -> Dict[str, Any]:
-                outputs = [normalize_text(output).strip() for output in invoke_stage("rollout")]
+                rollout_result = dict(invoke_stage("rollout") or {})
                 return {
                     "run_name": payload.get("run_name"),
                     "job_type": "train_rl",
@@ -1530,7 +1654,7 @@ class RunTracker:
                     "repeat_count": payload.get("repeat_count"),
                     "query": payload.get("query"),
                     "sampling": payload.get("sampling"),
-                    "outputs": outputs,
+                    **rollout_result,
                 }
 
             @weave.op(name="train_rl_reward_score")
@@ -1663,9 +1787,10 @@ class RunTracker:
         repeat_count: int,
         sampling: SamplingSpec,
         generator: Any,
+        tokenizer: Any = None,
     ) -> List[str]:
         if not callable(self.weave_trace_fn) or self.weave_remaining_budget <= 0:
-            return [normalize_text(output).strip() for output in generator()]
+            return build_rollout_trace_result(generator(), tokenizer=tokenizer)["outputs"]
 
         protein_id = normalize_text(query.sample_meta.get("protein_id")).strip()
         call_payload = {
@@ -1691,7 +1816,7 @@ class RunTracker:
             stage_name="rollout",
             weave_fn=self.weave_trace_fn,
             payload=call_payload,
-            callback=lambda: [normalize_text(output).strip() for output in generator()],
+            callback=lambda: build_rollout_trace_result(generator(), tokenizer=tokenizer),
             attributes=self._build_weave_attributes(
                 stage="rollout",
                 step=step,
@@ -2316,12 +2441,13 @@ def prepare_group_for_loss(
     group: RolloutGroup,
     *,
     global_reward_std: float,
+    query_group_mean: float,
     runtime_device: Any,
     max_loss_completion_tokens: int,
 ) -> Dict[str, Any]:
     require_torch()
     full_advantages = torch.tensor(
-        compute_group_advantages(group.rewards, global_reward_std),
+        compute_group_advantages(group.rewards, global_reward_std, group_mean=query_group_mean),
         dtype=torch.float32,
         device=runtime_device,
     )
@@ -2545,6 +2671,7 @@ def rollout_worker_process_main(connection: Any, bootstrap: Mapping[str, Any]) -
                     min_p=float(sampling.min_p),
                     repetition_penalty=float(sampling.repetition_penalty),
                     max_new_tokens=int(sampling.max_new_tokens),
+                    seed=int(message.get("seed", getattr(args, "seed", 0))),
                     stop=stop_markers,
                 )
                 if resolve_effective_vllm_sleep_mode(args) and hasattr(model, "sleep"):
@@ -2597,6 +2724,7 @@ class VLLMRolloutWorker:
         self.model = None
         self._connection = None
         self._process = None
+        self._generation_counter = 0
         if self.backend != "subprocess":
             self._load(checkpoint_dir)
 
@@ -2679,6 +2807,8 @@ class VLLMRolloutWorker:
         self._load(checkpoint_dir)
 
     def generate_group(self, query: PreparedQuery, repeat_count: int, sampling: SamplingSpec) -> List[str]:
+        generation_seed = int(self.args.seed) + (int(self.runtime.rank) * 100003) + self._generation_counter
+        self._generation_counter += 1
         if self.backend == "subprocess":
             if self._connection is None:
                 self._start_subprocess(self.checkpoint_dir)
@@ -2688,6 +2818,7 @@ class VLLMRolloutWorker:
                     "query": build_rollout_query_payload(query),
                     "repeat_count": int(repeat_count),
                     "sampling": asdict(sampling),
+                    "seed": generation_seed,
                 }
             )
             response = self._recv_response()
@@ -2709,6 +2840,7 @@ class VLLMRolloutWorker:
             min_p=float(sampling.min_p),
             repetition_penalty=float(sampling.repetition_penalty),
             max_new_tokens=int(sampling.max_new_tokens),
+            seed=generation_seed,
             stop=stop_markers,
         )
         return [normalize_text(output).strip() for output in outputs]
@@ -2844,6 +2976,7 @@ def train(args: argparse.Namespace) -> None:
     eval_spec = build_eval_spec(args)
     runtime = initialize_runtime(args)
     validate_runtime_shape(runtime, algorithm, runtime_spec, args)
+    configure_query_parallel_runtime(runtime, algorithm)
 
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2882,7 +3015,12 @@ def train(args: argparse.Namespace) -> None:
                 step=step,
                 runtime=runtime,
             )
-            local_query_indices = partition_queries_for_rank(global_query_indices, runtime.rank, max(runtime.world_size, 1))
+            local_query_indices = partition_queries_for_rank(
+                global_query_indices,
+                runtime.rank,
+                max(runtime.world_size, 1),
+                algorithm.queries_per_step,
+            )
             local_queries: List[PreparedQuery] = []
             for dataset_idx in local_query_indices:
                 batch = build_single_example_batch(train_dataset[int(dataset_idx)], policy_stack.engine.module)
@@ -2900,13 +3038,14 @@ def train(args: argparse.Namespace) -> None:
                     step=step + 1,
                     split="train",
                     query=query,
-                    repeat_count=algorithm.rollouts_per_query,
+                    repeat_count=resolve_local_rollouts_per_rank(algorithm, runtime.world_size),
                     sampling=sampling,
                     generator=lambda current_query=query: rollout_worker.generate_group(
                         current_query,
-                        algorithm.rollouts_per_query,
+                        resolve_local_rollouts_per_rank(algorithm, runtime.world_size),
                         sampling,
                     ),
+                    tokenizer=policy_stack.tokenizer,
                 )
                 rollout_seconds += time.perf_counter() - rollout_started_at
                 completion_ids = tokenize_completion_texts(policy_stack.tokenizer, completions, runtime.device)
@@ -2948,9 +3087,11 @@ def train(args: argparse.Namespace) -> None:
             )
 
             for group in local_groups:
+                query_group_mean = compute_query_group_mean(group.rewards, runtime)
                 prepare_group_for_loss(
                     group,
                     global_reward_std=global_reward_std,
+                    query_group_mean=query_group_mean,
                     runtime_device=runtime.device,
                     max_loss_completion_tokens=int(args.max_loss_completion_tokens),
                 )
