@@ -473,6 +473,17 @@ class ProteinLLMModel(nn.Module):
         """Clamp NaN/Inf values before they reach text generation."""
         return torch.nan_to_num(tensor, nan=0.0, posinf=1e4, neginf=-1e4)
 
+    def _truncate_protein_inputs(
+        self,
+        protein_sequences: Optional[List[str]],
+        structure_coords: Optional[torch.Tensor],
+    ) -> tuple[Optional[List[str]], Optional[torch.Tensor]]:
+        if protein_sequences is not None:
+            protein_sequences = [str(seq)[: self.max_length_protein] for seq in protein_sequences]
+        if isinstance(structure_coords, torch.Tensor) and structure_coords.shape[1] > self.max_length_protein:
+            structure_coords = structure_coords[:, : self.max_length_protein, ...]
+        return protein_sequences, structure_coords
+
     def build_multimodal_cache(
         self,
         *,
@@ -488,6 +499,7 @@ class ProteinLLMModel(nn.Module):
             "protein_embeddings": None,
             "go_embeddings": None,
         }
+        protein_sequences, structure_coords = self._truncate_protein_inputs(protein_sequences, structure_coords)
         if protein_sequences is not None and batch_idx_map is not None:
             cache["protein_embeddings"] = self.process_protein_embeddings(
                 protein_sequences,

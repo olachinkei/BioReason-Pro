@@ -321,6 +321,7 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertEqual(runtime_spec.runtime_stack, "deepspeed_vllm_colocate")
         self.assertEqual(args.attn_implementation, "auto")
         self.assertEqual(args.dataset_num_proc, 4)
+        self.assertEqual(args.reasoning_prompt_style, "paper_native")
         self.assertEqual(args.vllm_attention_backend, "XFORMERS")
         self.assertEqual(args.vllm_worker_multiproc_method, "spawn")
         self.assertFalse(args.vllm_enable_sleep_mode)
@@ -355,6 +356,26 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
             ),
             ["GO:0007165", "GO:0005515"],
         )
+
+    def test_extract_go_terms_from_completion_requires_final_answer_block(self):
+        self.assertIsNone(
+            GRPO.extract_go_terms_from_completion(
+                "<|GO_SUMMARY_START|>\nBP: GO:0007165 (signal transduction)\nMF: GO:0005515 (protein binding)\n<|GO_SUMMARY_END|>"
+            )
+        )
+
+    def test_compute_group_rewards_requires_final_answer_block(self):
+        rewards = GRPO.compute_group_rewards(
+            completions=[
+                "<|GO_SUMMARY_START|>\nBP: GO:0000001 (root)\n<|GO_SUMMARY_END|>",
+                "No structured output",
+            ],
+            sample_meta={"go_bp": "GO:0000001", "go_mf": "", "go_cc": ""},
+            go_graph={},
+            ia_weights={"GO:0000001": 1.0},
+        )
+
+        self.assertEqual(rewards, [0.0, 0.0])
 
     def test_build_query_sample_meta_omits_reasoning_and_final_answer(self):
         sample_meta = GRPO.build_query_sample_meta(
@@ -539,13 +560,28 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
             "wandb-healthcare/bioreasoning-pro/bioreason-pro-rl-paper:production",
         )
         self.assertEqual(config["model_artifact"], "train-rl-output")
-        self.assertEqual(config["reward_extraction"], "final_answer_block_only")
+        self.assertEqual(config["reward_extraction"], "final_answer_only")
         self.assertEqual(config["paper_target_rollouts_per_query"], 24.0)
         self.assertEqual(config["paper_target_max_new_tokens"], 10000.0)
         self.assertEqual(config["paper_deviation_max_new_tokens"], 0.0)
         self.assertEqual(config["query_parallel_degree"], 2)
         self.assertEqual(config["local_rollouts_per_rank"], 12)
         self.assertEqual(config["wandb_project"], "bioreasoning-pro")
+        self.assertEqual(config["reward_prediction_source"], "final_answer_block")
+
+    def test_load_reasoning_datasets_uses_configured_reasoning_prompt_style(self):
+        args = GRPO.parse_args(["--text_model_name", "/tmp/demo-model", "--reasoning_prompt_style", "paper_compact"])
+        runtime = GRPO.DistributedRuntime(enabled=False, rank=0, world_size=1, local_rank=0, device="cpu")
+
+        with mock.patch(
+            "bioreason2.dataset.cafa5.load.load_cafa5_dataset",
+            return_value=(["train"], ["validation"], []),
+        ) as load_mock:
+            train_dataset, validation_dataset = GRPO.load_reasoning_datasets(args, runtime)
+
+        self.assertEqual(train_dataset, ["train"])
+        self.assertEqual(validation_dataset, ["validation"])
+        self.assertEqual(load_mock.call_args.kwargs["reasoning_prompt_style"], "paper_compact")
 
     def test_build_trace_path_is_rank_scoped_when_distributed(self):
         runtime = GRPO.DistributedRuntime(enabled=True, rank=3, world_size=8, local_rank=3, device="cpu")
@@ -1168,6 +1204,11 @@ relationship: part_of GO:0000002 ! child
             )
             self.assertEqual(fake_weave.trace_results[0]["output_length_summary"]["chars"]["count"], 1)
             self.assertEqual(fake_weave.trace_results[0]["output_length_summary"]["tokens"]["count"], 1)
+            self.assertEqual(fake_weave.trace_results[0]["output_format_valid"], [True])
+            self.assertEqual(fake_weave.trace_results[0]["output_has_final_answer_tag"], [True])
+            self.assertEqual(fake_weave.trace_results[0]["output_has_go_summary_block"], [False])
+            self.assertEqual(fake_weave.trace_results[0]["output_parsed_go_counts"], [1])
+            self.assertEqual(fake_weave.trace_results[0]["output_format_summary"]["format_valid"]["true_count"], 1)
             self.assertEqual(tracker.weave_remaining_budget, args.weave_trace_budget - 1)
 
     def test_trace_reward_call_uses_stage_specific_targets(self):

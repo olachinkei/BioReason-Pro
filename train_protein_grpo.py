@@ -9,7 +9,7 @@ specification directly:
 
 - rollout generation is owned by a separate vLLM-backed rollout worker
 - scoring / optimization is owned by a DeepSpeed-backed policy engine
-- reward extraction is strict to the <|FINAL_ANSWER|> block
+- reward extraction accepts the repo's structured final answer blocks
 - the canonical paper batch is 8 proteins x 24 rollouts = 192 trajectories
 """
 
@@ -49,6 +49,10 @@ except ImportError:  # pragma: no cover - optional dependency
 GO_ID_PATTERN = re.compile(r"GO:\d{7}")
 FINAL_ANSWER_PATTERN = re.compile(
     r"<\|FINAL_ANSWER\|>\s*(.*?)\s*<\|/FINAL_ANSWER\|>",
+    re.DOTALL,
+)
+GO_SUMMARY_PATTERN = re.compile(
+    r"<\|GO_SUMMARY_START\|>\s*(.*?)\s*<\|GO_SUMMARY_END\|>",
     re.DOTALL,
 )
 ROLLOUT_TRACE_SAMPLE_META_KEYS = ("protein_id", "split")
@@ -386,6 +390,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--structure_dir", type=str, default=None)
     parser.add_argument("--go_gpt_predictions_column", type=str, default="go_pred")
     parser.add_argument("--dataset_num_proc", type=int, default=env_int("BIOREASON_DATASET_NUM_PROC", 4))
+    parser.add_argument(
+        "--reasoning_prompt_style",
+        type=str,
+        default="paper_native",
+        choices=["paper_native", "paper_compact"],
+    )
 
     parser.add_argument("--max_length_text", type=int, default=512)
     parser.add_argument("--max_length_protein", type=int, default=2000)
@@ -818,6 +828,15 @@ def initialize_runtime(args: argparse.Namespace) -> DistributedRuntime:
     else:
         if not torch.cuda.is_available():
             raise RuntimeError("Spec-first DR-GRPO training requires CUDA.")
+        import deepspeed
+
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", str(env_int("MASTER_PORT", 29500)))
+        os.environ.setdefault("RANK", "0")
+        os.environ.setdefault("LOCAL_RANK", "0")
+        os.environ.setdefault("WORLD_SIZE", "1")
+        if not is_distributed_initialized():
+            deepspeed.init_distributed(dist_backend="nccl")
         torch.cuda.set_device(0)
         device = torch.device("cuda", 0)
 
@@ -897,7 +916,9 @@ def destroy_torch_distributed_process_group(log_prefix: Optional[str] = None) ->
 
 
 def shutdown_runtime(runtime: DistributedRuntime) -> None:
-    if torch is None or not runtime.enabled:
+    if torch is None:
+        return
+    if not is_distributed_initialized():
         return
     destroy_torch_distributed_process_group(log_prefix=f"[rank {runtime.rank}]")
 
@@ -1058,6 +1079,42 @@ def extract_go_terms_from_final_answer(text: str) -> Optional[List[str]]:
     return ordered
 
 
+def extract_go_terms_from_go_summary(text: str) -> Optional[List[str]]:
+    match = GO_SUMMARY_PATTERN.search(normalize_text(text))
+    if match is None:
+        return None
+    seen = set()
+    ordered: List[str] = []
+    for go_id in GO_ID_PATTERN.findall(match.group(1)):
+        if go_id not in seen:
+            seen.add(go_id)
+            ordered.append(go_id)
+    return ordered
+
+
+def extract_go_terms_from_completion(text: str) -> Optional[List[str]]:
+    return extract_go_terms_from_final_answer(text)
+
+
+def completion_has_final_answer_tag(text: str) -> bool:
+    return FINAL_ANSWER_PATTERN.search(normalize_text(text)) is not None
+
+
+def completion_has_go_summary_block(text: str) -> bool:
+    return GO_SUMMARY_PATTERN.search(normalize_text(text)) is not None
+
+
+def build_completion_format_summary(text: str) -> Dict[str, Any]:
+    parsed_go_ids = extract_go_terms_from_completion(text) or []
+    return {
+        "has_final_answer_tag": completion_has_final_answer_tag(text),
+        "has_go_summary_block": completion_has_go_summary_block(text),
+        "parsed_go_ids": list(parsed_go_ids),
+        "parsed_go_count": len(parsed_go_ids),
+        "format_valid": bool(parsed_go_ids),
+    }
+
+
 def build_query_sample_meta(batch: Mapping[str, Any]) -> Dict[str, str]:
     return {
         "protein_id": normalize_text((batch.get("protein_ids") or [""])[0]),
@@ -1195,7 +1252,7 @@ def compute_group_rewards(
     propagated_target = propagate_go_ids(target_go_ids, go_graph) if go_graph else target_go_ids
     rewards: List[float] = []
     for completion in completions:
-        predicted_go_ids = extract_go_terms_from_final_answer(completion)
+        predicted_go_ids = extract_go_terms_from_completion(completion)
         if predicted_go_ids is None:
             rewards.append(0.0)
             continue
@@ -1336,7 +1393,8 @@ def build_tracking_config(
             "target_world_size": runtime_spec.target_world_size,
             "world_size": runtime.world_size,
             "zero_stage": runtime_spec.zero_stage,
-            "reward_extraction": "final_answer_block_only",
+            "reward_extraction": "final_answer_only",
+            "reasoning_prompt_style": normalize_text(args.reasoning_prompt_style).strip() or "paper_native",
             "wandb_project": normalize_text(args.wandb_project).strip(),
             "wandb_entity": normalize_text(args.wandb_entity).strip(),
             "weave_project": resolve_weave_project(args),
@@ -1385,10 +1443,28 @@ def summarize_length_values(lengths: Sequence[int]) -> Dict[str, Any]:
     }
 
 
+def summarize_boolean_values(values: Sequence[bool]) -> Dict[str, Any]:
+    if not values:
+        return {"count": 0, "true_count": 0, "false_count": 0, "true_rate": 0.0}
+    true_count = sum(1 for value in values if bool(value))
+    count = len(values)
+    return {
+        "count": count,
+        "true_count": true_count,
+        "false_count": count - true_count,
+        "true_rate": round(true_count / count, 4),
+    }
+
+
 def build_rollout_trace_result(outputs: Sequence[str], tokenizer: Any = None) -> Dict[str, Any]:
     normalized_outputs = [normalize_text(output).strip() for output in outputs]
     char_lengths = [len(output) for output in normalized_outputs]
     word_lengths = [len(output.split()) for output in normalized_outputs]
+    format_summaries = [build_completion_format_summary(output) for output in normalized_outputs]
+    final_answer_flags = [bool(summary["has_final_answer_tag"]) for summary in format_summaries]
+    go_summary_flags = [bool(summary["has_go_summary_block"]) for summary in format_summaries]
+    format_valid_flags = [bool(summary["format_valid"]) for summary in format_summaries]
+    parsed_go_counts = [int(summary["parsed_go_count"]) for summary in format_summaries]
     token_lengths: List[int] = []
     if tokenizer is not None:
         try:
@@ -1400,9 +1476,19 @@ def build_rollout_trace_result(outputs: Sequence[str], tokenizer: Any = None) ->
         "output_count": len(normalized_outputs),
         "output_char_lengths": char_lengths,
         "output_word_lengths": word_lengths,
+        "output_has_final_answer_tag": final_answer_flags,
+        "output_has_go_summary_block": go_summary_flags,
+        "output_format_valid": format_valid_flags,
+        "output_parsed_go_counts": parsed_go_counts,
         "output_length_summary": {
             "chars": summarize_length_values(char_lengths),
             "words": summarize_length_values(word_lengths),
+        },
+        "output_format_summary": {
+            "final_answer_tag": summarize_boolean_values(final_answer_flags),
+            "go_summary_block": summarize_boolean_values(go_summary_flags),
+            "format_valid": summarize_boolean_values(format_valid_flags),
+            "parsed_go_counts": summarize_length_values(parsed_go_counts),
         },
     }
     if token_lengths:
@@ -2002,7 +2088,7 @@ def load_reasoning_datasets(args: argparse.Namespace, runtime: DistributedRuntim
         include_ground_truth_in_final_answer=False,
         add_uniprot_summary=False,
         is_swissprot=False,
-        reasoning_prompt_style="paper_native",
+        reasoning_prompt_style=normalize_text(args.reasoning_prompt_style).strip() or "paper_native",
     )
     return train_dataset, validation_dataset
 
@@ -2156,6 +2242,7 @@ def initialize_policy_stack(
         optimizer=optimizer,
         lr_scheduler=scheduler,
         config=build_deepspeed_config(args, runtime_spec),
+        dist_init_required=bool(runtime.enabled),
     )
     tokenizer = engine.module.text_tokenizer
     pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
@@ -2292,6 +2379,20 @@ def repeat_query_for_rollouts(query: PreparedQuery, repeat_count: int, device: A
         "go_aspects": query.go_aspects * repeat_count,
         "multimodal_cache": repeat_multimodal_cache(query.multimodal_cache, repeat_count),
     }
+
+
+def build_rollout_multimodal_cache(model: Any, query: PreparedQuery, repeat_count: int) -> Optional[Dict[str, Any]]:
+    build_cache = getattr(model, "build_multimodal_cache", None)
+    if not callable(build_cache):
+        return repeat_multimodal_cache(query.multimodal_cache, repeat_count)
+    single_cache = build_cache(
+        protein_sequences=query.protein_sequences,
+        batch_idx_map=query.batch_idx_map,
+        batch_size=1,
+        structure_coords=query.structure_coords,
+        go_aspects=query.go_aspects,
+    )
+    return repeat_multimodal_cache(single_cache, repeat_count)
 
 
 def tokenize_completion_texts(tokenizer: Any, completions: Sequence[str], device: Any) -> List[Any]:
@@ -2657,14 +2758,20 @@ def rollout_worker_process_main(connection: Any, bootstrap: Mapping[str, Any]) -
                 query = query_from_rollout_payload(message["query"])
                 sampling = SamplingSpec(**dict(message["sampling"]))
                 rollout_batch = repeat_query_for_rollouts(query, int(message["repeat_count"]), query.input_ids.device)
-                stop_markers = ["<|/FINAL_ANSWER|>", "<|im_end|>", "<|endoftext|>"]
+                rollout_multimodal_cache = build_rollout_multimodal_cache(
+                    model,
+                    query,
+                    int(message["repeat_count"]),
+                )
+                stop_markers = ["<|/FINAL_ANSWER|>", "<|GO_SUMMARY_END|>", "<|im_end|>", "<|endoftext|>"]
                 outputs = model.generate(
                     input_ids=rollout_batch["input_ids"],
                     attention_mask=rollout_batch["attention_mask"],
-                    protein_sequences=rollout_batch["protein_sequences"],
-                    batch_idx_map=rollout_batch["batch_idx_map"],
-                    structure_coords=rollout_batch["structure_coords"],
-                    go_aspects=rollout_batch["go_aspects"],
+                    protein_sequences=None,
+                    batch_idx_map=None,
+                    structure_coords=None,
+                    go_aspects=None,
+                    multimodal_cache=rollout_multimodal_cache,
                     temperature=float(sampling.temperature),
                     top_k=int(sampling.top_k),
                     top_p=float(sampling.top_p),
@@ -2826,14 +2933,16 @@ class VLLMRolloutWorker:
         if self.model is None:
             self._load(self.checkpoint_dir)
         rollout_batch = repeat_query_for_rollouts(query, repeat_count, query.input_ids.device)
-        stop_markers = ["<|/FINAL_ANSWER|>", "<|im_end|>", "<|endoftext|>"]
+        rollout_multimodal_cache = build_rollout_multimodal_cache(self.model, query, repeat_count)
+        stop_markers = ["<|/FINAL_ANSWER|>", "<|GO_SUMMARY_END|>", "<|im_end|>", "<|endoftext|>"]
         outputs = self.model.generate(
             input_ids=rollout_batch["input_ids"],
             attention_mask=rollout_batch["attention_mask"],
-            protein_sequences=rollout_batch["protein_sequences"],
-            batch_idx_map=rollout_batch["batch_idx_map"],
-            structure_coords=rollout_batch["structure_coords"],
-            go_aspects=rollout_batch["go_aspects"],
+            protein_sequences=None,
+            batch_idx_map=None,
+            structure_coords=None,
+            go_aspects=None,
+            multimodal_cache=rollout_multimodal_cache,
             temperature=float(sampling.temperature),
             top_k=int(sampling.top_k),
             top_p=float(sampling.top_p),
@@ -2860,6 +2969,7 @@ def maybe_trace_group(
 ) -> None:
     trace_full_group = tracker.claim_full_group_trace()
     for rollout_idx, (completion, reward) in enumerate(zip(group.completions, group.rewards)):
+        format_summary = build_completion_format_summary(completion)
         trace_to_weave = (
             trace_full_group and rollout_idx < max(tracker.weave_full_group_rollouts, 0)
         ) or (
@@ -2876,7 +2986,11 @@ def maybe_trace_group(
                 "reward": float(reward),
                 "completion": completion,
                 "target_go_ids": build_target_go_ids(group.query.sample_meta),
-                "predicted_go_ids": extract_go_terms_from_final_answer(completion) or [],
+                "predicted_go_ids": list(format_summary["parsed_go_ids"]),
+                "has_final_answer_tag": bool(format_summary["has_final_answer_tag"]),
+                "has_go_summary_block": bool(format_summary["has_go_summary_block"]),
+                "parsed_go_count": int(format_summary["parsed_go_count"]),
+                "format_valid": bool(format_summary["format_valid"]),
             },
             trace_to_weave=trace_to_weave,
         )
@@ -3222,10 +3336,27 @@ def train(args: argparse.Namespace) -> None:
             refresh_seconds = time.perf_counter() - refresh_started_at
 
             local_rewards = [reward for group in local_groups for reward in group.rewards]
+            local_format_summaries = [
+                build_completion_format_summary(completion)
+                for group in local_groups
+                for completion in group.completions
+            ]
             metrics = {
                 "reward_mean": mean_or_zero(local_rewards),
                 "reward_nonzero_rate": mean_or_zero([1.0 if reward > 0.0 else 0.0 for reward in local_rewards]),
                 "reward_std": float(global_reward_std),
+                "format_valid_rate": mean_or_zero(
+                    [1.0 if summary["format_valid"] else 0.0 for summary in local_format_summaries]
+                ),
+                "final_answer_tag_rate": mean_or_zero(
+                    [1.0 if summary["has_final_answer_tag"] else 0.0 for summary in local_format_summaries]
+                ),
+                "go_summary_block_rate": mean_or_zero(
+                    [1.0 if summary["has_go_summary_block"] else 0.0 for summary in local_format_summaries]
+                ),
+                "parsed_go_count_mean": mean_or_zero(
+                    [float(summary["parsed_go_count"]) for summary in local_format_summaries]
+                ),
                 "loss_mean": mean_or_zero(policy_loss_values),
                 "kl_mean": mean_or_zero(kl_values),
                 "ratio_mean": mean_or_zero(ratio_means),
@@ -3245,6 +3376,10 @@ def train(args: argparse.Namespace) -> None:
                 "reward_mean": all_reduce_sum_scalar(metrics["reward_mean"], runtime) / float(runtime.world_size),
                 "reward_nonzero_rate": all_reduce_sum_scalar(metrics["reward_nonzero_rate"], runtime) / float(runtime.world_size),
                 "reward_std": metrics["reward_std"],
+                "format_valid_rate": all_reduce_sum_scalar(metrics["format_valid_rate"], runtime) / float(runtime.world_size),
+                "final_answer_tag_rate": all_reduce_sum_scalar(metrics["final_answer_tag_rate"], runtime) / float(runtime.world_size),
+                "go_summary_block_rate": all_reduce_sum_scalar(metrics["go_summary_block_rate"], runtime) / float(runtime.world_size),
+                "parsed_go_count_mean": all_reduce_sum_scalar(metrics["parsed_go_count_mean"], runtime) / float(runtime.world_size),
                 "loss_mean": all_reduce_sum_scalar(metrics["loss_mean"], runtime) / float(runtime.world_size),
                 "kl_mean": all_reduce_sum_scalar(metrics["kl_mean"], runtime) / float(runtime.world_size),
                 "ratio_mean": all_reduce_sum_scalar(metrics["ratio_mean"], runtime) / float(runtime.world_size),

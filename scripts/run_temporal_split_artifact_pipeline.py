@@ -183,6 +183,18 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional dataset directory to upload. Defaults to the variant-specific path.",
     )
+    parser.add_argument("--source-metadata-dataset", default=os.getenv("BIOREASON_SOURCE_METADATA_DATASET"))
+    parser.add_argument("--source-metadata-name", default=os.getenv("BIOREASON_SOURCE_METADATA_NAME"))
+    parser.add_argument("--source-metadata-local-dir", default=os.getenv("BIOREASON_SOURCE_METADATA_LOCAL_DIR"))
+    parser.add_argument("--source-metadata-cache-dir", default=os.getenv("BIOREASON_SOURCE_METADATA_CACHE_DIR"))
+    parser.add_argument("--interpro-metadata-dataset", default=os.getenv("BIOREASON_INTERPRO_METADATA_DATASET"))
+    parser.add_argument("--interpro-metadata-name", default=os.getenv("BIOREASON_INTERPRO_METADATA_NAME"))
+    parser.add_argument("--interpro-metadata-local-dir", default=os.getenv("BIOREASON_INTERPRO_METADATA_LOCAL_DIR"))
+    parser.add_argument(
+        "--allow-missing-paper-context",
+        action="store_true",
+        help="Allow dataset upload even if GO-GPT / InterPro / PPI prompt context coverage is incomplete.",
+    )
     return parser.parse_args()
 
 
@@ -228,14 +240,29 @@ def run_temporal_split_command(repo_root: Path, args: argparse.Namespace, varian
 
 def run_dataset_build_command(repo_root: Path, args: argparse.Namespace, variant: VariantConfig) -> Dict[str, Any]:
     dataset_build_script = repo_root / args.dataset_build_script
+    reasoning_dir = resolve_dataset_dir(args.reasoning_dir, variant.default_reasoning_dir, repo_root)
     command = [
         sys.executable,
         str(dataset_build_script),
         "--temporal-split-dir",
         variant.temporal_split_output_dir,
         "--reasoning-output-dir",
-        variant.default_reasoning_dir,
+        str(reasoning_dir.relative_to(repo_root)),
     ]
+    optional_flags = {
+        "--source-metadata-dataset": normalize_text(getattr(args, "source_metadata_dataset", None)),
+        "--source-metadata-name": normalize_text(getattr(args, "source_metadata_name", None)),
+        "--source-metadata-local-dir": normalize_text(getattr(args, "source_metadata_local_dir", None)),
+        "--source-metadata-cache-dir": normalize_text(getattr(args, "source_metadata_cache_dir", None)),
+        "--interpro-metadata-dataset": normalize_text(getattr(args, "interpro_metadata_dataset", None)),
+        "--interpro-metadata-name": normalize_text(getattr(args, "interpro_metadata_name", None)),
+        "--interpro-metadata-local-dir": normalize_text(getattr(args, "interpro_metadata_local_dir", None)),
+    }
+    for flag, value in optional_flags.items():
+        if value:
+            command.extend([flag, value])
+    if getattr(args, "allow_missing_paper_context", False):
+        command.append("--allow-missing-paper-context")
     log(f"[pipeline] building datasets for {variant.name}: {' '.join(command)}")
     completed = subprocess.run(command, check=False)
     return {
@@ -338,7 +365,7 @@ def build_upload_metadata(
         metadata["temporal_split_artifact"] = temporal_split_artifact_ref
     if artifact_kind == "reasoning_dataset":
         metadata["dataset_source"] = "wanglab/cafa5"
-        metadata["dataset_name"] = "disease_temporal_hc_reasoning_v1"
+        metadata["dataset_name"] = local_dir.parent.name
     return metadata
 
 
@@ -384,6 +411,37 @@ def is_populated_directory(directory: Path) -> bool:
     return directory.is_dir() and any(directory.iterdir())
 
 
+def validate_reasoning_dataset_outputs(dataset_dir: Path) -> Dict[str, Any]:
+    metadata_path = dataset_dir / "build_metadata.json"
+    status: Dict[str, Any] = {
+        "metadata_present": metadata_path.exists(),
+        "paper_context_ready": False,
+        "context_coverage_by_split": {},
+        "errors": [],
+        "ok": False,
+    }
+    if not metadata_path.exists():
+        status["errors"].append("build_metadata.json missing")
+        return status
+    try:
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        status["errors"].append(f"build_metadata.json invalid JSON: {exc}")
+        return status
+
+    coverage_by_split = payload.get("context_coverage_by_split") or {}
+    status["context_coverage_by_split"] = coverage_by_split
+    ready_flags = []
+    for split in ("train", "validation", "test"):
+        split_payload = coverage_by_split.get(split) or {}
+        ready_flags.append(split_payload.get("paper_context_ready") is True)
+    status["paper_context_ready"] = bool(ready_flags) and all(ready_flags)
+    if not status["paper_context_ready"]:
+        status["errors"].append("paper context coverage is incomplete")
+    status["ok"] = status["metadata_present"] and status["paper_context_ready"]
+    return status
+
+
 def upload_variant_artifacts(
     repo_root: Path,
     args: argparse.Namespace,
@@ -410,7 +468,8 @@ def upload_variant_artifacts(
     )
 
     reasoning_dir = resolve_dataset_dir(args.reasoning_dir, variant.default_reasoning_dir, repo_root)
-    if is_populated_directory(reasoning_dir):
+    reasoning_validation = validate_reasoning_dataset_outputs(reasoning_dir) if is_populated_directory(reasoning_dir) else None
+    if is_populated_directory(reasoning_dir) and reasoning_validation and reasoning_validation["ok"]:
         uploads.append(
             upload_directory_artifact(
                 entity=entity,
@@ -428,7 +487,12 @@ def upload_variant_artifacts(
                 "local_dir": str(reasoning_dir),
                 "aliases": list(variant.artifact_aliases),
                 "uploaded": False,
-                "skip_reason": "directory_missing_or_empty",
+                "skip_reason": (
+                    "directory_missing_or_empty"
+                    if reasoning_validation is None
+                    else "paper_context_validation_failed"
+                ),
+                "validation": reasoning_validation,
             }
         )
 

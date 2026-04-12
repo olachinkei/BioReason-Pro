@@ -217,6 +217,58 @@ class RunTemporalSplitArtifactPipelineContractsTest(unittest.TestCase):
         self.assertFalse(uploads[1]["uploaded"])
         self.assertEqual(uploads[1]["skip_reason"], "directory_missing_or_empty")
 
+    def test_validate_reasoning_dataset_outputs_requires_paper_context_ready(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dataset_dir = Path(tmpdir)
+            payload = {
+                "context_coverage_by_split": {
+                    "train": {"paper_context_ready": True},
+                    "validation": {"paper_context_ready": False},
+                    "test": {"paper_context_ready": True},
+                }
+            }
+            (dataset_dir / "build_metadata.json").write_text(json.dumps(payload), encoding="utf-8")
+
+            status = PIPELINE.validate_reasoning_dataset_outputs(dataset_dir)
+
+        self.assertFalse(status["ok"])
+        self.assertFalse(status["paper_context_ready"])
+
+    def test_upload_variant_artifacts_skips_dataset_when_paper_context_validation_fails(self):
+        args = types.SimpleNamespace(
+            wandb_entity="demo",
+            wandb_project="project",
+            temporal_split_artifact_family="disease-temporal-split",
+            reasoning_artifact_family="disease-temporal-reasoning",
+            reasoning_dir=None,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            variant = PIPELINE.VARIANT_CONFIGS["main"]
+            temporal_split_dir = repo_root / variant.temporal_split_output_dir
+            temporal_split_dir.mkdir(parents=True, exist_ok=True)
+            reasoning_dir = repo_root / variant.default_reasoning_dir
+            reasoning_dir.mkdir(parents=True, exist_ok=True)
+            (reasoning_dir / "build_metadata.json").write_text(
+                json.dumps(
+                    {
+                        "context_coverage_by_split": {
+                            "train": {"paper_context_ready": False},
+                            "validation": {"paper_context_ready": False},
+                            "test": {"paper_context_ready": False},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (reasoning_dir / "dataset_dict.json").write_text("{}", encoding="utf-8")
+
+            uploads = PIPELINE.upload_variant_artifacts(repo_root, args, variant)
+
+        self.assertFalse(uploads[1]["uploaded"])
+        self.assertEqual(uploads[1]["skip_reason"], "paper_context_validation_failed")
+
 
 if __name__ == "__main__":
     unittest.main()

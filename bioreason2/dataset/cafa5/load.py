@@ -67,16 +67,28 @@ def _resolve_num_proc(num_proc):
     return max(1, min(per_rank_budget, cap))
 
 
+def _resolve_keep_in_memory_for_local_dataset():
+    explicit = os.environ.get("BIOREASON_DATASET_KEEP_IN_MEMORY")
+    if explicit is not None:
+        return str(explicit).strip().lower() in {"1", "true", "t", "yes", "y"}
+    return _coerce_positive_int(os.environ.get("WORLD_SIZE")) not in (None, 1)
+
+
 def _load_dataset_source(dataset, dataset_name=None, cache_dir=None, dataset_subset=None):
     """Load either a Hub dataset or a local DatasetDict artifact."""
     dataset_path = Path(os.path.expanduser(str(dataset)))
+    keep_in_memory = _resolve_keep_in_memory_for_local_dataset()
     if dataset_path.exists():
         if dataset_path.is_dir() and (dataset_path / "dataset_dict.json").exists():
-            return load_from_disk(str(dataset_path))
+            if keep_in_memory:
+                print(f"Loading local dataset artifact into memory: {dataset_path}")
+            return load_from_disk(str(dataset_path), keep_in_memory=keep_in_memory)
         if dataset_name:
             named_path = dataset_path / dataset_name
             if named_path.is_dir() and (named_path / "dataset_dict.json").exists():
-                return load_from_disk(str(named_path))
+                if keep_in_memory:
+                    print(f"Loading local named dataset artifact into memory: {named_path}")
+                return load_from_disk(str(named_path), keep_in_memory=keep_in_memory)
 
     if dataset_subset:
         return load_dataset(
@@ -244,6 +256,8 @@ def _limit_multiline_slot(value, *, max_lines, none_value="None"):
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if not lines:
         return none_value
+    if max_lines is None or int(max_lines) <= 0:
+        return "\n".join(lines)
     if len(lines) <= max_lines:
         return "\n".join(lines)
     clipped = lines[:max_lines]
@@ -299,7 +313,9 @@ def _compact_go_speculations(value, *, max_ids_per_aspect=8):
 
     compact = {}
     for aspect in ("MF", "BP", "CC"):
-        aspect_items = grouped_items[aspect][:max_ids_per_aspect]
+        aspect_items = grouped_items[aspect]
+        if max_ids_per_aspect is not None and int(max_ids_per_aspect) > 0:
+            aspect_items = aspect_items[:max_ids_per_aspect]
         compact[aspect] = ", ".join(aspect_items) if aspect_items else "None"
     return compact
 
@@ -358,7 +374,7 @@ def _build_paper_compact_response_format(focus_aspect_code):
         aspect_codes = ["MF", "BP", "CC"]
     example_lines = [go_summary_start]
     for aspect_code in aspect_codes:
-        example_lines.append(f"{aspect_code}: GO:0000000 (term name); GO:0000001 (term name)")
+        example_lines.append(f"{aspect_code}: GO:XXXXXXX (replace with a real GO ID); GO:YYYYYYY (replace with a real GO ID)")
     example_lines.append(go_summary_end)
     return "\n".join(example_lines)
 
@@ -373,9 +389,9 @@ def _format_reasoning_prompt(
     is_swissprot=False,
     ask_all_go_aspects=False,
     reasoning_prompt_style="verbose",
-    compact_interpro_limit=12,
-    compact_ppi_limit=10,
-    compact_go_speculation_limit=8,
+    compact_interpro_limit=0,
+    compact_ppi_limit=0,
+    compact_go_speculation_limit=0,
 ):
     """Format reasoning data into prompt structure.
     
@@ -431,15 +447,15 @@ def _format_reasoning_prompt(
     assistant_answer = _add_uniprot_summary(example) if add_uniprot_summary else (example["final_answer"] if "final_answer" in example else "")
     
     if reasoning_prompt_style == "paper_native":
-        compact_interpro = _limit_multiline_slot(
+        paper_interpro = _limit_multiline_slot(
             interpro_data,
             max_lines=compact_interpro_limit,
         )
-        compact_ppi = _limit_multiline_slot(
+        paper_ppi = _limit_multiline_slot(
             ppi_data,
             max_lines=compact_ppi_limit,
         )
-        compact_go_speculations = _compact_go_speculations(
+        paper_go_speculations = _compact_go_speculations(
             go_speculations,
             max_ids_per_aspect=compact_go_speculation_limit,
         )
@@ -447,11 +463,11 @@ def _format_reasoning_prompt(
             "system": CAFA5_REASONING_TEMPLATE_PAPER_NATIVE["system_prompt"],
             "user": CAFA5_REASONING_TEMPLATE_PAPER_NATIVE["user_prompt"].format(
                 organism=organism,
-                interpro_data=compact_interpro,
-                ppi_data=compact_ppi,
-                go_mf_speculations=compact_go_speculations["MF"],
-                go_bp_speculations=compact_go_speculations["BP"],
-                go_cc_speculations=compact_go_speculations["CC"],
+                interpro_data=paper_interpro,
+                ppi_data=paper_ppi,
+                go_mf_speculations=paper_go_speculations["MF"],
+                go_bp_speculations=paper_go_speculations["BP"],
+                go_cc_speculations=paper_go_speculations["CC"],
             ),
             "assistant_reasoning": example["reasoning"] if "reasoning" in example else "",
             "assistant_answer": example["final_answer"] if "final_answer" in example else "",
@@ -706,9 +722,9 @@ def _process_dataset_split(
     is_swissprot=False,
     ask_all_go_aspects=False,
     reasoning_prompt_style="verbose",
-    compact_interpro_limit=12,
-    compact_ppi_limit=10,
-    compact_go_speculation_limit=8,
+    compact_interpro_limit=0,
+    compact_ppi_limit=0,
+    compact_go_speculation_limit=0,
 ):
     """Process a single dataset split with all transformations."""
     # For testing, limit to 50 datapoints
@@ -732,12 +748,21 @@ def _process_dataset_split(
         )
 
     if reasoning_dataset_name and reasoning_prompt_style in {"paper_native", "paper_compact"}:
-        print(
-            f"Using {reasoning_prompt_style.replace('_', '-')} reasoning prompts with slot caps: "
-            f"interpro={compact_interpro_limit}, "
-            f"ppi={compact_ppi_limit}, "
-            f"go_speculations_per_aspect={compact_go_speculation_limit}"
-        )
+        if (
+            compact_interpro_limit is None or int(compact_interpro_limit) <= 0
+        ) and (
+            compact_ppi_limit is None or int(compact_ppi_limit) <= 0
+        ) and (
+            compact_go_speculation_limit is None or int(compact_go_speculation_limit) <= 0
+        ):
+            print(f"Using {reasoning_prompt_style.replace('_', '-')} reasoning prompts without slot caps")
+        else:
+            print(
+                f"Using {reasoning_prompt_style.replace('_', '-')} reasoning prompts with slot caps: "
+                f"interpro={compact_interpro_limit}, "
+                f"ppi={compact_ppi_limit}, "
+                f"go_speculations_per_aspect={compact_go_speculation_limit}"
+            )
 
     # Format for Protein-LLM
     if split_go_aspects:
@@ -859,9 +884,9 @@ def load_cafa5_dataset(
     is_swissprot: bool = False,
     ask_all_go_aspects: bool = False,
     reasoning_prompt_style: str = "verbose",
-    compact_interpro_limit: int = 12,
-    compact_ppi_limit: int = 20,
-    compact_go_speculation_limit: int = 8,
+    compact_interpro_limit: int = 0,
+    compact_ppi_limit: int = 0,
+    compact_go_speculation_limit: int = 0,
 ):
     """
     Load CAFA5 dataset, format it into the Protein-LLM format, and split into train/val sets.
@@ -909,9 +934,12 @@ def load_cafa5_dataset(
         reasoning_prompt_style: Prompt style for reasoning data. "paper_native" keeps the
                                paper-style freer-form continuation contract, while
                                "paper_compact" is a stricter structured ablation.
-        compact_interpro_limit: Maximum number of InterPro lines kept in paper-compact prompts.
-        compact_ppi_limit: Maximum number of PPI lines kept in paper-compact prompts.
-        compact_go_speculation_limit: Maximum GO IDs kept per aspect in paper-compact prompts.
+        compact_interpro_limit: Maximum number of InterPro lines kept in reasoning prompts.
+                               Use 0 or a negative value to disable clipping.
+        compact_ppi_limit: Maximum number of PPI lines kept in reasoning prompts.
+                           Use 0 or a negative value to disable clipping.
+        compact_go_speculation_limit: Maximum GO IDs kept per aspect in reasoning prompts.
+                                      Use 0 or a negative value to disable clipping.
 
     Returns:
         Tuple of (train_dataset, val_dataset, test_dataset) where test_dataset is the original test split
@@ -1147,12 +1175,21 @@ def load_cafa5_dataset(
                 )
 
             if reasoning_dataset_name and reasoning_prompt_style in {"paper_native", "paper_compact"}:
-                print(
-                    f"Using {reasoning_prompt_style.replace('_', '-')} reasoning prompts with slot caps: "
-                    f"interpro={compact_interpro_limit}, "
-                    f"ppi={compact_ppi_limit}, "
-                    f"go_speculations_per_aspect={compact_go_speculation_limit}"
-                )
+                if (
+                    compact_interpro_limit is None or int(compact_interpro_limit) <= 0
+                ) and (
+                    compact_ppi_limit is None or int(compact_ppi_limit) <= 0
+                ) and (
+                    compact_go_speculation_limit is None or int(compact_go_speculation_limit) <= 0
+                ):
+                    print(f"Using {reasoning_prompt_style.replace('_', '-')} reasoning prompts without slot caps")
+                else:
+                    print(
+                        f"Using {reasoning_prompt_style.replace('_', '-')} reasoning prompts with slot caps: "
+                        f"interpro={compact_interpro_limit}, "
+                        f"ppi={compact_ppi_limit}, "
+                        f"go_speculations_per_aspect={compact_go_speculation_limit}"
+                    )
 
             # Format for Protein-LLM
             if split_go_aspects:

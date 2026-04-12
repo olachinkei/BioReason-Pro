@@ -540,6 +540,36 @@ class ProteinLLMModel(nn.Module):
 
         return batch_go_embeddings
 
+    def build_multimodal_cache(
+        self,
+        *,
+        protein_sequences: Optional[List[str]] = None,
+        batch_idx_map: Optional[List[int]] = None,
+        batch_size: int,
+        structure_coords: Optional[torch.Tensor] = None,
+        go_aspects: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Precompute projected protein / GO features for reuse across rollouts."""
+        cache: Dict[str, Any] = {
+            "batch_size": int(batch_size),
+            "protein_embeddings": None,
+            "go_embeddings": None,
+        }
+        if protein_sequences is not None:
+            protein_sequences = [str(seq)[: self.max_length_protein] for seq in protein_sequences]
+        if isinstance(structure_coords, torch.Tensor) and structure_coords.shape[1] > self.max_length_protein:
+            structure_coords = structure_coords[:, : self.max_length_protein, ...]
+        if protein_sequences is not None and batch_idx_map is not None:
+            cache["protein_embeddings"] = self.process_protein_embeddings(
+                protein_sequences,
+                batch_idx_map,
+                batch_size,
+                structure_coords=structure_coords,
+            )
+        if go_aspects is not None:
+            cache["go_embeddings"] = self.process_go_aspects(go_aspects, batch_size)
+        return cache
+
     def forward(
         self,
         input_ids: Optional[torch.Tensor] = None,
@@ -577,6 +607,7 @@ class ProteinLLMModel(nn.Module):
         batch_idx_map: Optional[List[int]] = None,
         structure_coords: Optional[torch.Tensor] = None,
         go_aspects: Optional[List[str]] = None,
+        multimodal_cache: Optional[Dict[str, Any]] = None,
         **generation_kwargs,
     ) -> Union[torch.Tensor, List[str]]:
         """
@@ -606,19 +637,19 @@ class ProteinLLMModel(nn.Module):
         # Get text embeddings from the model's embedding layer
         text_inputs_embeds = self._embedding_layer(input_ids)
 
-        # Process GO aspects if provided
-        go_embeddings = None
-        if go_aspects is not None:
-            go_embeddings = self.process_go_aspects(go_aspects, batch_size)
-
-        # Process protein sequences if provided
-        if protein_sequences is not None and batch_idx_map is not None:
-            batch_protein_embeds = self.process_protein_embeddings(
-                protein_sequences,
-                batch_idx_map,
-                batch_size,
+        if multimodal_cache is None:
+            multimodal_cache = self.build_multimodal_cache(
+                protein_sequences=protein_sequences,
+                batch_idx_map=batch_idx_map,
+                batch_size=batch_size,
                 structure_coords=structure_coords,
+                go_aspects=go_aspects,
             )
+
+        go_embeddings = multimodal_cache.get("go_embeddings")
+
+        batch_protein_embeds = multimodal_cache.get("protein_embeddings")
+        if batch_protein_embeds:
 
             # Find positions where protein tokens should be replaced
             mask = input_ids == self.protein_token_id
@@ -642,7 +673,6 @@ class ProteinLLMModel(nn.Module):
             # Replace protein tokens with actual protein embeddings
             text_inputs_embeds[mask] = protein_embeds_flat
 
-        # Process GO embeddings if provided
         if go_embeddings is not None:
             # Find positions where GO tokens should be replaced
             go_mask = input_ids == self.go_token_id

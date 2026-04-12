@@ -17,11 +17,12 @@
   "assets": {
     "bioreason-pro-rl-paper": {
       "display_name": "bioreason-pro-rl-paper",
-      "artifact_name": "bioreason-pro-rl",
+      "artifact_name": "bioreason-pro-rl-paper",
       "artifact_type": "model",
       "registry_env_var": "BIOREASON_RL_PAPER_MODEL_REGISTRY_PATH",
       "artifact_aliases": [
         "production",
+        "latest",
         "{benchmark_alias}"
       ],
       "sources": [

@@ -318,7 +318,24 @@ def maybe_use_artifact(
         else:
             use_artifact(resolved_ref)
     except TypeError:
-        use_artifact(resolved_ref)
+        try:
+            use_artifact(resolved_ref)
+        except Exception as exc:
+            return {
+                "used": False,
+                "artifact_ref": resolved_ref,
+                "artifact_type": artifact_type or "",
+                "reason": "use_artifact_failed",
+                "error": str(exc),
+            }
+    except Exception as exc:
+        return {
+            "used": False,
+            "artifact_ref": resolved_ref,
+            "artifact_type": artifact_type or "",
+            "reason": "use_artifact_failed",
+            "error": str(exc),
+        }
 
     return {
         "used": True,
