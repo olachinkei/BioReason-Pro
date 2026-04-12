@@ -364,6 +364,44 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
             )
         )
 
+    def test_extract_go_terms_from_completion_accepts_alternate_final_answer_close_tag(self):
+        self.assertEqual(
+            GRPO.extract_go_terms_from_completion(
+                "<|FINAL_ANSWER|>\nGO:0007165\nGO:0005515\n</|FINAL_ANSWER|>"
+            ),
+            ["GO:0007165", "GO:0005515"],
+        )
+
+    def test_extract_go_terms_from_completion_accepts_open_final_answer_until_end_marker(self):
+        self.assertEqual(
+            GRPO.extract_go_terms_from_completion(
+                "<|FINAL_ANSWER|>\nGO:0007165\nGO:0005515\n<|endoftext|>"
+            ),
+            ["GO:0007165", "GO:0005515"],
+        )
+
+    def test_build_completion_format_summary_tracks_broken_final_answer_shapes(self):
+        summary = GRPO.build_completion_format_summary(
+            "<|FINAL_ANSWER|>\nGO:0007165\n</|FINAL_ANSWER|>\n</think>\n<tool_call>{}</tool_call>\n<|FINAL_ANSWER|>"
+        )
+
+        self.assertTrue(summary["has_final_answer_tag"])
+        self.assertTrue(summary["uses_alt_final_answer_close_tag"])
+        self.assertTrue(summary["has_repeated_final_answer_open_tag"])
+        self.assertTrue(summary["has_tool_call_residue"])
+        self.assertTrue(summary["has_think_residue"])
+        self.assertEqual(summary["parsed_go_ids"], ["GO:0007165"])
+
+    def test_build_completion_format_summary_tracks_unclosed_final_answer(self):
+        summary = GRPO.build_completion_format_summary(
+            "<|FINAL_ANSWER|>\nGO:0007165\n<|endoftext|>"
+        )
+
+        self.assertTrue(summary["has_final_answer_tag"])
+        self.assertTrue(summary["has_unclosed_final_answer_tag"])
+        self.assertFalse(summary["uses_alt_final_answer_close_tag"])
+        self.assertEqual(summary["parsed_go_ids"], ["GO:0007165"])
+
     def test_compute_group_rewards_requires_final_answer_block(self):
         rewards = GRPO.compute_group_rewards(
             completions=[
@@ -1021,10 +1059,6 @@ relationship: part_of GO:0000002 ! child
                 "max_new_tokens": 10000,
                 "steps_per_generation": 2,
                 "num_iterations": 1,
-                "paper_runtime_deviation_from_spec": 1.0,
-                "paper_target_rollouts_per_query": 24.0,
-                "paper_target_max_new_tokens": 10000.0,
-                "paper_deviation_max_new_tokens": 0.0,
             }
 
             tracker = GRPO.RunTracker(args=args, config=config, output_dir=output_dir, runtime=runtime)
@@ -1037,16 +1071,18 @@ relationship: part_of GO:0000002 ! child
             self.assertEqual(tracker.wandb_run_path, "wandb-healthcare/bioreasoning-pro/demo123")
             self.assertTrue((output_dir / "wandb_run_info.json").exists())
             define_metric_names = [item["name"] for item in fake_wandb.runs[0].define_metric_calls]
-            self.assertIn("trainer/global_step", define_metric_names)
+            self.assertIn("train/global_step", define_metric_names)
             self.assertIn("train/*", define_metric_names)
             self.assertIn("timing/*", define_metric_names)
-            self.assertIn("paper/*", define_metric_names)
+            self.assertNotIn("paper/*", define_metric_names)
+            self.assertNotIn("runtime/*", define_metric_names)
             startup_payload = fake_wandb.runs[0].logged[0]["payload"]
             self.assertEqual(fake_wandb.runs[0].logged[0]["step"], 0)
-            self.assertEqual(startup_payload["trainer/global_step"], 0)
+            self.assertEqual(startup_payload["train/global_step"], 0)
             self.assertEqual(startup_payload["system/wandb_initialized"], 1.0)
-            self.assertEqual(startup_payload["runtime/rollouts_per_query"], 24.0)
-            self.assertEqual(startup_payload["paper/runtime_deviation_from_spec"], 1.0)
+            self.assertEqual(startup_payload["system/weave_enabled"], 0.0)
+            self.assertNotIn("runtime/rollouts_per_query", startup_payload)
+            self.assertNotIn("paper/runtime_deviation_from_spec", startup_payload)
 
     def test_log_metrics_adds_namespaced_wandb_series(self):
         fake_wandb = FakeWandbModule()
@@ -1081,8 +1117,8 @@ relationship: part_of GO:0000002 ! child
 
             payload = fake_wandb.runs[0].logged[-1]["payload"]
             self.assertEqual(fake_wandb.runs[0].logged[-1]["step"], 7)
-            self.assertEqual(payload["trainer/global_step"], 7)
-            self.assertEqual(payload["reward_mean"], 0.25)
+            self.assertEqual(payload["train/global_step"], 7)
+            self.assertNotIn("reward_mean", payload)
             self.assertEqual(payload["train/reward_mean"], 0.25)
             self.assertEqual(payload["train/loss_mean"], 0.125)
             self.assertEqual(payload["validation/reward_mean"], 0.5)
@@ -1207,8 +1243,14 @@ relationship: part_of GO:0000002 ! child
             self.assertEqual(fake_weave.trace_results[0]["output_format_valid"], [True])
             self.assertEqual(fake_weave.trace_results[0]["output_has_final_answer_tag"], [True])
             self.assertEqual(fake_weave.trace_results[0]["output_has_go_summary_block"], [False])
+            self.assertEqual(fake_weave.trace_results[0]["output_uses_alt_final_answer_close_tag"], [False])
+            self.assertEqual(fake_weave.trace_results[0]["output_has_unclosed_final_answer_tag"], [False])
+            self.assertEqual(fake_weave.trace_results[0]["output_has_repeated_final_answer_open_tag"], [False])
+            self.assertEqual(fake_weave.trace_results[0]["output_has_tool_call_residue"], [False])
+            self.assertEqual(fake_weave.trace_results[0]["output_has_think_residue"], [False])
             self.assertEqual(fake_weave.trace_results[0]["output_parsed_go_counts"], [1])
             self.assertEqual(fake_weave.trace_results[0]["output_format_summary"]["format_valid"]["true_count"], 1)
+            self.assertEqual(fake_weave.trace_results[0]["output_format_summary"]["alt_final_answer_close_tag"]["true_count"], 0)
             self.assertEqual(tracker.weave_remaining_budget, args.weave_trace_budget - 1)
 
     def test_trace_reward_call_uses_stage_specific_targets(self):

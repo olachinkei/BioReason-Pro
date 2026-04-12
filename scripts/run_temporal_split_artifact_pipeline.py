@@ -59,7 +59,7 @@ class VariantConfig:
 
     @property
     def default_reasoning_dir(self) -> str:
-        return f"data/artifacts/datasets/disease_temporal_hc_reasoning_v1/{self.benchmark_dir_name}"
+        return f"data/artifacts/datasets/disease_temporal_hc_reasoning_v2/{self.benchmark_dir_name}"
 
 
 VARIANT_CONFIGS = {

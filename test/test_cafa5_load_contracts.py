@@ -31,6 +31,15 @@ sys.modules["cafa5_prompts_contracts_test_module"] = PROMPTS
 assert PROMPTS_SPEC.loader is not None
 PROMPTS_SPEC.loader.exec_module(PROMPTS)
 
+FORMAT_SPEC = importlib.util.spec_from_file_location(
+    "cafa5_format_contracts_test_module",
+    ROOT / "bioreason2" / "dataset" / "cafa5" / "format.py",
+)
+FORMAT = importlib.util.module_from_spec(FORMAT_SPEC)
+sys.modules["cafa5_format_contracts_test_module"] = FORMAT
+assert FORMAT_SPEC.loader is not None
+FORMAT_SPEC.loader.exec_module(FORMAT)
+
 
 class Cafa5LoadContractsTest(unittest.TestCase):
     def test_resolve_keep_in_memory_defaults_to_false_without_distributed_world(self):
@@ -85,8 +94,9 @@ class Cafa5LoadContractsTest(unittest.TestCase):
         self.assertIn("<|REASONING|>", system_prompt)
         self.assertIn("<|FINAL_ANSWER|>", system_prompt)
         self.assertIn("<|/FINAL_ANSWER|>", system_prompt)
-        self.assertIn("<|REASONING|>", user_prompt)
         self.assertIn("<|FINAL_ANSWER|>", user_prompt)
+        self.assertNotIn("GO:XXXXXXX", user_prompt)
+        self.assertNotIn("GO:YYYYYYY", user_prompt)
 
     def test_limit_multiline_slot_keeps_full_text_when_caps_disabled(self):
         value = "line1\nline2\nline3"
@@ -99,6 +109,25 @@ class Cafa5LoadContractsTest(unittest.TestCase):
         compact = LOAD._compact_go_speculations(text, max_ids_per_aspect=0)
 
         self.assertEqual(compact["MF"], "GO:0000001, GO:0000002, GO:0000003")
+
+    def test_format_preserves_paper_contract_without_think_wrapper(self):
+        example = {
+            "prompt": {
+                "system": "system",
+                "user": "user",
+                "assistant_reasoning": "<|REASONING|>\nreason\n<|/REASONING|>",
+                "assistant_answer": "<|FINAL_ANSWER|>\nGO:0000001\n<|/FINAL_ANSWER|>",
+            },
+            "sequence": "MPEPTIDE",
+        }
+
+        formatted = FORMAT.format_cafa5_for_protein_llm(example)
+        assistant = formatted["prompt"][1]
+        assistant_text = assistant["content"][0]["text"]
+
+        self.assertNotIn("reasoning_content", assistant)
+        self.assertTrue(assistant_text.startswith("<|REASONING|>"))
+        self.assertIn("<|FINAL_ANSWER|>", assistant_text)
 
 
 if __name__ == "__main__":

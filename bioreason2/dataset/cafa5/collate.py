@@ -12,6 +12,8 @@ from esm.sdk.api import ESMProtein
 # BioPython imports for structure parsing
 from Bio.PDB import MMCIFParser, is_aa
 
+PAPER_REASONING_PREFILL = "<|REASONING|>\n"
+
 
 def _coords_from_cif(cif_path, chain_id="A", atom_order=["N", "CA", "C"]):
     """Load protein structure coordinates from a CIF file.
@@ -88,6 +90,14 @@ def _stringify_metadata_value(value):
     if isinstance(value, (list, tuple, set)):
         return ", ".join(str(item) for item in value if item not in (None, ""))
     return str(value)
+
+
+def _resolve_inference_assistant_prefill(example: Dict) -> str:
+    reasoning = _stringify_metadata_value(example.get("reasoning"))
+    final_answer = _stringify_metadata_value(example.get("final_answer"))
+    if "<|REASONING|>" in reasoning or "<|FINAL_ANSWER|>" in final_answer:
+        return PAPER_REASONING_PREFILL
+    return ""
 
 
 def qwen_protein_collate_fn(
@@ -271,6 +281,11 @@ def qwen_protein_collate_fn(
         pad_id = processor.tokenizer.pad_token_id
         if pad_id is None:
             pad_id = processor.tokenizer.eos_token_id
+        prefill_texts = [_resolve_inference_assistant_prefill(example) for example in examples]
+        prefill_token_ids = [
+            processor.tokenizer.encode(text, add_special_tokens=False) if text else []
+            for text in prefill_texts
+        ]
 
         # Composite marker to match _truncate_after_assistant_start
         composite = "<|im_end|>\n<|im_start|>assistant\n"
@@ -289,7 +304,7 @@ def qwen_protein_collate_fn(
                 if torch.all(ids[j : j + comp_len] == comp_t):
                     keep = j + comp_len
                     break
-            keep_lens.append(keep)
+            keep_lens.append(keep + len(prefill_token_ids[i]))
 
         new_max = max(keep_lens) if keep_lens else 0
 
@@ -298,23 +313,42 @@ def qwen_protein_collate_fn(
         new_attention = torch.zeros((B, new_max), dtype=batch["attention_mask"].dtype, device=device)
         new_labels = torch.full((B, new_max), -100, dtype=batch["labels"].dtype, device=device)
 
-        for i, k in enumerate(keep_lens):
-            if k == 0:
+        for i, total_keep in enumerate(keep_lens):
+            prefill_ids = prefill_token_ids[i]
+            prefill_len = len(prefill_ids)
+            src_keep = total_keep - prefill_len
+            if src_keep == 0 and prefill_len == 0:
                 continue
             # Take the first k tokens (truncate from the RIGHT), then left-pad to new_max
-            src_ids = batch["input_ids"][i, :k]
-            src_attn = batch["attention_mask"][i, :k]
-            src_lbls = batch["labels"][i, :k]
-
-            new_input_ids[i, -k:] = src_ids
-            new_attention[i, -k:] = src_attn
-            new_labels[i, -k:] = src_lbls
+            if src_keep > 0:
+                src_ids = batch["input_ids"][i, :src_keep]
+                src_attn = batch["attention_mask"][i, :src_keep]
+                src_lbls = batch["labels"][i, :src_keep]
+                write_start = new_max - total_keep
+                write_mid = write_start + src_keep
+                new_input_ids[i, write_start:write_mid] = src_ids
+                new_attention[i, write_start:write_mid] = src_attn
+                new_labels[i, write_start:write_mid] = src_lbls
+            else:
+                write_mid = new_max - prefill_len
+            if prefill_len > 0:
+                prefill_tensor = torch.tensor(
+                    prefill_ids,
+                    dtype=batch["input_ids"].dtype,
+                    device=device,
+                )
+                write_end = write_mid + prefill_len
+                new_input_ids[i, write_mid:write_end] = prefill_tensor
+                new_attention[i, write_mid:write_end] = 1
 
         batch["input_ids"] = new_input_ids
         batch["attention_mask"] = new_attention
         batch["labels"] = new_labels
 
         # Also truncate the text prompts
-        batch["prompt"] = [_truncate_after_assistant_start(p) for p in prompts_text]
+        batch["prompt"] = [
+            _truncate_after_assistant_start(prompt) + prefill
+            for prompt, prefill in zip(prompts_text, prefill_texts)
+        ]
 
     return batch

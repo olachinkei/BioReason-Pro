@@ -2,10 +2,43 @@ from typing import Any, Dict
 from pprint import pprint
 
 
+def _combine_paper_contract_sections(reasoning: str, answer: str) -> str:
+    reasoning = (reasoning or "").strip()
+    answer = (answer or "").strip()
+    if not reasoning:
+        return answer
+    if not answer:
+        return reasoning
+    return f"{reasoning}\n{answer}"
+
+
 def format_cafa5_for_protein_llm(example: Dict[str, Any]) -> Dict[str, Any]:
     """
     Format a CAFA5 example into the required chat format for Protein-LLM.
     """
+    assistant_reasoning = example["prompt"]["assistant_reasoning"].strip()
+    assistant_answer = example["prompt"]["assistant_answer"].strip()
+    preserve_paper_contract = (
+        "<|REASONING|>" in assistant_reasoning
+        or "<|FINAL_ANSWER|>" in assistant_answer
+    )
+
+    assistant_message: Dict[str, Any] = {
+        "role": "assistant",
+        "content": [
+            {
+                "type": "text",
+                "text": (
+                    _combine_paper_contract_sections(assistant_reasoning, assistant_answer)
+                    if preserve_paper_contract
+                    else assistant_answer
+                ),
+            },
+        ],
+    }
+    if not preserve_paper_contract:
+        assistant_message["reasoning_content"] = assistant_reasoning
+
     return {
         "prompt": [
             # {
@@ -23,16 +56,7 @@ def format_cafa5_for_protein_llm(example: Dict[str, Any]) -> Dict[str, Any]:
                     },
                 ],
             },
-            {
-                "role": "assistant",
-                "reasoning_content": f"{example['prompt']['assistant_reasoning'].strip()}",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": f"{example['prompt']['assistant_answer'].strip()}",
-                    },
-                ],
-            },
+            assistant_message,
         ],
         "protein_sequences": [
             example["sequence"],

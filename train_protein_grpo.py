@@ -47,8 +47,19 @@ except ImportError:  # pragma: no cover - optional dependency
 
 
 GO_ID_PATTERN = re.compile(r"GO:\d{7}")
+FINAL_ANSWER_OPEN_TAG = "<|FINAL_ANSWER|>"
+FINAL_ANSWER_CLOSE_TAG = "<|/FINAL_ANSWER|>"
+ALT_FINAL_ANSWER_CLOSE_TAG = "</|FINAL_ANSWER|>"
+ROLLOUT_STOP_MARKERS = [
+    FINAL_ANSWER_CLOSE_TAG,
+    ALT_FINAL_ANSWER_CLOSE_TAG,
+    "<|GO_SUMMARY_END|>",
+    "<|im_end|>",
+    "<|endoftext|>",
+    "</think>",
+]
 FINAL_ANSWER_PATTERN = re.compile(
-    r"<\|FINAL_ANSWER\|>\s*(.*?)\s*<\|/FINAL_ANSWER\|>",
+    r"<\|FINAL_ANSWER\|>\s*(.*?)\s*(?:<\|/FINAL_ANSWER\|>|</\|FINAL_ANSWER\|>)",
     re.DOTALL,
 )
 GO_SUMMARY_PATTERN = re.compile(
@@ -82,6 +93,30 @@ def normalize_path_value(value: Any) -> str:
     if isinstance(value, (list, tuple)):
         return "/".join(str(item) for item in value if item not in (None, ""))
     return normalize_text(value)
+
+
+def normalize_structured_response_text(text: Any) -> str:
+    normalized = normalize_text(text)
+    if not normalized:
+        return ""
+    return normalized.replace(ALT_FINAL_ANSWER_CLOSE_TAG, FINAL_ANSWER_CLOSE_TAG)
+
+
+def extract_final_answer_fallback_content(text: Any) -> Optional[str]:
+    normalized = normalize_structured_response_text(text)
+    start_index = normalized.find(FINAL_ANSWER_OPEN_TAG)
+    if start_index < 0:
+        return None
+    content = normalized[start_index + len(FINAL_ANSWER_OPEN_TAG) :]
+    stop_candidates: List[int] = []
+    for marker in ("<|REASONING|>", "<|GO_SUMMARY_START|>", "<|im_end|>", "<|endoftext|>", "</think>"):
+        marker_index = content.find(marker)
+        if marker_index >= 0:
+            stop_candidates.append(marker_index)
+    if stop_candidates:
+        content = content[: min(stop_candidates)]
+    content = content.strip()
+    return content or None
 
 
 def parse_wandb_artifact_project(value: Any) -> Tuple[str, str]:
@@ -362,8 +397,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wandb_job_type", type=str, default="train_rl", choices=["train_rl"])
     parser.add_argument("--benchmark_version", type=str, default="213 -> 221 -> 225 -> 228")
     parser.add_argument("--temporal_split_artifact", type=str, default=None)
-    parser.add_argument("--dataset_config", type=str, default="disease_temporal_hc_reasoning_v1")
-    parser.add_argument("--reasoning_dataset_config", type=str, default="disease_temporal_hc_reasoning_v1")
+    parser.add_argument("--dataset_config", type=str, default="disease_temporal_hc_reasoning_v2")
+    parser.add_argument("--reasoning_dataset_config", type=str, default="disease_temporal_hc_reasoning_v2")
     parser.add_argument("--dataset_artifact", type=str, default=None)
     parser.add_argument("--shortlist_query", type=str, default=None)
     parser.add_argument("--shortlist_mode", type=str, default="high-confidence")
@@ -384,7 +419,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--precomputed_embeddings_path", type=str, default=None)
 
     parser.add_argument("--cafa5_dataset", type=str, default="wanglab/cafa5")
-    parser.add_argument("--reasoning_dataset_name", type=str, default="disease_temporal_hc_reasoning_v1")
+    parser.add_argument("--reasoning_dataset_name", type=str, default="disease_temporal_hc_reasoning_v2")
     parser.add_argument("--interpro_dataset_name", type=str, default="interpro_metadata")
     parser.add_argument("--dataset_cache_dir", type=str, default=None)
     parser.add_argument("--structure_dir", type=str, default=None)
@@ -1067,12 +1102,18 @@ def validate_algorithm_runtime_contract(
 
 
 def extract_go_terms_from_final_answer(text: str) -> Optional[List[str]]:
-    match = FINAL_ANSWER_PATTERN.search(normalize_text(text))
+    normalized = normalize_structured_response_text(text)
+    match = FINAL_ANSWER_PATTERN.search(normalized)
     if match is None:
-        return None
+        fallback_content = extract_final_answer_fallback_content(normalized)
+        if fallback_content is None:
+            return None
+        content = fallback_content
+    else:
+        content = match.group(1)
     seen = set()
     ordered: List[str] = []
-    for go_id in GO_ID_PATTERN.findall(match.group(1)):
+    for go_id in GO_ID_PATTERN.findall(content):
         if go_id not in seen:
             seen.add(go_id)
             ordered.append(go_id)
@@ -1080,7 +1121,7 @@ def extract_go_terms_from_final_answer(text: str) -> Optional[List[str]]:
 
 
 def extract_go_terms_from_go_summary(text: str) -> Optional[List[str]]:
-    match = GO_SUMMARY_PATTERN.search(normalize_text(text))
+    match = GO_SUMMARY_PATTERN.search(normalize_structured_response_text(text))
     if match is None:
         return None
     seen = set()
@@ -1097,11 +1138,40 @@ def extract_go_terms_from_completion(text: str) -> Optional[List[str]]:
 
 
 def completion_has_final_answer_tag(text: str) -> bool:
-    return FINAL_ANSWER_PATTERN.search(normalize_text(text)) is not None
+    normalized = normalize_structured_response_text(text)
+    return (FINAL_ANSWER_OPEN_TAG in normalized) and (
+        FINAL_ANSWER_PATTERN.search(normalized) is not None or extract_final_answer_fallback_content(normalized) is not None
+    )
 
 
 def completion_has_go_summary_block(text: str) -> bool:
-    return GO_SUMMARY_PATTERN.search(normalize_text(text)) is not None
+    return GO_SUMMARY_PATTERN.search(normalize_structured_response_text(text)) is not None
+
+
+def completion_uses_alt_final_answer_close_tag(text: str) -> bool:
+    return ALT_FINAL_ANSWER_CLOSE_TAG in normalize_text(text)
+
+
+def completion_has_unclosed_final_answer_tag(text: str) -> bool:
+    normalized = normalize_structured_response_text(text)
+    if FINAL_ANSWER_OPEN_TAG not in normalized:
+        return False
+    return FINAL_ANSWER_PATTERN.search(normalized) is None
+
+
+def completion_has_repeated_final_answer_open_tag(text: str) -> bool:
+    normalized = normalize_structured_response_text(text)
+    return normalized.count(FINAL_ANSWER_OPEN_TAG) > 1
+
+
+def completion_has_tool_call_residue(text: str) -> bool:
+    normalized = normalize_text(text)
+    return "<tool_call>" in normalized or "</tool_call>" in normalized
+
+
+def completion_has_think_residue(text: str) -> bool:
+    normalized = normalize_text(text)
+    return "<think>" in normalized or "</think>" in normalized
 
 
 def build_completion_format_summary(text: str) -> Dict[str, Any]:
@@ -1109,6 +1179,11 @@ def build_completion_format_summary(text: str) -> Dict[str, Any]:
     return {
         "has_final_answer_tag": completion_has_final_answer_tag(text),
         "has_go_summary_block": completion_has_go_summary_block(text),
+        "uses_alt_final_answer_close_tag": completion_uses_alt_final_answer_close_tag(text),
+        "has_unclosed_final_answer_tag": completion_has_unclosed_final_answer_tag(text),
+        "has_repeated_final_answer_open_tag": completion_has_repeated_final_answer_open_tag(text),
+        "has_tool_call_residue": completion_has_tool_call_residue(text),
+        "has_think_residue": completion_has_think_residue(text),
         "parsed_go_ids": list(parsed_go_ids),
         "parsed_go_count": len(parsed_go_ids),
         "format_valid": bool(parsed_go_ids),
@@ -1464,6 +1539,13 @@ def build_rollout_trace_result(outputs: Sequence[str], tokenizer: Any = None) ->
     final_answer_flags = [bool(summary["has_final_answer_tag"]) for summary in format_summaries]
     go_summary_flags = [bool(summary["has_go_summary_block"]) for summary in format_summaries]
     format_valid_flags = [bool(summary["format_valid"]) for summary in format_summaries]
+    alt_close_flags = [bool(summary["uses_alt_final_answer_close_tag"]) for summary in format_summaries]
+    unclosed_final_answer_flags = [bool(summary["has_unclosed_final_answer_tag"]) for summary in format_summaries]
+    repeated_final_answer_open_flags = [
+        bool(summary["has_repeated_final_answer_open_tag"]) for summary in format_summaries
+    ]
+    tool_call_residue_flags = [bool(summary["has_tool_call_residue"]) for summary in format_summaries]
+    think_residue_flags = [bool(summary["has_think_residue"]) for summary in format_summaries]
     parsed_go_counts = [int(summary["parsed_go_count"]) for summary in format_summaries]
     token_lengths: List[int] = []
     if tokenizer is not None:
@@ -1479,6 +1561,11 @@ def build_rollout_trace_result(outputs: Sequence[str], tokenizer: Any = None) ->
         "output_has_final_answer_tag": final_answer_flags,
         "output_has_go_summary_block": go_summary_flags,
         "output_format_valid": format_valid_flags,
+        "output_uses_alt_final_answer_close_tag": alt_close_flags,
+        "output_has_unclosed_final_answer_tag": unclosed_final_answer_flags,
+        "output_has_repeated_final_answer_open_tag": repeated_final_answer_open_flags,
+        "output_has_tool_call_residue": tool_call_residue_flags,
+        "output_has_think_residue": think_residue_flags,
         "output_parsed_go_counts": parsed_go_counts,
         "output_length_summary": {
             "chars": summarize_length_values(char_lengths),
@@ -1488,6 +1575,11 @@ def build_rollout_trace_result(outputs: Sequence[str], tokenizer: Any = None) ->
             "final_answer_tag": summarize_boolean_values(final_answer_flags),
             "go_summary_block": summarize_boolean_values(go_summary_flags),
             "format_valid": summarize_boolean_values(format_valid_flags),
+            "alt_final_answer_close_tag": summarize_boolean_values(alt_close_flags),
+            "unclosed_final_answer_tag": summarize_boolean_values(unclosed_final_answer_flags),
+            "repeated_final_answer_open_tag": summarize_boolean_values(repeated_final_answer_open_flags),
+            "tool_call_residue": summarize_boolean_values(tool_call_residue_flags),
+            "think_residue": summarize_boolean_values(think_residue_flags),
             "parsed_go_counts": summarize_length_values(parsed_go_counts),
         },
     }
@@ -1599,13 +1691,11 @@ class RunTracker:
         if not callable(define_metric):
             return
         metric_specs = [
-            ("trainer/global_step", {}),
-            ("train/*", {"step_metric": "trainer/global_step"}),
-            ("validation/*", {"step_metric": "trainer/global_step"}),
-            ("timing/*", {"step_metric": "trainer/global_step"}),
-            ("runtime/*", {"step_metric": "trainer/global_step"}),
-            ("paper/*", {"step_metric": "trainer/global_step"}),
-            ("system/*", {"step_metric": "trainer/global_step"}),
+            ("train/global_step", {}),
+            ("train/*", {"step_metric": "train/global_step"}),
+            ("validation/*", {"step_metric": "train/global_step"}),
+            ("timing/*", {"step_metric": "train/global_step"}),
+            ("system/*", {"step_metric": "train/global_step"}),
         ]
         for metric_name, kwargs in metric_specs:
             try:
@@ -1646,55 +1736,23 @@ class RunTracker:
         save_json(self.output_dir / "wandb_run_info.json", payload)
 
     def _build_wandb_startup_metrics(self) -> Dict[str, float]:
-        config = self.config
-        runtime_deviation = config.get("paper_runtime_deviation_from_spec")
-        metrics: Dict[str, float] = {
+        return {
             "system_wandb_initialized": 1.0,
             "system_weave_enabled": float(parse_bool(self.args.trace_rollouts_to_weave) and bool(self.weave_project)),
-            "runtime_world_size": float(self.runtime.world_size),
-            "runtime_queries_per_step": float(config.get("queries_per_step", 0) or 0),
-            "runtime_rollouts_per_query": float(config.get("rollouts_per_query", 0) or 0),
-            "runtime_total_trajectories_per_step": float(config.get("total_trajectories_per_step", 0) or 0),
-            "runtime_max_new_tokens": float(config.get("max_new_tokens", 0) or 0),
-            "runtime_steps_per_generation": float(config.get("steps_per_generation", 0) or 0),
-            "runtime_num_iterations": float(config.get("num_iterations", 0) or 0),
-            "paper_runtime_deviation_from_spec": float(runtime_deviation or 0.0),
         }
-        for key in (
-            "paper_target_queries_per_step",
-            "paper_target_rollouts_per_query",
-            "paper_target_total_trajectories_per_step",
-            "paper_target_world_size",
-            "paper_target_max_new_tokens",
-            "paper_target_steps_per_generation",
-            "paper_target_num_iterations",
-            "paper_deviation_queries_per_step",
-            "paper_deviation_rollouts_per_query",
-            "paper_deviation_total_trajectories_per_step",
-            "paper_deviation_world_size",
-            "paper_deviation_max_new_tokens",
-            "paper_deviation_steps_per_generation",
-            "paper_deviation_num_iterations",
-            "paper_deviation_runtime_stack",
-        ):
-            if key in config and config[key] is not None:
-                metrics[key] = float(config[key])
-        return metrics
 
     def _augment_metrics_for_wandb(self, metrics: Mapping[str, Any], step: int) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {"trainer/global_step": int(step)}
+        payload: Dict[str, Any] = {"train/global_step": int(step)}
         for key, value in metrics.items():
             if key == "step":
                 continue
-            payload[key] = value
+            if "/" in key:
+                payload[key] = value
+                continue
             if key.startswith("validation_"):
                 payload[f"validation/{key[len('validation_'):]}"] = value
             elif key.startswith("timing_"):
                 payload[f"timing/{key[len('timing_'):]}"] = value
-            elif key.startswith("runtime_"):
-                payload[f"runtime/{key[len('runtime_'):]}"] = value
-            elif key.startswith("paper_"):
-                payload[f"paper/{key[len('paper_'):]}"] = value
             elif key.startswith("system_"):
                 payload[f"system/{key[len('system_'):]}"] = value
             else:
@@ -2332,6 +2390,11 @@ def extract_single_query(batch: Mapping[str, Any], model: Any, device: Any) -> P
         structure_coords=query.structure_coords,
         go_aspects=query.go_aspects,
     )
+    query.multimodal_cache = align_multimodal_cache_to_input_ids(
+        query.multimodal_cache,
+        query.input_ids,
+        unwrap_model(model),
+    )
     return query
 
 
@@ -2352,6 +2415,43 @@ def repeat_multimodal_cache(cache: Optional[Dict[str, Any]], repeat_count: int) 
     if go_embeddings:
         expanded["go_embeddings"] = [go_embeddings[0] for _ in range(repeat_count)]
     return expanded
+
+
+def align_multimodal_cache_to_input_ids(
+    cache: Optional[Dict[str, Any]],
+    input_ids: Any,
+    model: Any,
+) -> Optional[Dict[str, Any]]:
+    require_torch()
+    if cache is None:
+        return None
+    protein_token_id = getattr(model, "protein_token_id", None)
+    go_token_id = getattr(model, "go_token_id", None)
+    aligned = dict(cache)
+
+    protein_embeddings = cache.get("protein_embeddings")
+    if protein_embeddings is not None and protein_token_id is not None:
+        protein_counts = (input_ids == int(protein_token_id)).sum(dim=1).tolist()
+        trimmed_embeddings: List[Any] = []
+        for emb, count in zip(protein_embeddings, protein_counts):
+            if int(count) <= 0:
+                trimmed_embeddings.append(emb[:0])
+            else:
+                trimmed_embeddings.append(emb[: int(count)])
+        aligned["protein_embeddings"] = trimmed_embeddings
+
+    go_embeddings = cache.get("go_embeddings")
+    if go_embeddings is not None and go_token_id is not None:
+        go_counts = (input_ids == int(go_token_id)).sum(dim=1).tolist()
+        trimmed_go_embeddings: List[Any] = []
+        for emb, count in zip(go_embeddings, go_counts):
+            if int(count) <= 0:
+                trimmed_go_embeddings.append(emb[:0])
+            else:
+                trimmed_go_embeddings.append(emb[: int(count)])
+        aligned["go_embeddings"] = trimmed_go_embeddings
+
+    return aligned
 
 
 def repeat_query_for_rollouts(query: PreparedQuery, repeat_count: int, device: Any) -> Dict[str, Any]:
@@ -2384,7 +2484,9 @@ def repeat_query_for_rollouts(query: PreparedQuery, repeat_count: int, device: A
 def build_rollout_multimodal_cache(model: Any, query: PreparedQuery, repeat_count: int) -> Optional[Dict[str, Any]]:
     build_cache = getattr(model, "build_multimodal_cache", None)
     if not callable(build_cache):
-        return repeat_multimodal_cache(query.multimodal_cache, repeat_count)
+        repeated_cache = repeat_multimodal_cache(query.multimodal_cache, repeat_count)
+        repeated_input_ids = query.input_ids.repeat(repeat_count, 1)
+        return align_multimodal_cache_to_input_ids(repeated_cache, repeated_input_ids, model)
     single_cache = build_cache(
         protein_sequences=query.protein_sequences,
         batch_idx_map=query.batch_idx_map,
@@ -2392,7 +2494,9 @@ def build_rollout_multimodal_cache(model: Any, query: PreparedQuery, repeat_coun
         structure_coords=query.structure_coords,
         go_aspects=query.go_aspects,
     )
-    return repeat_multimodal_cache(single_cache, repeat_count)
+    repeated_cache = repeat_multimodal_cache(single_cache, repeat_count)
+    repeated_input_ids = query.input_ids.repeat(repeat_count, 1)
+    return align_multimodal_cache_to_input_ids(repeated_cache, repeated_input_ids, model)
 
 
 def tokenize_completion_texts(tokenizer: Any, completions: Sequence[str], device: Any) -> List[Any]:
@@ -2409,6 +2513,7 @@ def build_scoring_batch(
     completion_ids: Sequence[Any],
     pad_token_id: int,
     device: Any,
+    model: Any,
 ) -> Dict[str, Any]:
     require_torch()
 
@@ -2452,7 +2557,11 @@ def build_scoring_batch(
         "batch_idx_map": batch_idx_map,
         "structure_coords": structure_coords,
         "go_aspects": query.go_aspects * batch_size,
-        "multimodal_cache": repeat_multimodal_cache(query.multimodal_cache, batch_size),
+        "multimodal_cache": align_multimodal_cache_to_input_ids(
+            repeat_multimodal_cache(query.multimodal_cache, batch_size),
+            input_ids,
+            model,
+        ),
     }
 
 
@@ -2467,7 +2576,7 @@ def compute_sequence_log_probs(
     require_torch()
 
     def _compute(subgroup_completion_ids: Sequence[Any]) -> Any:
-        scoring_batch = build_scoring_batch(query, subgroup_completion_ids, pad_token_id, device)
+        scoring_batch = build_scoring_batch(query, subgroup_completion_ids, pad_token_id, device, model)
         outputs = model(
             input_ids=scoring_batch["input_ids"],
             attention_mask=scoring_batch["attention_mask"],
@@ -2763,7 +2872,6 @@ def rollout_worker_process_main(connection: Any, bootstrap: Mapping[str, Any]) -
                     query,
                     int(message["repeat_count"]),
                 )
-                stop_markers = ["<|/FINAL_ANSWER|>", "<|GO_SUMMARY_END|>", "<|im_end|>", "<|endoftext|>"]
                 outputs = model.generate(
                     input_ids=rollout_batch["input_ids"],
                     attention_mask=rollout_batch["attention_mask"],
@@ -2779,7 +2887,7 @@ def rollout_worker_process_main(connection: Any, bootstrap: Mapping[str, Any]) -
                     repetition_penalty=float(sampling.repetition_penalty),
                     max_new_tokens=int(sampling.max_new_tokens),
                     seed=int(message.get("seed", getattr(args, "seed", 0))),
-                    stop=stop_markers,
+                    stop=ROLLOUT_STOP_MARKERS,
                 )
                 if resolve_effective_vllm_sleep_mode(args) and hasattr(model, "sleep"):
                     model.sleep(level=int(args.vllm_sleep_level))
@@ -2934,7 +3042,6 @@ class VLLMRolloutWorker:
             self._load(self.checkpoint_dir)
         rollout_batch = repeat_query_for_rollouts(query, repeat_count, query.input_ids.device)
         rollout_multimodal_cache = build_rollout_multimodal_cache(self.model, query, repeat_count)
-        stop_markers = ["<|/FINAL_ANSWER|>", "<|GO_SUMMARY_END|>", "<|im_end|>", "<|endoftext|>"]
         outputs = self.model.generate(
             input_ids=rollout_batch["input_ids"],
             attention_mask=rollout_batch["attention_mask"],
@@ -2950,7 +3057,7 @@ class VLLMRolloutWorker:
             repetition_penalty=float(sampling.repetition_penalty),
             max_new_tokens=int(sampling.max_new_tokens),
             seed=generation_seed,
-            stop=stop_markers,
+            stop=ROLLOUT_STOP_MARKERS,
         )
         return [normalize_text(output).strip() for output in outputs]
 
@@ -2987,8 +3094,14 @@ def maybe_trace_group(
                 "completion": completion,
                 "target_go_ids": build_target_go_ids(group.query.sample_meta),
                 "predicted_go_ids": list(format_summary["parsed_go_ids"]),
+                "format_summary": dict(format_summary),
                 "has_final_answer_tag": bool(format_summary["has_final_answer_tag"]),
                 "has_go_summary_block": bool(format_summary["has_go_summary_block"]),
+                "uses_alt_final_answer_close_tag": bool(format_summary["uses_alt_final_answer_close_tag"]),
+                "has_unclosed_final_answer_tag": bool(format_summary["has_unclosed_final_answer_tag"]),
+                "has_repeated_final_answer_open_tag": bool(format_summary["has_repeated_final_answer_open_tag"]),
+                "has_tool_call_residue": bool(format_summary["has_tool_call_residue"]),
+                "has_think_residue": bool(format_summary["has_think_residue"]),
                 "parsed_go_count": int(format_summary["parsed_go_count"]),
                 "format_valid": bool(format_summary["format_valid"]),
             },
@@ -3354,6 +3467,21 @@ def train(args: argparse.Namespace) -> None:
                 "go_summary_block_rate": mean_or_zero(
                     [1.0 if summary["has_go_summary_block"] else 0.0 for summary in local_format_summaries]
                 ),
+                "alt_final_answer_close_tag_rate": mean_or_zero(
+                    [1.0 if summary["uses_alt_final_answer_close_tag"] else 0.0 for summary in local_format_summaries]
+                ),
+                "unclosed_final_answer_tag_rate": mean_or_zero(
+                    [1.0 if summary["has_unclosed_final_answer_tag"] else 0.0 for summary in local_format_summaries]
+                ),
+                "repeated_final_answer_open_tag_rate": mean_or_zero(
+                    [1.0 if summary["has_repeated_final_answer_open_tag"] else 0.0 for summary in local_format_summaries]
+                ),
+                "tool_call_residue_rate": mean_or_zero(
+                    [1.0 if summary["has_tool_call_residue"] else 0.0 for summary in local_format_summaries]
+                ),
+                "think_residue_rate": mean_or_zero(
+                    [1.0 if summary["has_think_residue"] else 0.0 for summary in local_format_summaries]
+                ),
                 "parsed_go_count_mean": mean_or_zero(
                     [float(summary["parsed_go_count"]) for summary in local_format_summaries]
                 ),
@@ -3379,6 +3507,22 @@ def train(args: argparse.Namespace) -> None:
                 "format_valid_rate": all_reduce_sum_scalar(metrics["format_valid_rate"], runtime) / float(runtime.world_size),
                 "final_answer_tag_rate": all_reduce_sum_scalar(metrics["final_answer_tag_rate"], runtime) / float(runtime.world_size),
                 "go_summary_block_rate": all_reduce_sum_scalar(metrics["go_summary_block_rate"], runtime) / float(runtime.world_size),
+                "alt_final_answer_close_tag_rate": all_reduce_sum_scalar(
+                    metrics["alt_final_answer_close_tag_rate"], runtime
+                )
+                / float(runtime.world_size),
+                "unclosed_final_answer_tag_rate": all_reduce_sum_scalar(
+                    metrics["unclosed_final_answer_tag_rate"], runtime
+                )
+                / float(runtime.world_size),
+                "repeated_final_answer_open_tag_rate": all_reduce_sum_scalar(
+                    metrics["repeated_final_answer_open_tag_rate"], runtime
+                )
+                / float(runtime.world_size),
+                "tool_call_residue_rate": all_reduce_sum_scalar(metrics["tool_call_residue_rate"], runtime)
+                / float(runtime.world_size),
+                "think_residue_rate": all_reduce_sum_scalar(metrics["think_residue_rate"], runtime)
+                / float(runtime.world_size),
                 "parsed_go_count_mean": all_reduce_sum_scalar(metrics["parsed_go_count_mean"], runtime) / float(runtime.world_size),
                 "loss_mean": all_reduce_sum_scalar(metrics["loss_mean"], runtime) / float(runtime.world_size),
                 "kl_mean": all_reduce_sum_scalar(metrics["kl_mean"], runtime) / float(runtime.world_size),
