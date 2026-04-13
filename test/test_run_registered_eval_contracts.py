@@ -136,6 +136,7 @@ class RunRegisteredEvalContractsTest(unittest.TestCase):
         }
         args = types.SimpleNamespace(
             split="validation",
+            reasoning_prompt_style="paper_native_tight",
             wandb_project="demo-project",
             wandb_entity="demo-entity",
             wandb_mode="offline",
@@ -190,7 +191,11 @@ class RunRegisteredEvalContractsTest(unittest.TestCase):
         self.assertEqual(captured["env"]["DATASET_ARTIFACT"], "demo/project/disease-temporal-reasoning:production")
         self.assertEqual(captured["env"]["MODEL_ARTIFACT"], "demo/project/bioreason-pro-base:production")
         self.assertEqual(captured["env"]["EVAL_SPLIT"], "validation")
-        self.assertEqual(captured["env"]["WANDB_RUN_NAME"], "eval-bioreason-pro-base-validation-213.221.225.228")
+        self.assertEqual(captured["env"]["REASONING_PROMPT_STYLE"], "paper_native_tight")
+        self.assertEqual(
+            captured["env"]["WANDB_RUN_NAME"],
+            "eval-bioreason-pro-base-validation-213.221.225.228-paper-native-tight",
+        )
         self.assertEqual(captured["env"]["KEEP_LOCAL_EVAL_OUTPUTS"], "0")
 
     def test_run_protein_llm_target_wraps_eval_in_srun_when_requested(self):
@@ -385,6 +390,19 @@ class RunRegisteredEvalContractsTest(unittest.TestCase):
         self.assertEqual(names["run_name"], "eval-train-sft-output-verify40-test-213.221.225.228")
         self.assertEqual(names["artifact_name"], "eval-train-sft-output-verify40-test-213.221.225.228")
         self.assertEqual(names["weave_eval_name"], "eval-train-sft-output-verify40-test-213.221.225.228")
+
+    def test_build_run_names_appends_prompt_variant(self):
+        names = REGISTERED_EVAL.build_run_names(
+            "bioreason-pro-rl-paper",
+            "test",
+            "213.221.225.228",
+            prompt_variant="paper_native_tight",
+        )
+
+        self.assertEqual(
+            names["run_name"],
+            "eval-bioreason-pro-rl-paper-test-213.221.225.228-paper-native-tight",
+        )
 
     def test_run_protein_llm_target_cleans_stale_scratch_before_execution(self):
         bundle = {

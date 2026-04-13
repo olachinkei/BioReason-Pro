@@ -321,7 +321,7 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertEqual(runtime_spec.runtime_stack, "deepspeed_vllm_colocate")
         self.assertEqual(args.attn_implementation, "auto")
         self.assertEqual(args.dataset_num_proc, 4)
-        self.assertEqual(args.reasoning_prompt_style, "paper_native")
+        self.assertEqual(args.reasoning_prompt_style, "paper_native_tight")
         self.assertEqual(args.vllm_attention_backend, "XFORMERS")
         self.assertEqual(args.vllm_worker_multiproc_method, "spawn")
         self.assertFalse(args.vllm_enable_sleep_mode)
@@ -620,6 +620,10 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertEqual(train_dataset, ["train"])
         self.assertEqual(validation_dataset, ["validation"])
         self.assertEqual(load_mock.call_args.kwargs["reasoning_prompt_style"], "paper_compact")
+
+    def test_parse_args_accepts_paper_native_tight_reasoning_prompt_style(self):
+        args = GRPO.parse_args(["--text_model_name", "/tmp/demo-model", "--reasoning_prompt_style", "paper_native_tight"])
+        self.assertEqual(args.reasoning_prompt_style, "paper_native_tight")
 
     def test_build_trace_path_is_rank_scoped_when_distributed(self):
         runtime = GRPO.DistributedRuntime(enabled=True, rank=3, world_size=8, local_rank=3, device="cpu")

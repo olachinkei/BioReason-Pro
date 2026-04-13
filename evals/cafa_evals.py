@@ -26,6 +26,18 @@ NAMESPACE_TO_ASPECT = {
     'cellular_component': 'CC'
 }
 METRICS_SUMMARY_FILE = "metrics_summary.json"
+FINAL_ANSWER_OPEN_TAG = "<|FINAL_ANSWER|>"
+FINAL_ANSWER_CLOSE_TAG = "<|/FINAL_ANSWER|>"
+ALT_FINAL_ANSWER_CLOSE_TAG = "</|FINAL_ANSWER|>"
+FINAL_ANSWER_STRICT_PATTERN = re.compile(
+    r"<\|FINAL_ANSWER\|>\s*(.*?)\s*<\|/FINAL_ANSWER\|>",
+    flags=re.DOTALL,
+)
+FINAL_ANSWER_LOOSE_PATTERN = re.compile(
+    r"<\|FINAL_ANSWER\|>\s*(.*?)\s*(?:<\|/FINAL_ANSWER\|>|</\|FINAL_ANSWER\|>)",
+    flags=re.DOTALL,
+)
+END_OF_RESPONSE_MARKERS = ("<|im_end|>", "<|endoftext|>", "</think>")
 
 
 
@@ -38,6 +50,53 @@ def extract_go_terms(text: str) -> Set[str]:
     go_pattern = r"GO:\d{7}"
     go_terms = set(re.findall(go_pattern, text))
     return go_terms
+
+
+def extract_final_answer_strict_content(text: str) -> str:
+    """Return content inside an exact paper-format FINAL_ANSWER block."""
+    normalized = (text or "").strip()
+    if not normalized:
+        return ""
+    match = FINAL_ANSWER_STRICT_PATTERN.search(normalized)
+    if not match:
+        return ""
+    return match.group(1).strip()
+
+
+def extract_final_answer_loose_content(text: str) -> str:
+    """Return FINAL_ANSWER content with tolerant fallbacks for legacy generations."""
+    normalized = (text or "").strip()
+    if not normalized:
+        return ""
+
+    match = FINAL_ANSWER_LOOSE_PATTERN.search(normalized)
+    if match:
+        return match.group(1).strip()
+
+    start_index = normalized.find(FINAL_ANSWER_OPEN_TAG)
+    if start_index == -1:
+        if "</think>" in normalized:
+            return normalized.split("</think>", 1)[1].strip()
+        return normalized
+
+    content = normalized[start_index + len(FINAL_ANSWER_OPEN_TAG) :]
+    cutoffs = [len(content)]
+    for marker in END_OF_RESPONSE_MARKERS:
+        marker_index = content.find(marker)
+        if marker_index != -1:
+            cutoffs.append(marker_index)
+    return content[: min(cutoffs)].strip()
+
+
+def resolve_prediction_extraction_mode(
+    *, final_answer_only: bool = False, prediction_extraction_mode: str = ""
+) -> str:
+    mode = (prediction_extraction_mode or "").strip().lower()
+    if mode in {"strict", "loose", "entire_response"}:
+        return mode
+    if final_answer_only:
+        return "loose"
+    return "entire_response"
 
 
 def extract_reasoning_ground_truth(sample: Dict) -> Tuple[Set[str], Set[str]]:
@@ -123,7 +182,11 @@ def filter_predictions_by_aspects(predicted_terms: Set[str], present_aspects: Se
     return filtered_terms
 
 
-def parse_prediction_format(text: str, final_answer_only: bool = False) -> Set[str]:
+def parse_prediction_format(
+    text: str,
+    final_answer_only: bool = False,
+    prediction_extraction_mode: str = "",
+) -> Set[str]:
     """
     Extract GO terms from prediction text.
 
@@ -132,10 +195,14 @@ def parse_prediction_format(text: str, final_answer_only: bool = False) -> Set[s
         final_answer_only: If True, split on </think> and only extract GO terms after it.
                           If False, extract from entire text.
     """
-    if final_answer_only and "</think>" in text:
-        # Split on </think> and take everything after
-        text = text.split("</think>")[-1].strip()
-    
+    extraction_mode = resolve_prediction_extraction_mode(
+        final_answer_only=final_answer_only,
+        prediction_extraction_mode=prediction_extraction_mode,
+    )
+    if extraction_mode == "strict":
+        return extract_go_terms(extract_final_answer_strict_content(text))
+    if extraction_mode == "loose":
+        return extract_go_terms(extract_final_answer_loose_content(text))
     return extract_go_terms(text)
 
 
@@ -169,7 +236,8 @@ def evaluate_single_prediction(predicted_terms: Set[str], gt_terms: Set[str]) ->
 def select_best_from_k_samples(
     k_samples: List[Dict], 
     gt_terms: Set[str],
-    final_answer_only: bool = False
+    final_answer_only: bool = False,
+    prediction_extraction_mode: str = "",
 ) -> Dict:
     """
     Evaluate k samples in parallel and return the one with highest F1 score.
@@ -189,7 +257,8 @@ def select_best_from_k_samples(
         generated_response = sample.get("generated_response", "")
         predicted_terms = parse_prediction_format(
             generated_response,
-            final_answer_only=final_answer_only
+            final_answer_only=final_answer_only,
+            prediction_extraction_mode=prediction_extraction_mode,
         )
         f1_score = evaluate_single_prediction(predicted_terms, gt_terms)
         return f1_score, sample
@@ -276,6 +345,7 @@ def process_json_data(
     base_dir: str, 
     reasoning_mode: bool = False, 
     final_answer_only: bool = False,
+    prediction_extraction_mode: str = "",
     go_dag=None
 ) -> Tuple[List[Tuple[str, Set[str]]], List[Tuple[str, Set[str]]]]:
     """
@@ -294,8 +364,11 @@ def process_json_data(
     if reasoning_mode:
         print(f"{Fore.YELLOW}Using reasoning evaluation mode with ground truth from go_bp/go_mf/go_cc{Style.RESET_ALL}")
     
-    extraction_mode = "entire response" if not final_answer_only else "after </think> tag"
-    print(f"{Fore.YELLOW}Extracting predictions from: {extraction_mode}{Style.RESET_ALL}")
+    resolved_mode = resolve_prediction_extraction_mode(
+        final_answer_only=final_answer_only,
+        prediction_extraction_mode=prediction_extraction_mode,
+    )
+    print(f"{Fore.YELLOW}Extracting predictions from mode: {resolved_mode}{Style.RESET_ALL}")
 
     predictions = []
     ground_truth = []
@@ -361,7 +434,8 @@ def process_json_data(
             best_sample = select_best_from_k_samples(
                 successful_k_samples,
                 gt_terms,
-                final_answer_only=final_answer_only
+                final_answer_only=final_answer_only,
+                prediction_extraction_mode=resolved_mode,
             )
         else:
             # Only one sample available
@@ -374,7 +448,8 @@ def process_json_data(
         generated_response = best_sample.get("generated_response", "")
         predicted_terms = parse_prediction_format(
             generated_response, 
-            final_answer_only=final_answer_only
+            final_answer_only=final_answer_only,
+            prediction_extraction_mode=resolved_mode,
         )
         
         # Only add if we have data

@@ -22,16 +22,26 @@ import inspect
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import time
 from collections import OrderedDict
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 import torch
 from tqdm import tqdm
 import traceback
 
 from bioreason2.models.protein_vllm import ProteinLLMModel
+try:
+    from bioreason2.dataset.cafa5.collate import PAPER_REASONING_PREFILL
+except ImportError:  # pragma: no cover - lightweight test stubs may not expose collate
+    PAPER_REASONING_PREFILL = "<|REASONING|>\n"
 from bioreason2.dataset.cafa5.load import load_cafa5_dataset
+try:
+    from bioreason2.dataset.prompts.cafa5 import publish_cafa5_reasoning_prompts_to_weave
+except ImportError:  # pragma: no cover - lightweight test stubs may not expose prompt helpers
+    def publish_cafa5_reasoning_prompts_to_weave(weave_module, variants=None):
+        return {}
 from bioreason2.utils import maybe_use_artifact_refs, str2bool
 
 try:
@@ -46,12 +56,25 @@ except ImportError:  # pragma: no cover - optional dependency at runtime
 
 # Constants
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-STOP_TOKENS = ["<|im_end|>"]
+STOP_TOKENS = ["<|/FINAL_ANSWER|>", "</|FINAL_ANSWER|>", "</think>", "<|im_end|>"]
 ERROR_LOG_FILE = "evaluation_errors.json"
 RUN_SUMMARY_FILE = "run_summary.json"
 SAMPLE_TABLE_FILE = "sample_results.tsv"
 REASONING_OPEN_TAG = "<think>"
 REASONING_CLOSE_TAG = "</think>"
+FINAL_ANSWER_OPEN_TAG = "<|FINAL_ANSWER|>"
+FINAL_ANSWER_CLOSE_TAG = "<|/FINAL_ANSWER|>"
+ALT_FINAL_ANSWER_CLOSE_TAG = "</|FINAL_ANSWER|>"
+GO_TERM_PATTERN = re.compile(r"GO:\d{7}")
+STRICT_FINAL_ANSWER_PATTERN = re.compile(
+    r"<\|FINAL_ANSWER\|>\s*(.*?)\s*<\|/FINAL_ANSWER\|>",
+    flags=re.DOTALL,
+)
+LOOSE_FINAL_ANSWER_PATTERN = re.compile(
+    r"<\|FINAL_ANSWER\|>\s*(.*?)\s*(?:<\|/FINAL_ANSWER\|>|</\|FINAL_ANSWER\|>)",
+    flags=re.DOTALL,
+)
+END_OF_RESPONSE_MARKERS = ("<|im_end|>", "<|endoftext|>", "</think>")
 SAMPLE_TABLE_FIELDNAMES = [
     "protein_id",
     "go_aspect",
@@ -116,6 +139,63 @@ def parse_result_filename(filename: str) -> Optional[Tuple[str, str]]:
 def _normalize_text_for_match(text: str) -> str:
     """Normalize whitespace for lightweight exact-match notes."""
     return " ".join((text or "").split())
+
+
+def extract_go_terms(text: str) -> List[str]:
+    """Extract unique GO IDs while preserving first-seen order."""
+    seen = OrderedDict()
+    for match in GO_TERM_PATTERN.findall(text or ""):
+        seen.setdefault(match, None)
+    return list(seen.keys())
+
+
+def extract_final_answer_content(text: str, mode: str) -> str:
+    """Extract FINAL_ANSWER text using either strict or tolerant parsing."""
+    normalized = (text or "").strip()
+    if not normalized:
+        return ""
+
+    if mode == "strict":
+        match = STRICT_FINAL_ANSWER_PATTERN.search(normalized)
+        content = match.group(1) if match else ""
+        return (content or "").strip()
+
+    match = LOOSE_FINAL_ANSWER_PATTERN.search(normalized)
+    if match:
+        return (match.group(1) or "").strip()
+
+    start_index = normalized.find(FINAL_ANSWER_OPEN_TAG)
+    if start_index == -1:
+        if REASONING_CLOSE_TAG in normalized:
+            return normalized.split(REASONING_CLOSE_TAG, 1)[1].strip()
+        return normalized
+
+    content = normalized[start_index + len(FINAL_ANSWER_OPEN_TAG) :]
+    cutoffs = [len(content)]
+    for marker in END_OF_RESPONSE_MARKERS:
+        marker_index = content.find(marker)
+        if marker_index != -1:
+            cutoffs.append(marker_index)
+    return content[: min(cutoffs)].strip()
+
+
+def build_mode_score_payload(prediction_text: str, expected_text: str, mode: str) -> Dict[str, Any]:
+    """Build per-mode eval diagnostics for Weave sample logging."""
+    predicted_final = extract_final_answer_content(prediction_text, mode)
+    expected_final = extract_final_answer_content(expected_text, mode)
+    predicted_final_normalized = _normalize_text_for_match(predicted_final)
+    expected_final_normalized = _normalize_text_for_match(expected_final)
+    predicted_go_ids = extract_go_terms(predicted_final)
+    expected_go_ids = extract_go_terms(expected_final)
+    prefix = (mode or "loose").strip().lower() or "loose"
+    return {
+        f"{prefix}_format_valid": float(bool(predicted_final)),
+        f"{prefix}_exact_match": float(
+            bool(predicted_final_normalized and expected_final_normalized and predicted_final_normalized == expected_final_normalized)
+        ),
+        f"{prefix}_predicted_go_count": float(len(predicted_go_ids)),
+        f"{prefix}_expected_go_count": float(len(expected_go_ids)),
+    }
 
 
 def extract_reasoning_fields(text: str) -> Dict[str, str]:
@@ -216,6 +296,7 @@ def load_dataset(args):
         predict_interpro=args.predict_interpro,
         ppi_in_prompt=args.ppi_in_prompt,
         reasoning_dataset_name=args.reasoning_dataset_name,
+        reasoning_prompt_style=getattr(args, "reasoning_prompt_style", "paper_native_tight"),
         go_gpt_predictions_column=args.go_gpt_predictions_column,
         min_go_mf_freq=args.min_go_mf_freq,
         min_go_bp_freq=args.min_go_bp_freq,
@@ -454,6 +535,42 @@ def normalize_metrics_summary(metrics_summary: Optional[Dict[str, Any]]) -> Dict
     return normalized
 
 
+def prefix_metrics(metrics: Mapping[str, Any], prefix: str) -> Dict[str, Any]:
+    """Prefix metric keys while preserving scalar values."""
+    normalized_prefix = (prefix or "").strip()
+    if not normalized_prefix:
+        return dict(metrics)
+    return {f"{normalized_prefix}_{key}": value for key, value in metrics.items()}
+
+
+def fill_missing_metric_keys(
+    metrics: Optional[Mapping[str, Any]],
+    template_metrics: Optional[Mapping[str, Any]],
+    *,
+    fill_value: float = 0.0,
+) -> Dict[str, Any]:
+    """Backfill missing scalar metric keys so downstream comparisons stay rectangular."""
+    normalized = normalize_metrics_summary(dict(metrics or {}))
+    template = normalize_metrics_summary(dict(template_metrics or {}))
+    for key, value in template.items():
+        if key in normalized:
+            continue
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            normalized[key] = fill_value
+    return normalized
+
+
+def merge_loose_and_strict_metrics(
+    loose_metrics: Optional[Mapping[str, Any]],
+    strict_metrics: Optional[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Use loose metrics as canonical defaults and strict metrics under strict_* aliases."""
+    merged = normalize_metrics_summary(dict(loose_metrics or {}))
+    strict_normalized = fill_missing_metric_keys(strict_metrics, merged, fill_value=0.0)
+    merged.update(prefix_metrics(strict_normalized, "strict"))
+    return merged
+
+
 def load_metrics_summary(metrics_summary_path: Optional[str]) -> Dict[str, Any]:
     """Load an optional metrics summary JSON for downstream tracking."""
     if not metrics_summary_path:
@@ -509,25 +626,29 @@ def maybe_compute_metrics_summary(args) -> Tuple[Dict[str, Any], Optional[str]]:
 
     metrics_output_dir = os.path.join(args.evals_path, "cafa_metrics")
 
-    try:
-        if os.path.exists(metrics_output_dir):
-            shutil.rmtree(metrics_output_dir)
-        os.makedirs(metrics_output_dir, exist_ok=True)
+    def compute_metrics_variant(
+        *,
+        label: str,
+        prediction_extraction_mode: str,
+    ) -> Tuple[Dict[str, Any], Optional[str]]:
+        variant_output_dir = os.path.join(metrics_output_dir, label)
+        os.makedirs(variant_output_dir, exist_ok=True)
 
         predictions, ground_truth = cafa_metrics.process_json_data(
             args.evals_path,
             reasoning_mode=reasoning_mode,
             final_answer_only=getattr(args, "metrics_final_answer_only", True),
+            prediction_extraction_mode=prediction_extraction_mode,
             go_dag=None,
         )
         if not predictions or not ground_truth:
-            print("⚠️  Could not derive predictions/ground truth for Fmax computation.")
+            print(f"⚠️  Could not derive {label} predictions/ground truth for Fmax computation.")
             return {}, None
 
-        predictions_dir = os.path.join(metrics_output_dir, "predictions")
+        predictions_dir = os.path.join(variant_output_dir, "predictions")
         os.makedirs(predictions_dir, exist_ok=True)
         prediction_file = os.path.join(predictions_dir, "llm_predictions.tsv")
-        ground_truth_file = os.path.join(metrics_output_dir, "ground_truth.tsv")
+        ground_truth_file = os.path.join(variant_output_dir, "ground_truth.tsv")
 
         cafa_metrics.create_cafa_prediction_file(predictions, prediction_file)
         cafa_metrics.create_cafa_ground_truth_file(ground_truth, ground_truth_file)
@@ -542,14 +663,40 @@ def maybe_compute_metrics_summary(args) -> Tuple[Dict[str, Any], Optional[str]]:
         )
 
         metrics_summary = normalize_metrics_summary(cafa_metrics.extract_metrics_summary(results))
-        metrics_summary_path = cafa_metrics.write_metrics_summary(metrics_summary, metrics_output_dir)
+        summary_path = cafa_metrics.write_metrics_summary(metrics_summary, variant_output_dir)
 
         evaluation_df, best_scores_dict = results
         if hasattr(evaluation_df, "to_csv"):
-            evaluation_df.to_csv(os.path.join(metrics_output_dir, "evaluation_results.tsv"), sep="\t")
+            evaluation_df.to_csv(os.path.join(variant_output_dir, "evaluation_results.tsv"), sep="\t")
         for metric_name, metric_df in best_scores_dict.items():
             if hasattr(metric_df, "to_csv"):
-                metric_df.to_csv(os.path.join(metrics_output_dir, f"best_{metric_name}.tsv"), sep="\t")
+                metric_df.to_csv(os.path.join(variant_output_dir, f"best_{metric_name}.tsv"), sep="\t")
+
+        return metrics_summary, summary_path
+
+    try:
+        if os.path.exists(metrics_output_dir):
+            shutil.rmtree(metrics_output_dir)
+        os.makedirs(metrics_output_dir, exist_ok=True)
+        loose_metrics, loose_metrics_path = compute_metrics_variant(
+            label="loose",
+            prediction_extraction_mode="loose",
+        )
+        strict_metrics, strict_metrics_path = compute_metrics_variant(
+            label="strict",
+            prediction_extraction_mode="strict",
+        )
+        if not loose_metrics and not strict_metrics:
+            metrics_summary_path = cafa_metrics.write_metrics_summary({}, metrics_output_dir)
+            return {}, metrics_summary_path
+
+        metrics_summary = merge_loose_and_strict_metrics(loose_metrics, strict_metrics)
+        metrics_summary["metrics_mode_default"] = "loose"
+        if loose_metrics_path:
+            metrics_summary["loose_metrics_summary_path"] = loose_metrics_path
+        if strict_metrics_path:
+            metrics_summary["strict_metrics_summary_path"] = strict_metrics_path
+        metrics_summary_path = cafa_metrics.write_metrics_summary(metrics_summary, metrics_output_dir)
 
         print(f"📈 Automatic Fmax metrics saved to: {metrics_summary_path}")
         return metrics_summary, metrics_summary_path
@@ -589,6 +736,10 @@ def build_eval_summary_row(args, run_summary: Dict[str, Any], metrics_summary: D
         "fmax_bp": metrics_summary.get("fmax_bp"),
         "fmax_cc": metrics_summary.get("fmax_cc"),
         "overall_mean_fmax": metrics_summary.get("overall_mean_fmax"),
+        "strict_fmax_mf": metrics_summary.get("strict_fmax_mf"),
+        "strict_fmax_bp": metrics_summary.get("strict_fmax_bp"),
+        "strict_fmax_cc": metrics_summary.get("strict_fmax_cc"),
+        "strict_overall_mean_fmax": metrics_summary.get("strict_overall_mean_fmax"),
         "loaded_samples": run_summary.get("loaded_samples"),
         "newly_processed_samples": run_summary.get("newly_processed_samples"),
         "result_files_total": run_summary.get("result_files_total"),
@@ -605,6 +756,18 @@ def build_weave_eval_summary_payload(
 ) -> Dict[str, Any]:
     """Build the final Weave Evaluation summary payload for one eval run."""
     summary_row = build_eval_summary_row(args, run_summary, metrics_summary)
+    loose_metrics = {
+        "fmax_mf": summary_row["fmax_mf"],
+        "fmax_bp": summary_row["fmax_bp"],
+        "fmax_cc": summary_row["fmax_cc"],
+        "overall_mean_fmax": summary_row["overall_mean_fmax"],
+    }
+    strict_metrics = {
+        "fmax_mf": summary_row["strict_fmax_mf"],
+        "fmax_bp": summary_row["strict_fmax_bp"],
+        "fmax_cc": summary_row["strict_fmax_cc"],
+        "overall_mean_fmax": summary_row["strict_overall_mean_fmax"],
+    }
     return {
         "model_name": summary_row["model_name"],
         "split": summary_row["split"],
@@ -613,11 +776,18 @@ def build_weave_eval_summary_payload(
         "fmax_bp": summary_row["fmax_bp"],
         "fmax_cc": summary_row["fmax_cc"],
         "overall_mean_fmax": summary_row["overall_mean_fmax"],
+        "strict_fmax_mf": summary_row["strict_fmax_mf"],
+        "strict_fmax_bp": summary_row["strict_fmax_bp"],
+        "strict_fmax_cc": summary_row["strict_fmax_cc"],
+        "strict_overall_mean_fmax": summary_row["strict_overall_mean_fmax"],
         "sample_rows_logged": len(sample_rows),
         "loaded_samples": summary_row["loaded_samples"],
         "newly_processed_samples": summary_row["newly_processed_samples"],
         "result_files_total": summary_row["result_files_total"],
         "unique_sample_keys_total": summary_row["unique_sample_keys_total"],
+        "metrics_mode_default": "loose",
+        "loose_metrics": loose_metrics,
+        "strict_metrics": strict_metrics,
     }
 
 
@@ -641,6 +811,7 @@ def build_tracking_config(args, run_summary: Dict[str, Any], metrics_summary: Di
         "model_artifact": getattr(args, "model_artifact", None),
         "seed": args.seed,
         "eval_split": args.eval_split,
+        "reasoning_prompt_style": getattr(args, "reasoning_prompt_style", None),
         "pass_at_k": args.pass_at_k,
         "max_samples": args.max_samples,
         "result_files_total": run_summary.get("result_files_total"),
@@ -762,6 +933,8 @@ def build_weave_eval_attributes(args) -> Dict[str, Any]:
         "dataset_artifact": getattr(args, "dataset_artifact", None),
         "model_artifact": getattr(args, "model_artifact", None),
         "temporal_split_artifact": getattr(args, "temporal_split_artifact", None),
+        "reasoning_prompt_style": getattr(args, "reasoning_prompt_style", None),
+        "selected_weave_prompt_ref": getattr(args, "selected_weave_prompt_ref", None),
     }
     return {key: value for key, value in attributes.items() if value not in (None, "")}
 
@@ -860,6 +1033,8 @@ def maybe_init_eval_tracking(args) -> Dict[str, Any]:
         "weave_eval_logger": None,
         "trace_sample": None,
         "weave_project": "",
+        "weave_prompt_refs": {},
+        "selected_weave_prompt_ref": "",
         "sample_traces_logged": 0,
     }
 
@@ -876,6 +1051,18 @@ def maybe_init_eval_tracking(args) -> Dict[str, Any]:
         cache_dir = ensure_weave_server_cache_dir(args)
         print(f"🧶 Using Weave cache directory: {cache_dir}")
         client = weave.init(weave_project)
+        selected_variant = (getattr(args, "reasoning_prompt_style", None) or "paper_native_tight").strip()
+        prompt_refs = publish_cafa5_reasoning_prompts_to_weave(weave, variants=[selected_variant])
+        selected_prompt_ref = prompt_refs.get(selected_variant, "")
+        setattr(args, "selected_weave_prompt_ref", selected_prompt_ref)
+        if tracking_state["wandb_run"] is not None and prompt_refs:
+            maybe_update_wandb_config(
+                tracking_state["wandb_run"],
+                {
+                    "weave_prompt_refs_json": json.dumps(prompt_refs, sort_keys=True),
+                    "selected_weave_prompt_ref": selected_prompt_ref,
+                },
+            )
 
         @weave.op(name="eval_sample_inference")
         def trace_sample(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -894,6 +1081,8 @@ def maybe_init_eval_tracking(args) -> Dict[str, Any]:
         tracking_state["weave_eval_logger"] = weave_eval_logger
         tracking_state["trace_sample"] = trace_sample
         tracking_state["weave_project"] = weave_project
+        tracking_state["weave_prompt_refs"] = prompt_refs
+        tracking_state["selected_weave_prompt_ref"] = selected_prompt_ref
         print("Weave initialization for eval tracing completed.")
     except Exception as exc:
         print(f"⚠️  Weave init failed, continuing without sample tracing: {exc}")
@@ -938,7 +1127,11 @@ def maybe_trace_eval_sample(
         "reasoning_full": prediction_fields.get("reasoning_full", ""),
         "final_answer": prediction_fields.get("final_answer", ""),
         "intermediate_trace": prediction_fields.get("intermediate_trace", ""),
+        "reasoning_prompt_style": getattr(args, "reasoning_prompt_style", None),
+        "selected_weave_prompt_ref": tracking_state.get("selected_weave_prompt_ref", ""),
     }
+    if tracking_state.get("weave_prompt_refs"):
+        payload["weave_prompt_refs"] = dict(tracking_state["weave_prompt_refs"])
     trace_sample(payload)
     tracking_state["sample_traces_logged"] = int(tracking_state.get("sample_traces_logged", 0)) + 1
 
@@ -1011,6 +1204,8 @@ def build_weave_prediction_payload(row: Dict[str, Any]) -> Tuple[Dict[str, Any],
         "attempt_count": float(row.get("attempt_count", 0)),
         "successful_attempt_count": float(row.get("successful_attempt_count", 0)),
     }
+    scores.update(build_mode_score_payload(row.get("prediction", ""), row.get("expected_output", ""), "loose"))
+    scores.update(build_mode_score_payload(row.get("prediction", ""), row.get("expected_output", ""), "strict"))
     return inputs, output, scores
 
 
@@ -1254,6 +1449,8 @@ def build_generation_prompt(model: ProteinLLMModel, sample: Dict[str, Any], prot
         add_generation_prompt=True,
         enable_thinking=args.enable_thinking,  # Avoid empty thinking injection
     )
+    if getattr(args, "reasoning_prompt_style", "paper_native_tight") in {"paper_native", "paper_native_tight"}:
+        final_prompt_string = final_prompt_string + PAPER_REASONING_PREFILL
     return final_prompt_string
 
 
@@ -1685,12 +1882,19 @@ def setup_argument_parser() -> argparse.ArgumentParser:
     dataset_group.add_argument(
         "--max_length_protein", type=int, default=2048, help="Maximum length of protein sequences."
     )
-    dataset_group.add_argument("--enable_thinking", type=str2bool, default=True)
+    dataset_group.add_argument("--enable_thinking", type=str2bool, default=False)
     dataset_group.add_argument(
         "--reasoning_dataset_name",
         type=str,
         default=None,
         help="Config name for reasoning traces dataset (e.g., 'experiment_data_reasoning'). If provided, uses reasoning data instead of generating assistant reasoning. Requires split_go_aspects=False since reasoning contains comprehensive analysis for all GO aspects together.",
+    )
+    dataset_group.add_argument(
+        "--reasoning_prompt_style",
+        type=str,
+        default="paper_native_tight",
+        choices=["paper_native", "paper_native_tight", "paper_compact", "verbose"],
+        help="Reasoning prompt style used for evaluation. Defaults to the same paper-native prompt as RL.",
     )
     dataset_group.add_argument(
         "--go_gpt_predictions_column",

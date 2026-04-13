@@ -98,6 +98,8 @@ MAX_NEW_TOKENS=5000
 TEMPERATURE=0
 TOP_P=0.95
 REPETITION_PENALTY=1.0
+ENABLE_THINKING=${ENABLE_THINKING:-False}
+REASONING_PROMPT_STYLE=${REASONING_PROMPT_STYLE:-paper_native_tight}
 INFERENCE_BATCH_SIZE=${INFERENCE_BATCH_SIZE:-1}
 PASS_AT_K=1
 PROTEIN_EMBEDDING_LAYER=37
@@ -308,10 +310,12 @@ esac
     --cafa5_dataset "$CAFA5_DATASET" \
     --cafa5_dataset_name "$DATASET_NAME" \
     --reasoning_dataset_name "$REASONING_DATASET_NAME" \
+    --reasoning_prompt_style "$REASONING_PROMPT_STYLE" \
     --go_gpt_predictions_column "$GO_GPT_PREDICTIONS_COLUMN" \
     --dataset_cache_dir "$DATASET_CACHE_DIR" \
     --structure_dir "$STRUCTURE_DIR" \
     --split_go_aspects "$SPLIT_GO_ASPECTS" \
+    --enable_thinking "$ENABLE_THINKING" \
     --interpro_in_prompt "$INTERPRO_IN_PROMPT" \
     --predict_interpro "$PREDICT_INTERPRO" \
     --ppi_in_prompt "$PPI_IN_PROMPT" \

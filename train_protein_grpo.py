@@ -428,8 +428,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reasoning_prompt_style",
         type=str,
-        default="paper_native",
-        choices=["paper_native", "paper_compact"],
+        default="paper_native_tight",
+        choices=["paper_native", "paper_native_tight", "paper_compact"],
     )
 
     parser.add_argument("--max_length_text", type=int, default=512)
@@ -1600,6 +1600,8 @@ class RunTracker:
         self.wandb_run = None
         self.weave_client = None
         self.weave_project = ""
+        self.weave_prompt_refs: Dict[str, str] = {}
+        self.selected_weave_prompt_ref = ""
         self.weave_trace_fn = None
         self.weave_reward_trace_fn = None
         self.weave_scoring_trace_fn = None
@@ -1768,6 +1770,8 @@ class RunTracker:
         if not project:
             return None
         try:
+            from bioreason2.dataset.prompts.cafa5 import publish_cafa5_reasoning_prompts_to_weave
+
             self._configure_weave_cache_dir()
             global_attributes = {
                 "job_type": "train_rl",
@@ -1777,6 +1781,21 @@ class RunTracker:
             }
             self.weave_project = project
             self.weave_client = weave.init(project, global_attributes=global_attributes)
+            selected_variant = normalize_text(getattr(self.args, "reasoning_prompt_style", None)).strip() or "paper_native_tight"
+            self.weave_prompt_refs = publish_cafa5_reasoning_prompts_to_weave(
+                weave,
+                variants=[selected_variant],
+            )
+            self.selected_weave_prompt_ref = self.weave_prompt_refs.get(selected_variant, "")
+            if self.wandb_run is not None and self.weave_prompt_refs:
+                self._sync_wandb_run_config(
+                    self.wandb_run,
+                    {
+                        **self.config,
+                        "weave_prompt_refs_json": json.dumps(self.weave_prompt_refs, sort_keys=True),
+                        "selected_weave_prompt_ref": self.selected_weave_prompt_ref,
+                    },
+                )
 
             def invoke_stage(stage_name: str) -> Any:
                 callback = self._weave_stage_callbacks.get(stage_name)
@@ -1895,6 +1914,9 @@ class RunTracker:
             "rank": int(self.runtime.rank),
             "split": normalize_text(split).strip() or "train",
             "protein_id": normalize_text(protein_id).strip(),
+            "reasoning_prompt_style": normalize_text(getattr(self.args, "reasoning_prompt_style", None)).strip()
+            or "paper_native_tight",
+            "selected_weave_prompt_ref": self.selected_weave_prompt_ref,
         }
 
     def _trace_weave_stage(
@@ -2079,6 +2101,10 @@ class RunTracker:
         payload_dict.setdefault("job_type", "train_rl")
         if self.weave_project:
             payload_dict.setdefault("weave_project", self.weave_project)
+        if self.weave_prompt_refs:
+            payload_dict.setdefault("weave_prompt_refs", dict(self.weave_prompt_refs))
+        if self.selected_weave_prompt_ref:
+            payload_dict.setdefault("selected_weave_prompt_ref", self.selected_weave_prompt_ref)
         line = json.dumps(payload_dict, ensure_ascii=True)
         with self.trace_path.open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
@@ -2417,6 +2443,24 @@ def repeat_multimodal_cache(cache: Optional[Dict[str, Any]], repeat_count: int) 
     return expanded
 
 
+def move_multimodal_cache_to_cpu(cache: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if cache is None:
+        return None
+
+    def move_value(value: Any) -> Any:
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu()
+        if isinstance(value, list):
+            return [move_value(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(move_value(item) for item in value)
+        if isinstance(value, dict):
+            return {key: move_value(item) for key, item in value.items()}
+        return value
+
+    return {key: move_value(value) for key, value in cache.items()}
+
+
 def align_multimodal_cache_to_input_ids(
     cache: Optional[Dict[str, Any]],
     input_ids: Any,
@@ -2482,6 +2526,10 @@ def repeat_query_for_rollouts(query: PreparedQuery, repeat_count: int, device: A
 
 
 def build_rollout_multimodal_cache(model: Any, query: PreparedQuery, repeat_count: int) -> Optional[Dict[str, Any]]:
+    if query.multimodal_cache is not None:
+        repeated_cache = repeat_multimodal_cache(query.multimodal_cache, repeat_count)
+        repeated_input_ids = query.input_ids.repeat(repeat_count, 1)
+        return align_multimodal_cache_to_input_ids(repeated_cache, repeated_input_ids, model)
     build_cache = getattr(model, "build_multimodal_cache", None)
     if not callable(build_cache):
         repeated_cache = repeat_multimodal_cache(query.multimodal_cache, repeat_count)
@@ -2763,6 +2811,9 @@ def build_rollout_query_payload(query: PreparedQuery) -> Dict[str, Any]:
     structure_coords = query.structure_coords
     if isinstance(structure_coords, torch.Tensor):
         structure_coords = structure_coords.detach().cpu()
+    multimodal_cache = query.multimodal_cache
+    if multimodal_cache is not None:
+        multimodal_cache = move_multimodal_cache_to_cpu(multimodal_cache)
     return {
         "input_ids": query.input_ids.detach().cpu(),
         "attention_mask": query.attention_mask.detach().cpu(),
@@ -2770,6 +2821,7 @@ def build_rollout_query_payload(query: PreparedQuery) -> Dict[str, Any]:
         "batch_idx_map": list(query.batch_idx_map),
         "structure_coords": structure_coords,
         "go_aspects": list(query.go_aspects),
+        "multimodal_cache": multimodal_cache,
     }
 
 
@@ -2783,7 +2835,7 @@ def query_from_rollout_payload(payload: Mapping[str, Any]) -> PreparedQuery:
         go_aspects=list(payload.get("go_aspects") or []),
         sample_meta={},
         prompt_text="",
-        multimodal_cache=None,
+        multimodal_cache=payload.get("multimodal_cache"),
     )
 
 

@@ -14,6 +14,7 @@ from bioreason2.dataset.cafa5.processor import (
 from bioreason2.dataset.prompts.cafa5 import (
     CAFA5_REASONING_TEMPLATE,
     CAFA5_REASONING_TEMPLATE_PAPER_NATIVE,
+    CAFA5_REASONING_TEMPLATE_PAPER_NATIVE_TIGHT,
     CAFA5_REASONING_TEMPLATE_PAPER_COMPACT,
     CAFA5_REASONING_TEMPLATE_WITH_CONTEXT,
     CAFA5_REASONING_TEMPLATE_WITH_CONTEXT_PPI,
@@ -404,7 +405,8 @@ def _format_reasoning_prompt(
         add_uniprot_summary: Whether to add UniProt summary to final answer and use UniProt template
         is_swissprot: Whether to use dynamic SwissProt template that mentions only available data
         reasoning_prompt_style: Prompt style for reasoning data. "paper_native"
-            keeps the paper-style freer-form continuation contract, while
+            keeps the paper-style freer-form continuation contract,
+            "paper_native_tight" strengthens the paper-native delimiter contract, while
             "paper_compact" is a stricter structured ablation that restricts
             text context to paper-style slots and omits optional prose fields.
         
@@ -446,7 +448,7 @@ def _format_reasoning_prompt(
     uniprot_summary = " Summarize in UniProt format."
     assistant_answer = _add_uniprot_summary(example) if add_uniprot_summary else (example["final_answer"] if "final_answer" in example else "")
     
-    if reasoning_prompt_style == "paper_native":
+    if reasoning_prompt_style in {"paper_native", "paper_native_tight"}:
         paper_interpro = _limit_multiline_slot(
             interpro_data,
             max_lines=compact_interpro_limit,
@@ -459,9 +461,14 @@ def _format_reasoning_prompt(
             go_speculations,
             max_ids_per_aspect=compact_go_speculation_limit,
         )
+        paper_template = (
+            CAFA5_REASONING_TEMPLATE_PAPER_NATIVE_TIGHT
+            if reasoning_prompt_style == "paper_native_tight"
+            else CAFA5_REASONING_TEMPLATE_PAPER_NATIVE
+        )
         prompt_dict = {
-            "system": CAFA5_REASONING_TEMPLATE_PAPER_NATIVE["system_prompt"],
-            "user": CAFA5_REASONING_TEMPLATE_PAPER_NATIVE["user_prompt"].format(
+            "system": paper_template["system_prompt"],
+            "user": paper_template["user_prompt"].format(
                 organism=organism,
                 interpro_data=paper_interpro,
                 ppi_data=paper_ppi,
@@ -747,7 +754,7 @@ def _process_dataset_split(
             desc="Removing protein function summaries",
         )
 
-    if reasoning_dataset_name and reasoning_prompt_style in {"paper_native", "paper_compact"}:
+    if reasoning_dataset_name and reasoning_prompt_style in {"paper_native", "paper_native_tight", "paper_compact"}:
         if (
             compact_interpro_limit is None or int(compact_interpro_limit) <= 0
         ) and (
@@ -932,8 +939,9 @@ def load_cafa5_dataset(
                            (Molecular Function, Biological Process, Cellular Component) regardless
                            of what ground truth data is available (default=False). Useful for evaluation.
         reasoning_prompt_style: Prompt style for reasoning data. "paper_native" keeps the
-                               paper-style freer-form continuation contract, while
-                               "paper_compact" is a stricter structured ablation.
+                               paper-style freer-form continuation contract,
+                               "paper_native_tight" strengthens the paper-native delimiter contract,
+                               while "paper_compact" is a stricter structured ablation.
         compact_interpro_limit: Maximum number of InterPro lines kept in reasoning prompts.
                                Use 0 or a negative value to disable clipping.
         compact_ppi_limit: Maximum number of PPI lines kept in reasoning prompts.
@@ -1174,7 +1182,7 @@ def load_cafa5_dataset(
                     desc="Removing protein function summaries",
                 )
 
-            if reasoning_dataset_name and reasoning_prompt_style in {"paper_native", "paper_compact"}:
+            if reasoning_dataset_name and reasoning_prompt_style in {"paper_native", "paper_native_tight", "paper_compact"}:
                 if (
                     compact_interpro_limit is None or int(compact_interpro_limit) <= 0
                 ) and (

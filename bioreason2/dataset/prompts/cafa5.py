@@ -89,6 +89,9 @@ CAFA5_PROMPT_TEMPLATE_SINGLE_ASPECT_INTERPRO_PPI_IN_PROMPT_NO_FUNC = {
 }
 
 # Reasoning template without special tokens for comprehensive analysis
+import hashlib
+import json
+
 CAFA5_REASONING_TEMPLATE = {
     "system_prompt": "You are a scientific assistant specialized in protein function prediction. Given a protein sequence and organism information, step-by-step reason about the InterPro terms, Gene Ontology (GO) terms regarding molecular function, biological process, and cellular component, protein-protein interactions (PPI), and overall function. Provide a summary of your findings in your final answer.",
     "user_prompt": "Given the protein above from organism {organism}, reason about the function of the protein.",
@@ -131,7 +134,8 @@ CAFA5_REASONING_TEMPLATE_PAPER_NATIVE = {
         "available. Produce exactly two sections in order: <|REASONING|> ... <|/REASONING|> "
         "followed by <|FINAL_ANSWER|> ... <|/FINAL_ANSWER|>. Use only the provided evidence, "
         "revise weak GO-GPT hypotheses when needed, and do not emit templates, placeholders, "
-        "tool-call text, or meta-instructions."
+        "tool-call text, meta-instructions, or <think> tags. Start your response immediately "
+        "with <|REASONING|> and stop immediately after <|/FINAL_ANSWER|>."
     ),
     "user_prompt": (
         "Organism: {organism}\n\n"
@@ -143,7 +147,39 @@ CAFA5_REASONING_TEMPLATE_PAPER_NATIVE = {
         "Protein-protein interaction partners:\n{ppi_data}\n\n"
         "Produce a structured reasoning trace followed by a final answer. "
         "In <|FINAL_ANSWER|>, list real GO IDs one per line before any concise function summary "
-        "or hypothesized interaction partners."
+        "or hypothesized interaction partners. Do not use <think>. Do not omit the closing "
+        "tag <|/FINAL_ANSWER|>."
+    ),
+}
+
+CAFA5_REASONING_TEMPLATE_PAPER_NATIVE_TIGHT = {
+    "system_prompt": (
+        "You are a scientific assistant specialized in protein function prediction. "
+        "The protein residue embeddings and 200 GO graph embeddings are already provided "
+        "as multimodal context. The user prompt is assembled by concatenating the target "
+        "organism, InterPro domain annotations (identifiers, names, and residue ranges), "
+        "greedy-decoded GO-GPT predictions, and protein-protein interaction partners when "
+        "available. Produce exactly two sections in order: <|REASONING|> ... <|/REASONING|> "
+        "followed immediately by <|FINAL_ANSWER|> ... <|/FINAL_ANSWER|>. Start your response "
+        "with <|REASONING|> and do not write any text before it. After <|/REASONING|>, "
+        "immediately open <|FINAL_ANSWER|>. Stop immediately after <|/FINAL_ANSWER|>. "
+        "Use only the provided evidence, revise weak GO-GPT hypotheses when needed, and do "
+        "not emit templates, placeholders, tool-call text, meta-instructions, <think> tags, "
+        "or repeated section tags."
+    ),
+    "user_prompt": (
+        "Organism: {organism}\n\n"
+        "InterPro annotations (identifiers, names, residue ranges):\n{interpro_data}\n\n"
+        "Greedy-decoded GO-GPT predictions:\n"
+        "Molecular Function (MF): {go_mf_speculations}\n"
+        "Biological Process (BP): {go_bp_speculations}\n"
+        "Cellular Component (CC): {go_cc_speculations}\n\n"
+        "Protein-protein interaction partners:\n{ppi_data}\n\n"
+        "Produce a structured reasoning trace followed by a final answer. "
+        "Inside <|FINAL_ANSWER|>, first list real GO IDs one per line. After the GO IDs, "
+        "write the required bullet-list summary. Do not use placeholder GO IDs such as "
+        "GO:XXXXXXX or GO:YYYYYYY. Do not repeat <|FINAL_ANSWER|>. Do not omit the closing "
+        "tag <|/FINAL_ANSWER|>."
     ),
 }
 
@@ -186,3 +222,49 @@ CAFA5_REASONING_TEMPLATE_PAPER_COMPACT = {
 
 # Helper prompts
 INTERPRO_IN_GENERATION = "Let me list the InterPro terms for this protein."
+
+CAFA5_REASONING_PROMPT_WEAVE_FAMILY = "cafa5_reasoning_prompt"
+CAFA5_REASONING_PROMPT_VERSIONED_VARIANTS = ("paper_native", "paper_native_tight")
+
+
+def get_cafa5_reasoning_prompt_templates():
+    return {
+        "paper_native": CAFA5_REASONING_TEMPLATE_PAPER_NATIVE,
+        "paper_native_tight": CAFA5_REASONING_TEMPLATE_PAPER_NATIVE_TIGHT,
+        "paper_compact": CAFA5_REASONING_TEMPLATE_PAPER_COMPACT,
+    }
+
+
+def build_cafa5_reasoning_prompt_spec(variant: str):
+    templates = get_cafa5_reasoning_prompt_templates()
+    if variant not in templates:
+        raise KeyError(f"Unsupported CAFA5 reasoning prompt variant: {variant}")
+    template = templates[variant]
+    payload = {
+        "family": CAFA5_REASONING_PROMPT_WEAVE_FAMILY,
+        "variant": variant,
+        "system_prompt": template["system_prompt"],
+        "user_prompt": template["user_prompt"],
+    }
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+    payload["prompt_sha256"] = digest
+    payload["registry_name"] = f"{CAFA5_REASONING_PROMPT_WEAVE_FAMILY}_{variant}"
+    return payload
+
+
+def publish_cafa5_reasoning_prompts_to_weave(weave_module, variants=None):
+    publish = getattr(weave_module, "publish", None)
+    if not callable(publish):
+        return {}
+
+    resolved_variants = []
+    for variant in list(CAFA5_REASONING_PROMPT_VERSIONED_VARIANTS) + list(variants or []):
+        if variant not in resolved_variants:
+            resolved_variants.append(variant)
+
+    refs = {}
+    for variant in resolved_variants:
+        spec = build_cafa5_reasoning_prompt_spec(variant)
+        ref = publish(spec, name=spec["registry_name"])
+        refs[variant] = str(ref)
+    return refs

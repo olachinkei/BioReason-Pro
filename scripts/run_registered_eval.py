@@ -118,6 +118,13 @@ def parse_args() -> argparse.Namespace:
         help="Evaluation split to run. Validation uses the fixed 100-protein dev split; test uses the fixed 400-protein holdout split.",
     )
     parser.add_argument(
+        "--reasoning-prompt-style",
+        type=str,
+        default="paper_native_tight",
+        choices=["paper_native", "paper_native_tight", "paper_compact", "verbose"],
+        help="Reasoning prompt variant to use for evaluation generation.",
+    )
+    parser.add_argument(
         "--output-root",
         type=str,
         default=DEFAULT_EVAL_OUTPUT_ROOT,
@@ -287,9 +294,13 @@ def build_run_names(
     benchmark_alias: str,
     *,
     model_source_ref: str = "",
+    prompt_variant: str = "",
 ) -> Dict[str, str]:
     target_label = _derive_eval_target_label(target_name, model_source_ref=model_source_ref)
+    prompt_suffix = normalize_text(prompt_variant).strip().replace("_", "-")
     suffix = f"{target_label}-{split}-{benchmark_alias}"
+    if prompt_suffix:
+        suffix = f"{suffix}-{prompt_suffix}"
     return {
         "run_name": f"eval-{suffix}",
         "artifact_name": f"eval-{suffix}",
@@ -504,6 +515,7 @@ def run_protein_llm_target(
         args.split,
         bundle["benchmark_alias"],
         model_source_ref=normalize_text(resolved_model.get("source_ref")),
+        prompt_variant=normalize_text(getattr(args, "reasoning_prompt_style", "")),
     )
     env = os.environ.copy()
     env.update(
@@ -520,6 +532,7 @@ def run_protein_llm_target(
             "CAFA5_DATASET": resolve_dataset_loader_source(bundle["reasoning_dataset"]),
             "DATASET_NAME": normalize_text(bundle["reasoning_dataset"].get("dataset_name")),
             "REASONING_DATASET_NAME": normalize_text(bundle["reasoning_dataset"].get("dataset_name")),
+            "REASONING_PROMPT_STYLE": normalize_text(getattr(args, "reasoning_prompt_style", "")),
             "EVAL_SPLIT": args.split,
             "BENCHMARK_VERSION": normalize_text(bundle.get("benchmark_version")),
             "TEMPORAL_SPLIT_ARTIFACT": normalize_text(bundle["temporal_split_artifact"].get("wandb_registry_path")),

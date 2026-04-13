@@ -55,6 +55,37 @@ CAFA_EVALS = load_cafa_eval_module()
 
 
 class CafaEvalContractTests(unittest.TestCase):
+    def test_parse_prediction_format_loose_accepts_alt_close_and_open_only(self):
+        alt_close = "<|FINAL_ANSWER|>\nGO:0001111\n</|FINAL_ANSWER|>"
+        open_only = "<|FINAL_ANSWER|>\nGO:0002222\n</think>"
+
+        self.assertEqual(
+            CAFA_EVALS.parse_prediction_format(alt_close, prediction_extraction_mode="loose"),
+            {"GO:0001111"},
+        )
+        self.assertEqual(
+            CAFA_EVALS.parse_prediction_format(open_only, prediction_extraction_mode="loose"),
+            {"GO:0002222"},
+        )
+
+    def test_parse_prediction_format_strict_requires_exact_close_tag(self):
+        strict_text = "<|FINAL_ANSWER|>\nGO:0001111\n<|/FINAL_ANSWER|>"
+        alt_close = "<|FINAL_ANSWER|>\nGO:0001111\n</|FINAL_ANSWER|>"
+        no_tags = "<think>trace</think>\nGO:0001111"
+
+        self.assertEqual(
+            CAFA_EVALS.parse_prediction_format(strict_text, prediction_extraction_mode="strict"),
+            {"GO:0001111"},
+        )
+        self.assertEqual(
+            CAFA_EVALS.parse_prediction_format(alt_close, prediction_extraction_mode="strict"),
+            set(),
+        )
+        self.assertEqual(
+            CAFA_EVALS.parse_prediction_format(no_tags, prediction_extraction_mode="strict"),
+            set(),
+        )
+
     def test_extract_metrics_summary_covers_all_three_namespaces(self):
         best_f_df = pd.DataFrame(
             {

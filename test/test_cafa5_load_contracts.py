@@ -98,6 +98,16 @@ class Cafa5LoadContractsTest(unittest.TestCase):
         self.assertNotIn("GO:XXXXXXX", user_prompt)
         self.assertNotIn("GO:YYYYYYY", user_prompt)
 
+    def test_paper_native_tight_prompt_strengthens_tag_contract(self):
+        system_prompt = PROMPTS.CAFA5_REASONING_TEMPLATE_PAPER_NATIVE_TIGHT["system_prompt"]
+        user_prompt = PROMPTS.CAFA5_REASONING_TEMPLATE_PAPER_NATIVE_TIGHT["user_prompt"]
+
+        self.assertIn("Start your response with <|REASONING|>", system_prompt)
+        self.assertIn("Stop immediately after <|/FINAL_ANSWER|>", system_prompt)
+        self.assertIn("<think> tags", system_prompt)
+        self.assertIn("Do not repeat <|FINAL_ANSWER|>", user_prompt)
+        self.assertIn("Do not omit the closing tag <|/FINAL_ANSWER|>", user_prompt)
+
     def test_limit_multiline_slot_keeps_full_text_when_caps_disabled(self):
         value = "line1\nline2\nline3"
 

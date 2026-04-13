@@ -550,7 +550,10 @@ class EvalContractTests(unittest.TestCase):
         result_rows = EVAL.process_sample_batch(model, samples, args)
 
         self.assertEqual(len(model.processor.calls), 1)
-        self.assertEqual(model.processor.calls[0]["text"], ["prompt:user-1", "prompt:user-2"])
+        self.assertEqual(
+            model.processor.calls[0]["text"],
+            ["prompt:user-1<|REASONING|>\n", "prompt:user-2<|REASONING|>\n"],
+        )
         self.assertEqual(len(model.generate_calls), 1)
         self.assertEqual(model.generate_calls[0]["protein_sequences"], ["MSTN", "AAAA"])
         self.assertEqual(model.generate_calls[0]["batch_idx_map"], [0, 1])
@@ -704,12 +707,15 @@ class EvalContractTests(unittest.TestCase):
 
         calls = {}
 
-        def process_json_data(base_dir, reasoning_mode=False, final_answer_only=False, go_dag=None):
-            calls["process_json_data"] = {
-                "base_dir": base_dir,
-                "reasoning_mode": reasoning_mode,
-                "final_answer_only": final_answer_only,
-            }
+        def process_json_data(base_dir, reasoning_mode=False, final_answer_only=False, go_dag=None, prediction_extraction_mode=""):
+            calls.setdefault("process_json_data", []).append(
+                {
+                    "base_dir": base_dir,
+                    "reasoning_mode": reasoning_mode,
+                    "final_answer_only": final_answer_only,
+                    "prediction_extraction_mode": prediction_extraction_mode,
+                }
+            )
             return [("P12345", {"GO:0001111"})], [("P12345", {"GO:0001111"})]
 
         def create_cafa_prediction_file(predictions, output_path):
@@ -772,11 +778,17 @@ class EvalContractTests(unittest.TestCase):
                 metrics_summary, metrics_summary_path = EVAL.maybe_compute_metrics_summary(args)
 
             self.assertEqual(metrics_summary["fmax_mf"], 0.9)
+            self.assertEqual(metrics_summary["strict_fmax_mf"], 0.9)
             self.assertTrue(metrics_summary_path.endswith("metrics_summary.json"))
             self.assertTrue(Path(metrics_summary_path).exists())
-            self.assertEqual(calls["process_json_data"]["base_dir"], tmpdir)
-            self.assertTrue(calls["process_json_data"]["reasoning_mode"])
-            self.assertTrue(calls["process_json_data"]["final_answer_only"])
+            self.assertEqual(len(calls["process_json_data"]), 2)
+            self.assertEqual(calls["process_json_data"][0]["base_dir"], tmpdir)
+            self.assertTrue(calls["process_json_data"][0]["reasoning_mode"])
+            self.assertTrue(calls["process_json_data"][0]["final_answer_only"])
+            self.assertEqual(
+                [call["prediction_extraction_mode"] for call in calls["process_json_data"]],
+                ["loose", "strict"],
+            )
             self.assertEqual(calls["run_cafa_evaluation"]["ia_file_path"], str(ia_path))
             self.assertEqual(calls["run_cafa_evaluation"]["n_cpu"], 4)
             self.assertEqual(calls["run_cafa_evaluation"]["th_step"], 0.95)
@@ -784,7 +796,7 @@ class EvalContractTests(unittest.TestCase):
     def test_maybe_compute_metrics_summary_runs_without_ia_file(self):
         calls = {}
 
-        def process_json_data(base_dir, reasoning_mode=False, final_answer_only=False, go_dag=None):
+        def process_json_data(base_dir, reasoning_mode=False, final_answer_only=False, go_dag=None, prediction_extraction_mode=""):
             return [("P12345", {"GO:0001111"})], [("P12345", {"GO:0001111"})]
 
         def create_cafa_prediction_file(predictions, output_path):
@@ -838,11 +850,12 @@ class EvalContractTests(unittest.TestCase):
                 metrics_summary, metrics_summary_path = EVAL.maybe_compute_metrics_summary(args)
 
         self.assertEqual(metrics_summary["fmax_mf"], 0.7)
+        self.assertEqual(metrics_summary["strict_fmax_mf"], 0.7)
         self.assertIsNotNone(metrics_summary_path)
         self.assertIsNone(calls["run_cafa_evaluation"]["ia_file_path"])
 
     def test_maybe_compute_metrics_summary_tolerates_missing_metric_frames(self):
-        def process_json_data(base_dir, reasoning_mode=False, final_answer_only=False, go_dag=None):
+        def process_json_data(base_dir, reasoning_mode=False, final_answer_only=False, go_dag=None, prediction_extraction_mode=""):
             return [("P12345", {"GO:0001111"})], [("P12345", {"GO:0001111"})]
 
         fake_cafa_module = types.SimpleNamespace(
@@ -873,6 +886,76 @@ class EvalContractTests(unittest.TestCase):
 
         self.assertEqual(metrics_summary, {})
         self.assertTrue(metrics_summary_path.endswith("metrics_summary.json"))
+
+    def test_merge_loose_and_strict_metrics_backfills_missing_strict_keys_with_zero(self):
+        merged = EVAL.merge_loose_and_strict_metrics(
+            {
+                "molecular_function_f1": 0.7,
+                "biological_process_f1": 0.5,
+                "overall_mean_f1": 0.6,
+            },
+            {},
+        )
+
+        self.assertEqual(merged["fmax_mf"], 0.7)
+        self.assertEqual(merged["strict_fmax_mf"], 0.0)
+        self.assertEqual(merged["strict_fmax_bp"], 0.0)
+        self.assertEqual(merged["strict_overall_mean_fmax"], 0.0)
+
+    def test_build_weave_prediction_payload_logs_loose_and_strict_scores_separately(self):
+        row = {
+            "protein_id": "P12345",
+            "go_aspect": "all",
+            "split": "test",
+            "prompt": "prompt",
+            "prediction": "<think>reasoning</think>\n<|FINAL_ANSWER|>\nGO:0000001\n",
+            "expected_output": "<|REASONING|>\nreasoning\n<|/REASONING|>\n<|FINAL_ANSWER|>\nGO:0000001\n<|/FINAL_ANSWER|>",
+            "reasoning_full": "reasoning",
+            "final_answer": "GO:0000001",
+            "intermediate_trace": "reasoning",
+            "success": True,
+            "attempt_count": 1,
+            "successful_attempt_count": 1,
+        }
+
+        _inputs, _output, scores = EVAL.build_weave_prediction_payload(row)
+
+        self.assertEqual(scores["success"], 1.0)
+        self.assertEqual(scores["loose_format_valid"], 1.0)
+        self.assertEqual(scores["strict_format_valid"], 0.0)
+        self.assertEqual(scores["loose_predicted_go_count"], 1.0)
+        self.assertEqual(scores["strict_predicted_go_count"], 0.0)
+
+    def test_build_weave_eval_summary_payload_includes_loose_and_strict_groups(self):
+        args = make_eval_args(
+            cafa5_dataset_name="dataset",
+            eval_split="test",
+            reasoning_dataset_name="reasoning-v2",
+        )
+        run_summary = {
+            "loaded_samples": 100,
+            "newly_processed_samples": 100,
+            "result_files_total": 100,
+            "unique_sample_keys_total": 100,
+            "successful_result_files_total": 100,
+        }
+        metrics_summary = {
+            "fmax_mf": 0.6,
+            "fmax_bp": 0.5,
+            "fmax_cc": 0.7,
+            "overall_mean_fmax": 0.6,
+            "strict_fmax_mf": 0.2,
+            "strict_fmax_bp": 0.1,
+            "strict_fmax_cc": 0.3,
+            "strict_overall_mean_fmax": 0.2,
+        }
+
+        payload = EVAL.build_weave_eval_summary_payload(args, run_summary, metrics_summary, sample_rows=[{"x": 1}])
+
+        self.assertEqual(payload["metrics_mode_default"], "loose")
+        self.assertEqual(payload["loose_metrics"]["overall_mean_fmax"], 0.6)
+        self.assertEqual(payload["strict_metrics"]["overall_mean_fmax"], 0.2)
+        self.assertEqual(payload["strict_overall_mean_fmax"], 0.2)
 
     def test_maybe_compute_metrics_summary_skips_when_required_files_are_missing(self):
         args = make_eval_args(
