@@ -503,7 +503,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.35)
     parser.add_argument("--vllm_max_model_len", type=int, default=32768)
-    parser.add_argument("--vllm_max_num_seqs", type=int, default=256)
+    parser.add_argument("--vllm_max_num_seqs", type=int, default=32)
     parser.add_argument("--vllm_cpu_offload_gb", type=float, default=0.0)
     parser.add_argument("--vllm_swap_space_gb", type=float, default=4.0)
     parser.add_argument("--vllm_enforce_eager", type=str, default="true")
@@ -905,6 +905,23 @@ def resolve_local_rollouts_per_rank(algorithm: AlgorithmSpec, world_size: int) -
     return max(algorithm.rollouts_per_query // query_parallel_degree, 1)
 
 
+def resolve_effective_vllm_max_num_seqs(args: argparse.Namespace) -> int:
+    configured = max(int(args.vllm_max_num_seqs), 1)
+    target_world_size = max(int(args.target_num_nodes) * int(args.target_gpus_per_node), 1)
+    queries_per_step = max(int(args.queries_per_step), 1)
+    rollouts_per_query = max(int(args.rollouts_per_query), 1)
+    query_parallel_degree = resolve_query_parallel_degree(target_world_size, queries_per_step)
+    if rollouts_per_query % query_parallel_degree != 0:
+        raise ValueError(
+            "rollouts_per_query must be divisible by query_parallel_degree when resolving "
+            "the effective vLLM max_num_seqs. "
+            f"Got rollouts_per_query={rollouts_per_query}, "
+            f"query_parallel_degree={query_parallel_degree}."
+        )
+    local_rollouts = max(rollouts_per_query // query_parallel_degree, 1)
+    return max(configured, local_rollouts)
+
+
 def configure_query_parallel_runtime(runtime: DistributedRuntime, algorithm: AlgorithmSpec) -> None:
     if not runtime.enabled:
         runtime.query_parallel_degree = 1
@@ -932,6 +949,15 @@ def rank0_print(runtime: DistributedRuntime, message: str) -> None:
 
 def rank_print(runtime: DistributedRuntime, message: str) -> None:
     print(f"[rank {runtime.rank}] {message}", flush=True)
+
+
+def maybe_stagger_startup_model_load(runtime: DistributedRuntime) -> None:
+    if not runtime.enabled:
+        return
+    local_rank = max(int(runtime.local_rank), 0)
+    if local_rank <= 0:
+        return
+    time.sleep(min(float(local_rank) * 2.0, 14.0))
 
 
 def destroy_torch_distributed_process_group(log_prefix: Optional[str] = None) -> None:
@@ -1931,6 +1957,11 @@ class RunTracker:
     ) -> Any:
         if not callable(weave_fn) or (decrement_rollout_budget and self.weave_remaining_budget <= 0):
             return callback()
+        if self.runtime.world_size > 1 and stage_name in {"scoring", "policy_update"}:
+            # Multi-node policy/scoring tracing has been unstable in practice and is
+            # not required for prompt / output-format observability. Keep rollout
+            # and reward traces in Weave, but run the heavier stages directly.
+            return callback()
         weave_attributes = getattr(weave, "attributes", None)
         attribute_context = weave_attributes(dict(attributes)) if callable(weave_attributes) else nullcontext()
         self._weave_stage_callbacks[stage_name] = callback
@@ -2235,6 +2266,7 @@ def instantiate_policy_model_from_source(
         load_in_4bit=False,
         unified_go_encoder=bool(args.unified_go_encoder),
         use_unsloth=False,
+        lazy_protein_encoder=True,
     )
     apply_lora_to_text_model(model, args, trainable=trainable)
     if args.disable_model_dropout:
@@ -2302,8 +2334,8 @@ def initialize_policy_stack(
     import deepspeed
     from transformers import get_cosine_schedule_with_warmup
 
+    maybe_stagger_startup_model_load(runtime)
     current_model = instantiate_policy_model(args, trainable=True)
-    current_model.to(runtime.device)
 
     trainable_parameters = [param for param in current_model.parameters() if param.requires_grad]
     optimizer = torch.optim.AdamW(
@@ -2802,7 +2834,10 @@ def export_inference_checkpoint(model: Any, export_dir: Path) -> None:
         torch.save(base_model.go_encoder.state_dict(), export_dir / "go_encoder.pt")
     protein_model_dir = export_dir / "protein_model"
     protein_model_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(base_model.protein_model.state_dict(), protein_model_dir / "pytorch_model.bin")
+    if hasattr(base_model, "copy_or_save_frozen_protein_model"):
+        base_model.copy_or_save_frozen_protein_model(protein_model_dir)
+    else:
+        torch.save(base_model.protein_model.state_dict(), protein_model_dir / "pytorch_model.bin")
     del base_model
     gc.collect()
 
@@ -2841,6 +2876,7 @@ def query_from_rollout_payload(payload: Mapping[str, Any]) -> PreparedQuery:
 
 def create_vllm_rollout_model(args: argparse.Namespace, checkpoint_dir: Path) -> Any:
     from bioreason2.models.protein_vllm import ProteinLLMModel as VLLMProteinLLMModel
+    effective_max_num_seqs = resolve_effective_vllm_max_num_seqs(args)
 
     return VLLMProteinLLMModel(
         ckpt_dir=str(checkpoint_dir),
@@ -2860,7 +2896,7 @@ def create_vllm_rollout_model(args: argparse.Namespace, checkpoint_dir: Path) ->
         unified_go_encoder=bool(args.unified_go_encoder),
         gpu_memory_utilization=float(args.vllm_gpu_memory_utilization),
         max_model_len=int(args.vllm_max_model_len),
-        max_num_seqs=max(int(args.vllm_max_num_seqs), int(args.rollouts_per_query)),
+        max_num_seqs=effective_max_num_seqs,
         cpu_offload_gb=float(args.vllm_cpu_offload_gb),
         swap_space=float(args.vllm_swap_space_gb),
         enforce_eager=bool(args.vllm_enforce_eager),

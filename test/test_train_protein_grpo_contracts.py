@@ -142,6 +142,14 @@ class FakeWandbModule:
 
 
 class TrainProteinGrpoContractsTest(unittest.TestCase):
+    def test_policy_model_instantiation_uses_lazy_protein_encoder(self):
+        source = SCRIPT_PATH.read_text(encoding="utf-8")
+        self.assertIn("lazy_protein_encoder=True", source)
+
+    def test_export_checkpoint_copies_frozen_protein_model_when_available(self):
+        source = SCRIPT_PATH.read_text(encoding="utf-8")
+        self.assertIn("copy_or_save_frozen_protein_model", source)
+
     def write_executable(self, path: Path, body: str) -> Path:
         path.write_text(body, encoding="utf-8")
         path.chmod(0o755)
@@ -347,6 +355,17 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertEqual(GRPO.resolve_effective_dataset_num_proc(4, distributed=True), 1)
         self.assertEqual(GRPO.resolve_effective_dataset_num_proc(4, distributed=False), 4)
         self.assertIsNone(GRPO.resolve_effective_dataset_num_proc(0, distributed=True))
+
+    def test_resolve_effective_vllm_max_num_seqs_uses_local_rollout_shape_without_reward_flag(self):
+        args = types.SimpleNamespace(
+            vllm_max_num_seqs=8,
+            target_num_nodes=2,
+            target_gpus_per_node=8,
+            queries_per_step=8,
+            rollouts_per_query=24,
+        )
+
+        self.assertEqual(GRPO.resolve_effective_vllm_max_num_seqs(args), 12)
 
     def test_extract_go_terms_requires_final_answer_block(self):
         self.assertIsNone(GRPO.extract_go_terms_from_final_answer("GO:0007165"))

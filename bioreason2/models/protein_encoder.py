@@ -5,7 +5,7 @@ This module provides a unified interface for protein embedding generation using 
 """
 
 import os
-import shutil
+import hashlib
 import torch
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -26,42 +26,44 @@ LOCAL_ESM3_RESIDUE_CSV_RELATIVE_PATH = Path(
 
 
 def _prepare_local_esm3_runtime(model_dir: Path) -> str:
-    """Materialize the minimum ESM3 local runtime layout from a bundled checkpoint."""
+    """Register a bundled ESM3 checkpoint as a process-local model registry entry."""
     weight_source = model_dir / "pytorch_model.bin"
     if not weight_source.exists():
         raise FileNotFoundError(f"Expected bundled ESM3 weights at {weight_source}")
 
     runtime_root = Path.cwd()
-    weight_target = runtime_root / LOCAL_ESM3_WEIGHT_RELATIVE_PATH
     residue_csv_target = runtime_root / LOCAL_ESM3_RESIDUE_CSV_RELATIVE_PATH
 
-    weight_target.parent.mkdir(parents=True, exist_ok=True)
     residue_csv_target.parent.mkdir(parents=True, exist_ok=True)
-
-    if weight_target.exists() or weight_target.is_symlink():
-        try:
-            if weight_target.samefile(weight_source):
-                pass
-            else:
-                weight_target.unlink()
-        except FileNotFoundError:
-            if weight_target.is_symlink():
-                weight_target.unlink()
-        except OSError:
-            if weight_target.is_file():
-                weight_target.unlink()
-    if not weight_target.exists():
-        try:
-            weight_target.symlink_to(weight_source.resolve())
-        except OSError:
-            shutil.copy2(weight_source, weight_target)
 
     if not residue_csv_target.exists():
         residue_csv_target.write_text("label,label_clean,count\n", encoding="utf-8")
 
+    import esm.pretrained as esm_pretrained
+
+    model_key = f"{LOCAL_ESM3_MODEL_NAME}_bundled_{hashlib.sha1(str(weight_source.resolve()).encode('utf-8')).hexdigest()[:12]}"
+    if model_key not in esm_pretrained.LOCAL_MODEL_REGISTRY:
+        def _load_bundled_esm3(device: torch.device | str = "cpu", *, _weight_source: Path = weight_source.resolve()):
+            with torch.device(device):
+                model = ESM3(
+                    d_model=1536,
+                    n_heads=24,
+                    v_heads=256,
+                    n_layers=48,
+                    structure_encoder_fn=esm_pretrained.ESM3_structure_encoder_v0,
+                    structure_decoder_fn=esm_pretrained.ESM3_structure_decoder_v0,
+                    function_decoder_fn=esm_pretrained.ESM3_function_decoder_v0,
+                    tokenizers=esm_pretrained.get_esm3_model_tokenizers(esm_pretrained.ESM3_OPEN_SMALL),
+                ).eval()
+            state_dict = torch.load(_weight_source, map_location=device)
+            model.load_state_dict(state_dict)
+            return model
+
+        esm_pretrained.LOCAL_MODEL_REGISTRY[model_key] = _load_bundled_esm3
+
     os.environ.setdefault("INFRA_PROVIDER", "local")
     print(f"📁 Prepared local ESM3 runtime under {runtime_root / 'data'}")
-    return LOCAL_ESM3_MODEL_NAME
+    return model_key
 
 
 class ProteinEncoder(ABC):

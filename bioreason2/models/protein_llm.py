@@ -1,5 +1,6 @@
 import copy
 import importlib.util
+import shutil
 
 import torch
 import torch.nn as nn
@@ -27,6 +28,10 @@ def _load_text_tokenizer(model_name: str, **kwargs):
         return AutoTokenizer.from_pretrained(model_name, fix_mistral_regex=True, **kwargs)
     except TypeError:
         return AutoTokenizer.from_pretrained(model_name, **kwargs)
+
+
+def _normalize_model_name(value: str) -> str:
+    return Path(value).name.strip().lower()
 
 
 def _normalize_attn_implementation(value: Optional[str]) -> str:
@@ -150,6 +155,7 @@ class ProteinLLMModel(nn.Module):
         load_in_4bit: bool = False,
         unified_go_encoder: bool = False,
         use_unsloth: bool = True,
+        lazy_protein_encoder: bool = False,
     ):
         """
         Initialize the ProteinLLMModel.
@@ -191,6 +197,7 @@ class ProteinLLMModel(nn.Module):
         self.unified_go_encoder = unified_go_encoder
         self.use_unsloth = use_unsloth
         self.attn_implementation = _normalize_attn_implementation(attn_implementation)
+        self.lazy_protein_encoder = bool(lazy_protein_encoder)
 
         if use_unsloth:
             if FastLanguageModel is None:
@@ -212,6 +219,7 @@ class ProteinLLMModel(nn.Module):
                 "cache_dir": cache_dir,
                 "trust_remote_code": True,
                 "torch_dtype": torch.bfloat16,
+                "low_cpu_mem_usage": True,
                 "attn_implementation": attn_implementation,
             }
             if quantization_config is not None:
@@ -248,17 +256,20 @@ class ProteinLLMModel(nn.Module):
         if text_model_path.exists() and checkpoint_protein_model.is_dir():
             resolved_protein_model_name = str(checkpoint_protein_model)
             print(f"📁 Using checkpoint-bundled protein model from {checkpoint_protein_model}")
+        self.resolved_protein_model_name = resolved_protein_model_name
+        self.protein_model_state_path = self._resolve_protein_model_state_path(resolved_protein_model_name)
 
-        self.protein_encoder = create_protein_encoder(
-            resolved_protein_model_name,
-            inference_mode=not protein_model_finetune,
-            embedding_layer=protein_embedding_layer
-        )
-        self.protein_model = self.protein_encoder.model
+        self.protein_encoder = None
+        self.protein_model = None
 
         # Get embedding dimensions
         self.text_hidden_size = self.text_config.hidden_size
-        self.protein_hidden_size = self.protein_encoder.embedding_dim
+        self.protein_hidden_size = self._infer_protein_hidden_size(
+            resolved_protein_model_name=resolved_protein_model_name,
+            text_model_path=text_model_path,
+        )
+        if not self.lazy_protein_encoder:
+            self._ensure_protein_encoder_loaded()
 
         # Initialize GO graph encoder if paths are provided
         self.go_encoder = None
@@ -307,7 +318,8 @@ class ProteinLLMModel(nn.Module):
             param.requires_grad = False
         
         # Protein encoder: use proper API to set inference mode
-        self.protein_encoder.set_inference_mode(inference_mode=not self.protein_model_finetune)
+        if self.protein_encoder is not None:
+            self.protein_encoder.set_inference_mode(inference_mode=not self.protein_model_finetune)
         
         # Protein projection: eval mode, frozen
         self.protein_projection.eval()
@@ -345,6 +357,7 @@ class ProteinLLMModel(nn.Module):
         Returns:
             List of tensor embeddings for each batch item
         """
+        self._ensure_protein_encoder_loaded()
         # Use the protein encoder to get embeddings
         batch_protein_embeddings = self.protein_encoder.encode_sequences(
             protein_sequences=protein_sequences,
@@ -371,6 +384,58 @@ class ProteinLLMModel(nn.Module):
                 )
 
         return batch_protein_embeddings
+
+    @staticmethod
+    def _resolve_protein_model_state_path(model_name: str) -> Optional[Path]:
+        model_path = Path(model_name).expanduser()
+        if model_path.is_dir():
+            weight_path = model_path / "pytorch_model.bin"
+            if weight_path.exists():
+                return weight_path.resolve()
+        if model_path.is_file():
+            return model_path.resolve()
+        return None
+
+    def _infer_protein_hidden_size(self, *, resolved_protein_model_name: str, text_model_path: Path) -> int:
+        projection_path = text_model_path / "protein_projection.pt"
+        if projection_path.exists():
+            try:
+                state = torch.load(projection_path, map_location="cpu")
+                if isinstance(state, dict):
+                    weight = state.get("0.weight")
+                    if isinstance(weight, torch.Tensor) and weight.ndim == 2:
+                        return int(weight.shape[1])
+            except Exception as exc:
+                print(f"⚠️ Could not infer protein hidden size from {projection_path}: {exc}")
+
+        model_name = _normalize_model_name(resolved_protein_model_name)
+        if "esmc_300m" in model_name:
+            return 640
+        if "esmc_600m" in model_name:
+            return 1152
+        # The checkpoint-bundled ESM3 small encoder used throughout BioReason-Pro.
+        return 1536
+
+    def _ensure_protein_encoder_loaded(self) -> None:
+        if self.protein_encoder is not None and self.protein_model is not None:
+            return
+        self.protein_encoder = create_protein_encoder(
+            self.resolved_protein_model_name,
+            inference_mode=not self.protein_model_finetune,
+            embedding_layer=self.protein_embedding_layer,
+        )
+        self.protein_model = self.protein_encoder.model
+
+    def copy_or_save_frozen_protein_model(self, destination_dir: Union[str, Path]) -> Path:
+        destination_dir = Path(destination_dir)
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        destination_path = destination_dir / "pytorch_model.bin"
+        if self.protein_model_state_path is not None and self.protein_model_state_path.exists():
+            shutil.copy2(self.protein_model_state_path, destination_path)
+            return destination_path
+        self._ensure_protein_encoder_loaded()
+        torch.save(self.protein_model.state_dict(), destination_path)
+        return destination_path
 
     def process_go_aspects(
         self,

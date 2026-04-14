@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+#SBATCH --mem=0
+#SBATCH -o /mnt/home/kkamata+cwb607/BioReason-Pro/runtime_logs/coreweave/train_rl_paper_tight_2node_srun_%j.log
 set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-${SLURM_SUBMIT_DIR:-}}"
@@ -40,7 +42,8 @@ export GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-2}"
 export MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-10000}"
 export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.35}"
 export VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-32768}"
-export VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-256}"
+export VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-32}"
+export VLLM_SWAP_SPACE_GB="${VLLM_SWAP_SPACE_GB:-0}"
 export ROLLOUT_LOGPROB_MICROBATCH_SIZE="${ROLLOUT_LOGPROB_MICROBATCH_SIZE:-4}"
 export MASTER_ADDR="${MASTER_ADDR:-$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)}"
 export MASTER_PORT="${MASTER_PORT:-29511}"
@@ -69,6 +72,7 @@ srun --nodes="${NNODES}" --ntasks="${NNODES}" --ntasks-per-node=1 bash -lc '
   export VLLM_GPU_MEMORY_UTILIZATION="'"$VLLM_GPU_MEMORY_UTILIZATION"'"
   export VLLM_MAX_MODEL_LEN="'"$VLLM_MAX_MODEL_LEN"'"
   export VLLM_MAX_NUM_SEQS="'"$VLLM_MAX_NUM_SEQS"'"
+  export VLLM_SWAP_SPACE_GB="'"$VLLM_SWAP_SPACE_GB"'"
   export ROLLOUT_LOGPROB_MICROBATCH_SIZE="'"$ROLLOUT_LOGPROB_MICROBATCH_SIZE"'"
   export MASTER_ADDR="'"$MASTER_ADDR"'"
   export MASTER_PORT="'"$MASTER_PORT"'"
