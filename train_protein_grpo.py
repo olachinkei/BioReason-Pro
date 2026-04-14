@@ -317,8 +317,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reward_weights",
         type=str,
-        default="",
-        help="Optional comma-separated reward weights aligned with --reward_funcs.",
+        default="0.1,0.1,1.0,0.1",
+        help="Comma-separated reward weights aligned with --reward_funcs. Defaults weight go_overlap 10x over format rewards to prevent reward saturation.",
     )
 
     parser.add_argument("--resume_from_raw_checkpoint", type=str, default=None)

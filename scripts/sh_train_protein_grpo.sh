@@ -80,7 +80,7 @@ GO_OBO_PATH=${GO_OBO_PATH:-"${BIOREASON_GO_OBO_PATH:-bioreason2/dataset/go-basic
 
 CAFA5_DATASET=${CAFA5_DATASET:-""}
 REASONING_DATASET_NAME=${REASONING_DATASET_NAME:-"disease_temporal_hc_reasoning_v1"}
-INTERPRO_DATASET_NAME=${INTERPRO_DATASET_NAME:-"interpro_metadata"}
+INTERPRO_DATASET_NAME=${INTERPRO_DATASET_NAME:-""}
 
 BENCHMARK_VERSION=${BENCHMARK_VERSION:-"213 -> 221 -> 225 -> 228"}
 TEMPORAL_SPLIT_ARTIFACT=${TEMPORAL_SPLIT_ARTIFACT:-"${BIOREASON_MAIN_TEMPORAL_SPLIT_REGISTRY_PATH:-}"}
@@ -150,7 +150,7 @@ TOP_P=${TOP_P:-0.95}
 DO_SAMPLE=${DO_SAMPLE:-"True"}
 KL_BETA=${KL_BETA:-0.02}
 REWARD_FUNCS=${REWARD_FUNCS:-"strict_format,reasoning_presence,go_overlap,answer_nonempty"}
-REWARD_WEIGHTS=${REWARD_WEIGHTS:-""}
+REWARD_WEIGHTS=${REWARD_WEIGHTS:-"0.1,0.1,1.0,0.1"}
 
 CHECKPOINT_ARTIFACT_NAME=${CHECKPOINT_ARTIFACT_NAME:-"train-rl-output"}
 CHECKPOINT_ARTIFACT_ALIASES=${CHECKPOINT_ARTIFACT_ALIASES:-"latest,213.221.225.228"}
@@ -325,6 +325,11 @@ if [ -n "$RESUME_FROM_RAW_CHECKPOINT" ]; then
   RESUME_ARGS=(--resume_from_raw_checkpoint "$RESUME_FROM_RAW_CHECKPOINT")
 fi
 
+OPTIONAL_INTERPRO_ARG=()
+if [ -n "$INTERPRO_DATASET_NAME" ] && [ "${INTERPRO_DATASET_NAME,,}" != "none" ]; then
+  OPTIONAL_INTERPRO_ARG=(--interpro_dataset_name "$INTERPRO_DATASET_NAME")
+fi
+
 stdbuf -oL -eL "${TRAIN_COMMAND[@]}" python train_protein_grpo.py \
   --run_name "$WANDB_RUN_NAME" \
   --wandb_project "$BASE_WANDB_PROJECT" \
@@ -356,7 +361,6 @@ stdbuf -oL -eL "${TRAIN_COMMAND[@]}" python train_protein_grpo.py \
   --cafa5_dataset "$CAFA5_DATASET" \
   --cafa5_dataset_name "$REASONING_DATASET_NAME" \
   --reasoning_dataset_name "$REASONING_DATASET_NAME" \
-  --interpro_dataset_name "$INTERPRO_DATASET_NAME" \
   --go_gpt_predictions_column go_pred \
   --include_ground_truth_in_final_answer False \
   --add_uniprot_summary True \
@@ -415,4 +419,5 @@ stdbuf -oL -eL "${TRAIN_COMMAND[@]}" python train_protein_grpo.py \
   --checkpoint_artifact_aliases "$CHECKPOINT_ARTIFACT_ALIASES" \
   --ablation_from_paper_rl "$ABLATION_FROM_PAPER_RL" \
   "${OPTIONAL_GO_EMBEDDINGS_ARG[@]}" \
+  "${OPTIONAL_INTERPRO_ARG[@]}" \
   "${RESUME_ARGS[@]}"
