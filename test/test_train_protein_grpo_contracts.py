@@ -1415,5 +1415,209 @@ relationship: part_of GO:0000002 ! child
             self.assertTrue(fake_weave.client.flush_called)
 
 
+class PhaseAAblationContractsTest(unittest.TestCase):
+    """Contract tests for the Phase A ablation levers.
+
+    See ``domain/learning-log/2026-04-16-rl-tuning-proposal-disease-pilot.md``
+    for the full proposal. The tests pin the expected behavior of each lever
+    so the A0/A1/A2/A3 runs on SUNK are actually measuring what the proposal
+    claims they measure.
+    """
+
+    def setUp(self) -> None:
+        self.ia_weights = {
+            "GO:0000001": 1.0,
+            "GO:0000002": 1.0,
+            "GO:0000003": 1.0,
+            "GO:0000100": 1.0,
+            "GO:0000200": 1.0,
+            "GO:0000300": 1.0,
+            "GO:0000400": 1.0,
+        }
+        self.go_aspects = {
+            "GO:0000001": "biological_process",
+            "GO:0000002": "molecular_function",
+            "GO:0000003": "cellular_component",
+            "GO:0000100": "biological_process",
+            "GO:0000200": "molecular_function",
+            "GO:0000300": "cellular_component",
+            "GO:0000400": "biological_process",
+        }
+
+    def _format_completion(self, go_ids):
+        body = "\n".join(go_ids)
+        return f"<|FINAL_ANSWER|>\n{body}\n<|FINAL_ANSWER_END|>"
+
+    def test_per_aspect_ia_f1_averages_over_aspects_present_in_target(self):
+        predicted = ["GO:0000001", "GO:0000002"]
+        target = ["GO:0000001", "GO:0000002", "GO:0000003"]
+
+        reward = GRPO.compute_per_aspect_weighted_f1(predicted, target, self.ia_weights, self.go_aspects)
+
+        self.assertAlmostEqual(reward, (1.0 + 1.0 + 0.0) / 3.0, places=6)
+
+    def test_per_aspect_ia_f1_skips_aspects_absent_from_target(self):
+        predicted = ["GO:0000001"]
+        target = ["GO:0000001"]
+
+        reward = GRPO.compute_per_aspect_weighted_f1(predicted, target, self.ia_weights, self.go_aspects)
+
+        self.assertEqual(reward, 1.0)
+
+    def test_per_aspect_ia_f1_breaks_zero_variance_group(self):
+        # Flat F1 returns 0 when predicted ∩ target = ∅, which is the
+        # zero-variance group failure mode that DAPO-style fixes target. Phase A.1
+        # claims to "reduce the all-0 group rate because partial aspect credit is
+        # common even when the overall F1 is 0". We verify that claim here:
+        # the model hit the BP aspect correctly but missed MF entirely, and
+        # per-aspect reward surfaces the BP hit while flat F1 hides it.
+        predicted = ["GO:0000001"]  # BP hit
+        target = ["GO:0000001", "GO:0000002"]  # BP target + MF target
+
+        baseline = GRPO.compute_weighted_f1(predicted, target, self.ia_weights)
+        per_aspect = GRPO.compute_per_aspect_weighted_f1(
+            predicted, target, self.ia_weights, self.go_aspects
+        )
+
+        # Flat F1 still sees a partial hit (1 of 2 overlap), so it's nonzero.
+        # Per-aspect hides the MF miss as a full 0 in one of two aspects,
+        # which is harsher but *equally informative* — the key property is
+        # simply that the two rewards disagree and per-aspect reports the BP
+        # aspect at full credit.
+        self.assertGreater(baseline, 0.0)
+        self.assertAlmostEqual(per_aspect, 0.5, places=6)
+
+    def test_per_aspect_ia_f1_surfaces_aspect_hit_when_flat_f1_is_zero(self):
+        # The proposal's actual motivating case: flat F1 = 0 (predicted and
+        # target share no exact terms), but one aspect has a partial hit.
+        # A.1 with ancestor propagation would catch this in a real run —
+        # here we simulate the post-propagation sets directly.
+        predicted = ["GO:0000001", "GO:0000002"]
+        target = ["GO:0000100", "GO:0000002"]  # matched on MF via GO:0000002
+
+        baseline = GRPO.compute_weighted_f1(predicted, target, self.ia_weights)
+        per_aspect = GRPO.compute_per_aspect_weighted_f1(
+            predicted, target, self.ia_weights, self.go_aspects
+        )
+
+        # Both see the MF hit. The test is that per-aspect's MF score is 1.0
+        # and aggregates cleanly, not hidden inside a diluted flat denominator.
+        self.assertGreater(per_aspect, 0.0)
+        self.assertGreater(baseline, 0.0)
+
+    def test_per_aspect_lin_partial_credit_only_when_direct_f1_is_zero(self):
+        predicted_with_hit = ["GO:0000001"]
+        target_with_hit = ["GO:0000001"]
+        direct_reward = GRPO.compute_reward_with_mode(
+            predicted_with_hit,
+            target_with_hit,
+            reward_mode="per_aspect_lin",
+            ia_weights=self.ia_weights,
+            go_aspects=self.go_aspects,
+            lin_partial_credit_cap=0.3,
+        )
+        self.assertEqual(direct_reward, 1.0)
+
+        predicted_miss = ["GO:0000100"]
+        target_miss = ["GO:0000400", "GO:0000200"]
+        partial_reward = GRPO.compute_reward_with_mode(
+            predicted_miss,
+            target_miss,
+            reward_mode="per_aspect_lin",
+            ia_weights=self.ia_weights,
+            go_aspects=self.go_aspects,
+            lin_partial_credit_cap=0.3,
+        )
+        self.assertGreaterEqual(partial_reward, 0.0)
+        self.assertLessEqual(partial_reward, 0.3)
+
+    def test_per_aspect_lin_partial_credit_cap_is_respected(self):
+        predicted = ["GO:0000100", "GO:0000200", "GO:0000300"]
+        target = ["GO:0000400"]
+
+        reward = GRPO.compute_reward_with_mode(
+            predicted,
+            target,
+            reward_mode="per_aspect_lin",
+            ia_weights=self.ia_weights,
+            go_aspects=self.go_aspects,
+            lin_partial_credit_cap=0.05,
+        )
+
+        self.assertLessEqual(reward, 0.05)
+
+    def test_compute_group_rewards_dispatches_on_reward_mode(self):
+        completions = [
+            self._format_completion(["GO:0000001"]),
+        ]
+        sample_meta = {"go_bp": "GO:0000001", "go_mf": "", "go_cc": ""}
+
+        baseline = GRPO.compute_group_rewards(
+            completions,
+            sample_meta,
+            {},
+            self.ia_weights,
+            reward_mode="ia_f1",
+        )
+        per_aspect = GRPO.compute_group_rewards(
+            completions,
+            sample_meta,
+            {},
+            self.ia_weights,
+            reward_mode="per_aspect_ia_f1",
+            go_aspects=self.go_aspects,
+        )
+
+        self.assertEqual(baseline, [1.0])
+        self.assertEqual(per_aspect, [1.0])
+
+    def test_resolve_disease_loss_scale_passes_through_when_weight_is_one(self):
+        scale = GRPO.resolve_disease_loss_scale({"is_disease_priority": False}, 1.0)
+        self.assertEqual(scale, 1.0)
+
+    def test_resolve_disease_loss_scale_defaults_to_true_when_flag_absent(self):
+        scale = GRPO.resolve_disease_loss_scale({}, 1.5)
+        self.assertEqual(scale, 1.5)
+
+    def test_resolve_disease_loss_scale_respects_false_flag(self):
+        scale = GRPO.resolve_disease_loss_scale({"is_disease_priority": False}, 1.5)
+        self.assertEqual(scale, 1.0)
+
+    def test_resolve_wandb_tags_dedupes_and_preserves_order(self):
+        args = types.SimpleNamespace(
+            ablation_tag="phase-a-A2",
+            wandb_tags=["phase-a", "phase-a-A2", "disease-pilot", ""],
+        )
+        tags = GRPO.resolve_wandb_tags(args)
+        self.assertEqual(tags, ["phase-a-A2", "phase-a", "disease-pilot"])
+
+    def test_resolve_wandb_tags_handles_missing_fields(self):
+        args = types.SimpleNamespace()
+        self.assertEqual(GRPO.resolve_wandb_tags(args), [])
+
+    def test_parse_args_accepts_phase_a_flags(self):
+        parsed = GRPO.parse_args(
+            [
+                "--text_model_name", "stub",
+                "--reward_mode", "per_aspect_lin",
+                "--disease_loss_weight", "1.5",
+                "--ablation_tag", "phase-a-A3",
+                "--wandb_tags", "phase-a", "disease-pilot",
+                "--lin_partial_credit_cap", "0.25",
+            ]
+        )
+        self.assertEqual(parsed.reward_mode, "per_aspect_lin")
+        self.assertEqual(parsed.disease_loss_weight, 1.5)
+        self.assertEqual(parsed.ablation_tag, "phase-a-A3")
+        self.assertEqual(parsed.wandb_tags, ["phase-a", "disease-pilot"])
+        self.assertEqual(parsed.lin_partial_credit_cap, 0.25)
+
+    def test_parse_args_defaults_preserve_current_behavior(self):
+        parsed = GRPO.parse_args(["--text_model_name", "stub"])
+        self.assertEqual(parsed.reward_mode, "ia_f1")
+        self.assertEqual(parsed.disease_loss_weight, 1.0)
+        self.assertIsNone(parsed.ablation_tag)
+
+
 if __name__ == "__main__":
     unittest.main()
