@@ -1251,30 +1251,50 @@ relationship: part_of GO:0000002 ! child
             self.assertNotIn("final_answer", fake_weave.trace_payloads[0]["query"]["sample_meta"])
             self.assertEqual(fake_weave.attribute_calls[0]["run_name"], "demo-run")
             self.assertEqual(fake_weave.attribute_calls[0]["step"], 4)
-            self.assertEqual(fake_weave.trace_results[0]["output_count"], 1)
+            # With the multi-step Weave tree, trace_generation emits one
+            # per-rollout child op before returning its own result, so the
+            # parent rollout result is the last entry appended to
+            # trace_results (the FakeWeaveModule records results after fn
+            # returns — children finish before the parent).
+            parent_rollout_result = next(
+                result for result in reversed(fake_weave.trace_results) if "output_count" in result
+            )
+            self.assertEqual(parent_rollout_result["output_count"], 1)
             self.assertEqual(
-                fake_weave.trace_results[0]["output_char_lengths"],
+                parent_rollout_result["output_char_lengths"],
                 [len("<|FINAL_ANSWER|>GO:0000001<|/FINAL_ANSWER|>")],
             )
-            self.assertEqual(fake_weave.trace_results[0]["output_word_lengths"], [1])
+            self.assertEqual(parent_rollout_result["output_word_lengths"], [1])
             self.assertEqual(
-                fake_weave.trace_results[0]["output_token_lengths"],
+                parent_rollout_result["output_token_lengths"],
                 [len("<|FINAL_ANSWER|>GO:0000001<|/FINAL_ANSWER|>")],
             )
-            self.assertEqual(fake_weave.trace_results[0]["output_length_summary"]["chars"]["count"], 1)
-            self.assertEqual(fake_weave.trace_results[0]["output_length_summary"]["tokens"]["count"], 1)
-            self.assertEqual(fake_weave.trace_results[0]["output_format_valid"], [True])
-            self.assertEqual(fake_weave.trace_results[0]["output_has_final_answer_tag"], [True])
-            self.assertEqual(fake_weave.trace_results[0]["output_has_go_summary_block"], [False])
-            self.assertEqual(fake_weave.trace_results[0]["output_uses_alt_final_answer_close_tag"], [False])
-            self.assertEqual(fake_weave.trace_results[0]["output_has_unclosed_final_answer_tag"], [False])
-            self.assertEqual(fake_weave.trace_results[0]["output_has_repeated_final_answer_open_tag"], [False])
-            self.assertEqual(fake_weave.trace_results[0]["output_has_tool_call_residue"], [False])
-            self.assertEqual(fake_weave.trace_results[0]["output_has_think_residue"], [False])
-            self.assertEqual(fake_weave.trace_results[0]["output_parsed_go_counts"], [1])
-            self.assertEqual(fake_weave.trace_results[0]["output_format_summary"]["format_valid"]["true_count"], 1)
-            self.assertEqual(fake_weave.trace_results[0]["output_format_summary"]["alt_final_answer_close_tag"]["true_count"], 0)
+            self.assertEqual(parent_rollout_result["output_length_summary"]["chars"]["count"], 1)
+            self.assertEqual(parent_rollout_result["output_length_summary"]["tokens"]["count"], 1)
+            self.assertEqual(parent_rollout_result["output_format_valid"], [True])
+            self.assertEqual(parent_rollout_result["output_has_final_answer_tag"], [True])
+            self.assertEqual(parent_rollout_result["output_has_go_summary_block"], [False])
+            self.assertEqual(parent_rollout_result["output_uses_alt_final_answer_close_tag"], [False])
+            self.assertEqual(parent_rollout_result["output_has_unclosed_final_answer_tag"], [False])
+            self.assertEqual(parent_rollout_result["output_has_repeated_final_answer_open_tag"], [False])
+            self.assertEqual(parent_rollout_result["output_has_tool_call_residue"], [False])
+            self.assertEqual(parent_rollout_result["output_has_think_residue"], [False])
+            self.assertEqual(parent_rollout_result["output_parsed_go_counts"], [1])
+            self.assertEqual(parent_rollout_result["output_format_summary"]["format_valid"]["true_count"], 1)
+            self.assertEqual(parent_rollout_result["output_format_summary"]["alt_final_answer_close_tag"]["true_count"], 0)
             self.assertEqual(tracker.weave_remaining_budget, args.weave_trace_budget - 1)
+            # Per-completion child op is emitted inside the parent rollout span.
+            rollout_item_payloads = [
+                payload for payload in fake_weave.trace_payloads if payload.get("stage") == "rollout_item"
+            ]
+            self.assertEqual(len(rollout_item_payloads), 1)
+            self.assertEqual(rollout_item_payloads[0]["rollout_idx"], 0)
+            self.assertEqual(rollout_item_payloads[0]["protein_id"], "P12345")
+            self.assertEqual(
+                rollout_item_payloads[0]["completion"],
+                "<|FINAL_ANSWER|>GO:0000001<|/FINAL_ANSWER|>",
+            )
+            self.assertEqual(rollout_item_payloads[0]["parsed_go_ids"], ["GO:0000001"])
 
     def test_trace_reward_call_uses_stage_specific_targets(self):
         fake_weave = FakeWeaveModule()
@@ -1321,6 +1341,20 @@ relationship: part_of GO:0000002 ! child
             self.assertEqual(fake_weave.trace_payloads[0]["target_go_ids"], ["GO:0000001"])
             self.assertEqual(fake_weave.trace_payloads[0]["completions"], ["<|FINAL_ANSWER|>GO:0000001<|/FINAL_ANSWER|>"])
             self.assertEqual(fake_weave.attribute_calls[0]["stage"], "reward")
+            # Per-completion reward child op is emitted inside the parent
+            # reward span, surfacing overlap/missed/extra GO ids for filtering.
+            reward_item_payloads = [
+                payload for payload in fake_weave.trace_payloads if payload.get("stage") == "reward_item"
+            ]
+            self.assertEqual(len(reward_item_payloads), 1)
+            self.assertEqual(reward_item_payloads[0]["rollout_idx"], 0)
+            self.assertEqual(reward_item_payloads[0]["reward"], 1.0)
+            self.assertEqual(reward_item_payloads[0]["protein_id"], "P12345")
+            self.assertEqual(reward_item_payloads[0]["target_go_ids"], ["GO:0000001"])
+            self.assertEqual(reward_item_payloads[0]["predicted_go_ids"], ["GO:0000001"])
+            self.assertEqual(reward_item_payloads[0]["overlap_go_ids"], ["GO:0000001"])
+            self.assertEqual(reward_item_payloads[0]["missed_go_ids"], [])
+            self.assertEqual(reward_item_payloads[0]["extra_go_ids"], [])
 
     def test_trace_policy_update_call_uses_stage_specific_op(self):
         fake_weave = FakeWeaveModule()
