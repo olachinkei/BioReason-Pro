@@ -2337,7 +2337,6 @@ class RunTracker:
             op_name="train_rl_step",
             inputs=inputs,
             attributes=attributes,
-            display_name=f"train_rl_step step={step}",
         ) as call:
             yield call
 
@@ -2363,7 +2362,6 @@ class RunTracker:
             op_name="train_rl_query",
             inputs=inputs,
             attributes=attributes,
-            display_name=f"train_rl_query step={step} protein={inputs['protein_id']}",
         ) as call:
             yield call
 
