@@ -184,6 +184,31 @@ def build_wandb_run_url(entity: str, project: str, run_id: str) -> str:
     return f"https://wandb.ai/{entity}/{project}/runs/{run_id}"
 
 
+def resolve_wandb_tags(args: Any) -> List[str]:
+    """Build the ordered, deduped list of W&B tags for this run.
+
+    Combines ``--ablation_tag`` (single value) and ``--wandb_tags`` (list),
+    normalizes whitespace, drops empties, and preserves first-seen order.
+    """
+    ordered: List[str] = []
+    seen: set = set()
+
+    def _push(candidate: Any) -> None:
+        text = normalize_text(candidate).strip()
+        if not text or text in seen:
+            return
+        seen.add(text)
+        ordered.append(text)
+
+    _push(getattr(args, "ablation_tag", None))
+    raw_tags = getattr(args, "wandb_tags", None) or []
+    if isinstance(raw_tags, str):
+        raw_tags = [raw_tags]
+    for tag in raw_tags:
+        _push(tag)
+    return ordered
+
+
 def paper_runtime_deviation_summary(
     algorithm: "AlgorithmSpec",
     runtime_spec: "RuntimeSpec",
@@ -483,6 +508,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--kl_beta", type=float, default=1e-4)
     parser.add_argument("--reward_std_epsilon", type=float, default=1e-6)
 
+    # --- Phase A ablation levers (2026-04-16-rl-tuning-proposal-disease-pilot.md) ---
+    # reward_mode selects the reward scoring function:
+    #   ia_f1           : current behavior, IA-weighted F1 after ancestor propagation (Phase A baseline / A0).
+    #   per_aspect_ia_f1: A.1, mean of IA-weighted F1 computed per GO aspect (BP/MF/CC).
+    #   per_aspect_lin  : A.2, A.1 with ancestor-set Jaccard partial credit (capped at 0.3) when
+    #                     propagated predicted ∩ target is empty.
+    parser.add_argument(
+        "--reward_mode",
+        type=str,
+        default="ia_f1",
+        choices=["ia_f1", "per_aspect_ia_f1", "per_aspect_lin"],
+    )
+    # A.3: per-trajectory loss scaling. Applied to any sample whose meta has
+    # ``is_disease_priority`` True (falls back to True when the flag is absent,
+    # which is the current state of the disease temporal dataset).
+    parser.add_argument("--disease_loss_weight", type=float, default=1.0)
+    # Partial-credit cap for reward_mode=per_aspect_lin. Bonus is clamped to
+    # [0, ``lin_partial_credit_cap``] so it can never beat a real F1 hit.
+    parser.add_argument("--lin_partial_credit_cap", type=float, default=0.3)
+
     parser.add_argument("--validation_num_proteins", type=int, default=200)
     parser.add_argument("--validation_every_n_steps", type=int, default=50)
     parser.add_argument("--save_every_n_steps", type=int, default=50)
@@ -494,6 +539,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wandb_project", type=str, default=os.environ.get("WANDB_PROJECT", "bioreasoning-pro"))
     parser.add_argument("--wandb_entity", type=str, default=None)
     parser.add_argument("--wandb_mode", type=str, default=None)
+    # Free-form name of the ablation this run belongs to (e.g. "phase-a-A1"). Attached
+    # as a W&B tag so users can filter runs in the UI.
+    parser.add_argument("--ablation_tag", type=str, default=None)
+    # Additional W&B tags. Combined with --ablation_tag (deduped).
+    parser.add_argument("--wandb_tags", type=str, nargs="*", default=None)
     parser.add_argument("--weave_project", type=str, default=None)
     parser.add_argument("--trace_rollouts_to_weave", type=str, default="true")
     parser.add_argument("--trace_jsonl_name", type=str, default="rollout_traces.jsonl")
@@ -1237,21 +1287,32 @@ def build_target_go_ids(sample_meta: Mapping[str, Any]) -> List[str]:
     return ordered
 
 
-def load_go_term_graph(go_obo_path: str) -> Dict[str, Tuple[str, ...]]:
-    if not go_obo_path or not os.path.exists(go_obo_path):
-        return {}
+def _parse_go_obo(go_obo_path: str) -> Tuple[Dict[str, List[str]], Dict[str, str]]:
+    """Parse GO OBO file, returning (parents_map, namespace_map).
+
+    ``namespace_map`` maps each non-obsolete GO ID to its aspect
+    (``biological_process`` / ``molecular_function`` / ``cellular_component``).
+    Used by the per-aspect reward modes (Phase A.1 / A.2).
+    """
     parents: Dict[str, List[str]] = {}
+    namespaces: Dict[str, str] = {}
+    if not go_obo_path or not os.path.exists(go_obo_path):
+        return parents, namespaces
     current_id = ""
     current_parents: List[str] = []
+    current_namespace = ""
     current_obsolete = False
     in_term = False
 
     def finalize() -> None:
-        nonlocal current_id, current_parents, current_obsolete
+        nonlocal current_id, current_parents, current_namespace, current_obsolete
         if current_id and not current_obsolete:
             parents[current_id] = list(dict.fromkeys(parent for parent in current_parents if parent))
+            if current_namespace:
+                namespaces[current_id] = current_namespace
         current_id = ""
         current_parents = []
+        current_namespace = ""
         current_obsolete = False
 
     with open(go_obo_path, "r", encoding="utf-8") as handle:
@@ -1269,6 +1330,8 @@ def load_go_term_graph(go_obo_path: str) -> Dict[str, Tuple[str, ...]]:
                 continue
             if line.startswith("id: "):
                 current_id = normalize_text(line.split(":", 1)[1]).strip()
+            elif line.startswith("namespace: "):
+                current_namespace = normalize_text(line.split(":", 1)[1]).strip()
             elif line.startswith("is_a: "):
                 parent = line.split("!", 1)[0].split()[1].strip()
                 if GO_ID_PATTERN.fullmatch(parent):
@@ -1280,7 +1343,25 @@ def load_go_term_graph(go_obo_path: str) -> Dict[str, Tuple[str, ...]]:
             elif line.startswith("is_obsolete: "):
                 current_obsolete = line.split(":", 1)[1].strip().lower() == "true"
     finalize()
+    return parents, namespaces
+
+
+def load_go_term_graph(go_obo_path: str) -> Dict[str, Tuple[str, ...]]:
+    parents, _ = _parse_go_obo(go_obo_path)
     return {key: tuple(value) for key, value in parents.items()}
+
+
+def load_go_term_aspects(go_obo_path: str) -> Dict[str, str]:
+    """Return ``go_id -> namespace`` (biological_process/molecular_function/cellular_component)."""
+    _, namespaces = _parse_go_obo(go_obo_path)
+    return namespaces
+
+
+GO_ASPECTS: Tuple[str, ...] = (
+    "biological_process",
+    "molecular_function",
+    "cellular_component",
+)
 
 
 def propagate_go_ids(go_ids: Iterable[str], graph: Mapping[str, Tuple[str, ...]]) -> List[str]:
@@ -1343,14 +1424,165 @@ def compute_weighted_f1(predicted: Iterable[str], target: Iterable[str], ia_weig
     return 2.0 * precision * recall / (precision + recall)
 
 
+def compute_per_aspect_weighted_f1(
+    predicted: Iterable[str],
+    target: Iterable[str],
+    ia_weights: Mapping[str, float],
+    go_aspects: Mapping[str, str],
+) -> float:
+    """Phase A.1: mean of IA-weighted F1 computed separately per GO aspect.
+
+    ``predicted`` and ``target`` must already be ancestor-propagated. Aspects
+    absent from the target set are skipped (no credit, no penalty). Returns 0.0
+    if none of BP/MF/CC are present in the target.
+    """
+    predicted_set = set(predicted)
+    target_set = set(target)
+    per_aspect_scores: List[float] = []
+    for aspect in GO_ASPECTS:
+        aspect_pred = {gid for gid in predicted_set if go_aspects.get(gid) == aspect}
+        aspect_target = {gid for gid in target_set if go_aspects.get(gid) == aspect}
+        if not aspect_target:
+            continue
+        per_aspect_scores.append(compute_weighted_f1(aspect_pred, aspect_target, ia_weights))
+    if not per_aspect_scores:
+        return 0.0
+    return sum(per_aspect_scores) / len(per_aspect_scores)
+
+
+def compute_ancestor_jaccard(predicted: Iterable[str], target: Iterable[str]) -> float:
+    """Jaccard similarity of two (propagated) GO term sets.
+
+    Coarse stand-in for Lin similarity when per-term IC values are not
+    available and only the union of propagated sets is known.
+    """
+    pred_set = set(predicted)
+    target_set = set(target)
+    union = pred_set | target_set
+    if not union:
+        return 0.0
+    return len(pred_set & target_set) / len(union)
+
+
+def compute_pairwise_lin_partial_credit(
+    raw_predicted: Iterable[str],
+    raw_target: Iterable[str],
+    *,
+    go_graph: Mapping[str, Tuple[str, ...]],
+    go_aspects: Mapping[str, str],
+) -> float:
+    """Phase A.2 Lin-similarity approximation.
+
+    For each raw predicted term, computes the *best* ancestor-set Jaccard
+    against any target term *in the same aspect*, then averages over
+    predicted terms that had a same-aspect target. This captures the
+    proposal's intent ("mean Lin similarity between each predicted term and
+    its nearest target term within the same aspect") while only requiring
+    the GO DAG — strict Lin would also need per-term IC values which are
+    not precomputed in-pipeline today (see §7 of the tuning proposal).
+    """
+    pred_terms = [gid for gid in raw_predicted if gid]
+    target_terms = [gid for gid in raw_target if gid]
+    if not pred_terms or not target_terms:
+        return 0.0
+    targets_by_aspect: Dict[str, List[str]] = {}
+    for t in target_terms:
+        aspect = go_aspects.get(t, "")
+        targets_by_aspect.setdefault(aspect, []).append(t)
+
+    ancestor_cache: Dict[str, set] = {}
+
+    def _ancestors(go_id: str) -> set:
+        cached = ancestor_cache.get(go_id)
+        if cached is not None:
+            return cached
+        if go_graph:
+            ancestors = set(propagate_go_ids([go_id], go_graph))
+        else:
+            ancestors = {go_id}
+        ancestor_cache[go_id] = ancestors
+        return ancestors
+
+    scores: List[float] = []
+    for pred in pred_terms:
+        pred_aspect = go_aspects.get(pred, "")
+        candidates = targets_by_aspect.get(pred_aspect, [])
+        if not candidates:
+            continue
+        pred_anc = _ancestors(pred)
+        best = 0.0
+        for t in candidates:
+            t_anc = _ancestors(t)
+            union = pred_anc | t_anc
+            if not union:
+                continue
+            jaccard = len(pred_anc & t_anc) / len(union)
+            if jaccard > best:
+                best = jaccard
+        scores.append(best)
+    if not scores:
+        return 0.0
+    return sum(scores) / len(scores)
+
+
+def compute_reward_with_mode(
+    propagated_predicted: Iterable[str],
+    propagated_target: Iterable[str],
+    *,
+    reward_mode: str,
+    ia_weights: Mapping[str, float],
+    go_aspects: Mapping[str, str],
+    lin_partial_credit_cap: float,
+    raw_predicted: Optional[Sequence[str]] = None,
+    raw_target: Optional[Sequence[str]] = None,
+    go_graph: Optional[Mapping[str, Tuple[str, ...]]] = None,
+) -> float:
+    """Dispatch to the right reward function for ``reward_mode``.
+
+    ``propagated_predicted`` / ``propagated_target`` are ancestor-propagated
+    GO id sets. ``raw_predicted`` / ``raw_target`` plus ``go_graph`` are
+    required for the ``per_aspect_lin`` partial-credit path; if any of those
+    are missing, Lin falls back to the propagated-set Jaccard.
+    """
+    propagated_pred_list = list(propagated_predicted)
+    propagated_target_list = list(propagated_target)
+    if reward_mode == "per_aspect_ia_f1":
+        return compute_per_aspect_weighted_f1(
+            propagated_pred_list, propagated_target_list, ia_weights, go_aspects
+        )
+    if reward_mode == "per_aspect_lin":
+        base = compute_per_aspect_weighted_f1(
+            propagated_pred_list, propagated_target_list, ia_weights, go_aspects
+        )
+        if base > 0.0:
+            return base
+        # Partial-credit branch: strict cap so it can never beat a real F1 hit.
+        if raw_predicted is not None and raw_target is not None and go_graph is not None:
+            bonus = compute_pairwise_lin_partial_credit(
+                raw_predicted,
+                raw_target,
+                go_graph=go_graph,
+                go_aspects=go_aspects,
+            )
+        else:
+            bonus = compute_ancestor_jaccard(propagated_pred_list, propagated_target_list)
+        return min(float(lin_partial_credit_cap), bonus)
+    return compute_weighted_f1(propagated_pred_list, propagated_target_list, ia_weights)
+
+
 def compute_group_rewards(
     completions: Sequence[str],
     sample_meta: Mapping[str, Any],
     go_graph: Mapping[str, Tuple[str, ...]],
     ia_weights: Mapping[str, float],
+    *,
+    reward_mode: str = "ia_f1",
+    go_aspects: Optional[Mapping[str, str]] = None,
+    lin_partial_credit_cap: float = 0.3,
 ) -> List[float]:
     target_go_ids = build_target_go_ids(sample_meta)
     propagated_target = propagate_go_ids(target_go_ids, go_graph) if go_graph else target_go_ids
+    aspect_map: Mapping[str, str] = go_aspects or {}
     rewards: List[float] = []
     for completion in completions:
         predicted_go_ids = extract_go_terms_from_completion(completion)
@@ -1358,8 +1590,43 @@ def compute_group_rewards(
             rewards.append(0.0)
             continue
         propagated_pred = propagate_go_ids(predicted_go_ids, go_graph) if go_graph else predicted_go_ids
-        rewards.append(compute_weighted_f1(propagated_pred, propagated_target, ia_weights))
+        rewards.append(
+            compute_reward_with_mode(
+                propagated_pred,
+                propagated_target,
+                reward_mode=reward_mode,
+                ia_weights=ia_weights,
+                go_aspects=aspect_map,
+                lin_partial_credit_cap=lin_partial_credit_cap,
+                raw_predicted=list(predicted_go_ids),
+                raw_target=list(target_go_ids),
+                go_graph=go_graph,
+            )
+        )
     return rewards
+
+
+def resolve_disease_loss_scale(sample_meta: Mapping[str, Any], disease_loss_weight: float) -> float:
+    """Return the per-trajectory loss multiplier for Phase A.3.
+
+    The multiplier is applied when ``sample_meta["is_disease_priority"]`` is
+    truthy. Under the current ``disease_temporal_hc_reasoning_v2`` dataset no
+    per-sample disease flag is surfaced, so the fallback is True — this
+    deliberately makes ``--disease_loss_weight > 1`` act as a uniform loss
+    scale. Once the data pipeline surfaces OMIM/DisGeNET membership, this
+    function becomes the single switch that turns A.3 on for real.
+    """
+    weight = float(disease_loss_weight)
+    if weight == 1.0:
+        return 1.0
+    flag = sample_meta.get("is_disease_priority")
+    if flag is None:
+        return weight
+    try:
+        is_priority = bool(flag)
+    except Exception:
+        is_priority = True
+    return weight if is_priority else 1.0
 
 
 def compute_global_reward_std(local_group_rewards: Sequence[Sequence[float]], runtime: DistributedRuntime, epsilon: float) -> float:
@@ -1686,6 +1953,9 @@ class RunTracker:
             "job_type": "train_rl",
             "dir": str(self.wandb_dir),
         }
+        resolved_tags = resolve_wandb_tags(self.args)
+        if resolved_tags:
+            init_kwargs["tags"] = resolved_tags
         if self.wandb_entity:
             init_kwargs["entity"] = self.wandb_entity
         if normalize_text(self.args.wandb_mode).strip():
@@ -2695,6 +2965,7 @@ def compute_chunk_loss(
     pad_token_id: int,
     device: Any,
     logprob_microbatch_size: int = 0,
+    loss_scale: float = 1.0,
 ) -> Tuple[Any, Dict[str, float]]:
     require_torch()
     current_log_probs = compute_sequence_log_probs(
@@ -2718,11 +2989,15 @@ def compute_chunk_loss(
         -(surrogate.sum() / algorithm.policy_denominator)
         + (float(algorithm.kl_beta) * kl.sum() / algorithm.kl_denominator)
     )
+    scale = float(loss_scale)
+    if scale != 1.0:
+        loss = loss * scale
     metrics = {
         "ratio_mean": float(ratios.detach().mean().item()),
         "ratio_max": float(ratios.detach().max().item()),
         "kl_mean": float(kl.detach().mean().item()),
         "policy_objective_mean": float(surrogate.detach().mean().item()),
+        "loss_scale": scale,
     }
     return loss, metrics
 
@@ -3210,6 +3485,10 @@ def evaluate_validation_subset(
     eval_spec: EvalSpec,
     runtime: DistributedRuntime,
     max_new_tokens: int,
+    *,
+    reward_mode: str = "ia_f1",
+    go_aspects: Optional[Mapping[str, str]] = None,
+    lin_partial_credit_cap: float = 0.3,
 ) -> Dict[str, float]:
     if runtime.rank != 0:
         return {}
@@ -3227,7 +3506,17 @@ def evaluate_validation_subset(
         batch = build_single_example_batch(validation_dataset[int(idx)], policy_model)
         query = extract_single_query(batch, policy_model, runtime.device)
         completions = policy_worker.generate_group(query, repeat_count=1, sampling=deterministic_sampling)
-        rewards.extend(compute_group_rewards(completions, query.sample_meta, go_graph, ia_weights))
+        rewards.extend(
+            compute_group_rewards(
+                completions,
+                query.sample_meta,
+                go_graph,
+                ia_weights,
+                reward_mode=reward_mode,
+                go_aspects=go_aspects,
+                lin_partial_credit_cap=lin_partial_credit_cap,
+            )
+        )
     return {
         "validation_reward_mean": mean_or_zero(rewards),
         "validation_reward_nonzero_rate": mean_or_zero([1.0 if reward > 0.0 else 0.0 for reward in rewards]),
@@ -3302,7 +3591,16 @@ def train(args: argparse.Namespace) -> None:
     rank0_print(runtime, "Initializing DeepSpeed policy stack.")
     policy_stack = initialize_policy_stack(args, runtime_spec, runtime)
     go_graph = load_go_term_graph(normalize_text(args.go_obo_path).strip())
+    go_aspects_map = load_go_term_aspects(normalize_text(args.go_obo_path).strip())
     ia_weights = load_ia_weights(normalize_text(args.ia_file_path).strip())
+    reward_mode = normalize_text(getattr(args, "reward_mode", "ia_f1")).strip() or "ia_f1"
+    lin_partial_credit_cap = float(getattr(args, "lin_partial_credit_cap", 0.3))
+    disease_loss_weight = float(getattr(args, "disease_loss_weight", 1.0))
+    if reward_mode != "ia_f1" and not go_aspects_map:
+        raise RuntimeError(
+            f"--reward_mode={reward_mode} requires a GO OBO with per-term namespace metadata; "
+            f"loaded 0 aspect entries from {args.go_obo_path!r}"
+        )
     tracker = RunTracker(
         args=args,
         config=build_tracking_config(args, algorithm, runtime_spec, runtime, run_name=run_name),
@@ -3375,6 +3673,9 @@ def train(args: argparse.Namespace) -> None:
                         current_query.sample_meta,
                         go_graph,
                         ia_weights,
+                        reward_mode=reward_mode,
+                        go_aspects=go_aspects_map,
+                        lin_partial_credit_cap=lin_partial_credit_cap,
                     ),
                 )
                 reward_seconds += time.perf_counter() - reward_started_at
@@ -3480,6 +3781,9 @@ def train(args: argparse.Namespace) -> None:
                             chunk_advantages = group.advantages[start_idx:end_idx]
                             chunk_old_log_probs = group.old_log_probs[start_idx:end_idx]
                             chunk_ref_log_probs = group.ref_log_probs[start_idx:end_idx]
+                            loss_scale = resolve_disease_loss_scale(
+                                group.query.sample_meta, disease_loss_weight
+                            )
                             loss, chunk_metrics = compute_chunk_loss(
                                 current_model=policy_stack.engine.module,
                                 query=group.query,
@@ -3491,6 +3795,7 @@ def train(args: argparse.Namespace) -> None:
                                 pad_token_id=policy_stack.pad_token_id,
                                 device=runtime.device,
                                 logprob_microbatch_size=int(args.rollout_logprob_microbatch_size),
+                                loss_scale=loss_scale,
                             )
                             policy_stack.engine.backward(loss)
                             policy_stack.engine.step()
@@ -3646,6 +3951,9 @@ def train(args: argparse.Namespace) -> None:
                     eval_spec=eval_spec,
                     runtime=runtime,
                     max_new_tokens=int(args.max_new_tokens),
+                    reward_mode=reward_mode,
+                    go_aspects=go_aspects_map,
+                    lin_partial_credit_cap=lin_partial_credit_cap,
                 )
                 validation_seconds = time.perf_counter() - validation_started_at
                 if validation_metrics:
