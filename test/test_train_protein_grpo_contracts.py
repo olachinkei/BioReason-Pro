@@ -141,6 +141,51 @@ class FakeWandbModule:
         self.define_metric_calls.append({"name": name, "kwargs": dict(kwargs)})
 
 
+class FakePipeConnection:
+    def __init__(self, *, poll_result: bool = True, response: dict[str, object] | None = None) -> None:
+        self.poll_result = poll_result
+        self.response = response or {"status": "ok"}
+        self.sent: list[dict[str, object]] = []
+        self.closed = False
+        self.poll_calls: list[float] = []
+
+    def poll(self, timeout: float) -> bool:
+        self.poll_calls.append(float(timeout))
+        return self.poll_result
+
+    def recv(self):
+        return dict(self.response)
+
+    def send(self, payload):
+        self.sent.append(dict(payload))
+
+    def close(self):
+        self.closed = True
+
+
+class FakeProcess:
+    def __init__(self, *, alive: bool = True, exitcode: int | None = None) -> None:
+        self._alive = alive
+        self.exitcode = exitcode
+        self.join_calls: list[float] = []
+        self.terminate_called = False
+        self.kill_called = False
+
+    def join(self, timeout: float | None = None) -> None:
+        self.join_calls.append(float(timeout or 0.0))
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+    def terminate(self) -> None:
+        self.terminate_called = True
+        self._alive = False
+
+    def kill(self) -> None:
+        self.kill_called = True
+        self._alive = False
+
+
 class TrainProteinGrpoContractsTest(unittest.TestCase):
     def test_policy_model_instantiation_uses_lazy_protein_encoder(self):
         source = SCRIPT_PATH.read_text(encoding="utf-8")
@@ -580,6 +625,70 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         start_mock.assert_called_once_with(Path("/tmp/current"))
         recv_mock.assert_called_once()
 
+    def test_rollout_worker_recv_response_times_out_when_pipe_never_replies(self):
+        worker = object.__new__(GRPO.VLLMRolloutWorker)
+        worker._connection = FakePipeConnection(poll_result=False)
+        worker._process = FakeProcess(alive=True, exitcode=None)
+
+        with self.assertRaises(TimeoutError):
+            worker._recv_response(timeout_s=1.5)
+
+    def test_rollout_worker_stop_subprocess_terminates_when_close_ack_times_out(self):
+        worker = object.__new__(GRPO.VLLMRolloutWorker)
+        worker.backend = "subprocess"
+        worker.args = types.SimpleNamespace(
+            rollout_worker_close_timeout_s=0.25,
+            rollout_worker_join_timeout_s=0.5,
+            rollout_worker_terminate_timeout_s=0.25,
+        )
+        worker.runtime = types.SimpleNamespace(rank=3)
+        connection = FakePipeConnection(poll_result=False)
+        process = FakeProcess(alive=True, exitcode=None)
+        worker._connection = connection
+        worker._process = process
+
+        worker._stop_subprocess()
+
+        self.assertEqual(connection.sent, [{"cmd": "close"}])
+        self.assertTrue(connection.closed)
+        self.assertTrue(process.terminate_called)
+        self.assertEqual(worker._connection, None)
+        self.assertEqual(worker._process, None)
+
+    def test_rollout_worker_generate_group_terminates_stuck_subprocess(self):
+        worker = object.__new__(GRPO.VLLMRolloutWorker)
+        worker.backend = "subprocess"
+        worker.args = types.SimpleNamespace(
+            seed=7,
+            rollout_worker_generate_timeout_s=0.5,
+        )
+        worker.runtime = types.SimpleNamespace(rank=4)
+        worker.checkpoint_dir = Path("/tmp/current")
+        worker._connection = FakePipeConnection(poll_result=False)
+        worker._process = FakeProcess(alive=True, exitcode=None)
+        worker._generation_counter = 0
+
+        with mock.patch.object(worker, "_stop_subprocess") as stop_mock, mock.patch.object(
+            GRPO, "build_rollout_query_payload", return_value={"query": "payload"}
+        ):
+            with self.assertRaisesRegex(RuntimeError, "generate timed out"):
+                worker.generate_group(
+                    query=GRPO.PreparedQuery(
+                        input_ids=None,
+                        attention_mask=None,
+                        protein_sequences=[],
+                        batch_idx_map=[],
+                        structure_coords=None,
+                        go_aspects=[],
+                        sample_meta={"protein_id": "P12345"},
+                        prompt_text="",
+                        multimodal_cache=None,
+                    ),
+                    repeat_count=12,
+                    sampling=GRPO.SamplingSpec(),
+                )
+        stop_mock.assert_called_once_with()
+
     def test_build_deepspeed_config_matches_spec_shape(self):
         args = GRPO.parse_args(["--text_model_name", "/tmp/demo-model"])
         runtime_spec = GRPO.build_runtime_spec(args)
@@ -590,6 +699,35 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertEqual(ds_config["gradient_clipping"], 1.0)
         self.assertEqual(ds_config["zero_optimization"]["stage"], 2)
         self.assertTrue(ds_config["bf16"]["enabled"])
+
+    def test_build_sampling_spec_prefers_rollout_override_when_present(self):
+        args = GRPO.parse_args(
+            [
+                "--text_model_name",
+                "/tmp/demo-model",
+                "--max_new_tokens",
+                "10000",
+                "--rollout_max_new_tokens",
+                "4096",
+            ]
+        )
+        sampling = GRPO.build_sampling_spec(args)
+        self.assertEqual(sampling.max_new_tokens, 4096)
+
+    def test_resolve_rollout_worker_vllm_port_is_rank_scoped(self):
+        args = GRPO.parse_args(
+            [
+                "--text_model_name",
+                "/tmp/demo-model",
+                "--rollout_worker_vllm_port_base",
+                "39000",
+                "--rollout_worker_vllm_port_stride",
+                "32",
+            ]
+        )
+        self.assertEqual(GRPO.resolve_rollout_worker_vllm_port(args, 0), 39000)
+        self.assertEqual(GRPO.resolve_rollout_worker_vllm_port(args, 1), 39032)
+        self.assertEqual(GRPO.resolve_rollout_worker_vllm_port(args, 15), 39480)
 
     def test_build_tracking_config_carries_required_spec_fields(self):
         args = GRPO.parse_args(["--text_model_name", "/tmp/demo-model"])

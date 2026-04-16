@@ -475,6 +475,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min_p", type=float, default=0.0)
     parser.add_argument("--repetition_penalty", type=float, default=1.0)
     parser.add_argument("--max_new_tokens", type=int, default=10_000)
+    parser.add_argument("--rollout_max_new_tokens", type=int, default=0)
     parser.add_argument("--max_loss_completion_tokens", type=int, default=0)
     parser.add_argument("--rollout_logprob_microbatch_size", type=int, default=4)
     parser.add_argument("--clip_epsilon_low", type=float, default=7e-4)
@@ -530,6 +531,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--rollout_backend", type=str, default="subprocess", choices=["subprocess", "inprocess"])
     parser.add_argument("--rollout_worker_start_method", type=str, default="spawn", choices=["spawn", "forkserver", "fork"])
+    parser.add_argument("--rollout_worker_generate_timeout_s", type=float, default=900.0)
+    parser.add_argument("--rollout_worker_vllm_port_base", type=int, default=39000)
+    parser.add_argument("--rollout_worker_vllm_port_stride", type=int, default=32)
+    parser.add_argument("--rollout_worker_vllm_host_ip", type=str, default="127.0.0.1")
 
     # DeepSpeed injects this flag into worker processes; accept it even though the
     # runtime primarily reads LOCAL_RANK from the environment.
@@ -583,13 +588,16 @@ def build_runtime_spec(args: argparse.Namespace) -> RuntimeSpec:
 
 
 def build_sampling_spec(args: argparse.Namespace) -> SamplingSpec:
+    rollout_max_new_tokens = int(getattr(args, "rollout_max_new_tokens", 0) or 0)
+    if rollout_max_new_tokens <= 0:
+        rollout_max_new_tokens = int(args.max_new_tokens)
     return SamplingSpec(
         temperature=float(args.temperature),
         top_k=int(args.top_k),
         top_p=float(args.top_p),
         min_p=float(args.min_p),
         repetition_penalty=float(args.repetition_penalty),
-        max_new_tokens=int(args.max_new_tokens),
+        max_new_tokens=rollout_max_new_tokens,
     )
 
 
@@ -920,6 +928,12 @@ def resolve_effective_vllm_max_num_seqs(args: argparse.Namespace) -> int:
         )
     local_rollouts = max(rollouts_per_query // query_parallel_degree, 1)
     return max(configured, local_rollouts)
+
+
+def resolve_rollout_worker_vllm_port(args: argparse.Namespace, runtime_rank: int) -> int:
+    base = max(int(getattr(args, "rollout_worker_vllm_port_base", 39000)), 1024)
+    stride = max(int(getattr(args, "rollout_worker_vllm_port_stride", 32)), 1)
+    return base + (max(int(runtime_rank), 0) * stride)
 
 
 def configure_query_parallel_runtime(runtime: DistributedRuntime, algorithm: AlgorithmSpec) -> None:
@@ -1490,6 +1504,7 @@ def build_tracking_config(
             "importance_sampling_cap": algorithm.importance_sampling_cap,
             "kl_beta": algorithm.kl_beta,
             "max_new_tokens": algorithm.max_new_tokens,
+            "rollout_max_new_tokens": int(getattr(args, "rollout_max_new_tokens", 0) or 0),
             "optimizer_micro_batch_size_per_gpu": runtime_spec.optimizer_micro_batch_size_per_gpu,
             "target_world_size": runtime_spec.target_world_size,
             "world_size": runtime.world_size,
@@ -1507,6 +1522,10 @@ def build_tracking_config(
             "vllm_cpu_offload_gb": float(args.vllm_cpu_offload_gb),
             "vllm_swap_space_gb": float(args.vllm_swap_space_gb),
             "vllm_enforce_eager": parse_bool(args.vllm_enforce_eager),
+            "rollout_worker_generate_timeout_s": float(getattr(args, "rollout_worker_generate_timeout_s", 900.0)),
+            "rollout_worker_vllm_port_base": int(getattr(args, "rollout_worker_vllm_port_base", 39000)),
+            "rollout_worker_vllm_port_stride": int(getattr(args, "rollout_worker_vllm_port_stride", 32)),
+            "rollout_worker_vllm_host_ip": normalize_text(getattr(args, "rollout_worker_vllm_host_ip", "127.0.0.1")).strip() or "127.0.0.1",
             "vllm_attention_backend": normalize_text(args.vllm_attention_backend).strip() or "<auto>",
             "vllm_worker_multiproc_method": normalize_text(args.vllm_worker_multiproc_method).strip() or "spawn",
             "vllm_use_v1": parse_bool(args.vllm_use_v1),
@@ -2933,7 +2952,20 @@ def rollout_worker_process_main(connection: Any, bootstrap: Mapping[str, Any]) -
         os.environ["WORLD_SIZE"] = "1"
 
         args = argparse.Namespace(**dict(bootstrap.get("args", {})))
+        runtime_rank = int(bootstrap.get("runtime_rank", 0))
         checkpoint_dir = Path(bootstrap["checkpoint_dir"])
+        vllm_port = resolve_rollout_worker_vllm_port(args, runtime_rank)
+        os.environ["VLLM_PORT"] = str(vllm_port)
+        vllm_host_ip = normalize_text(getattr(args, "rollout_worker_vllm_host_ip", "127.0.0.1")).strip() or "127.0.0.1"
+        os.environ["VLLM_HOST_IP"] = vllm_host_ip
+        print(
+            (
+                "[rollout-worker bootstrap] "
+                f"rank={runtime_rank} cuda={normalize_text(bootstrap.get('cuda_visible_device')).strip() or 'unknown'} "
+                f"VLLM_PORT={vllm_port} VLLM_HOST_IP={vllm_host_ip}"
+            ),
+            flush=True,
+        )
 
         def load_model(checkpoint_path: Path) -> Any:
             nonlocal model, sleeping
@@ -3031,9 +3063,17 @@ class VLLMRolloutWorker:
         if self.backend != "subprocess":
             self._load(checkpoint_dir)
 
-    def _recv_response(self, expected_status: str = "ok") -> Mapping[str, Any]:
+    def _recv_response(self, expected_status: str = "ok", timeout_s: Optional[float] = None) -> Mapping[str, Any]:
         if self._connection is None:
             raise RuntimeError("Rollout worker subprocess is not initialized.")
+        if timeout_s is not None:
+            poll = getattr(self._connection, "poll", None)
+            if callable(poll) and not poll(float(timeout_s)):
+                exitcode = self._process.exitcode if self._process is not None else None
+                raise TimeoutError(
+                    "Timed out waiting for rollout worker subprocess response "
+                    f"after {float(timeout_s):.1f}s (exitcode={exitcode})."
+                )
         try:
             response = self._connection.recv()
         except EOFError as exc:
@@ -3055,6 +3095,8 @@ class VLLMRolloutWorker:
             "checkpoint_dir": str(checkpoint_dir),
             "cuda_visible_device": resolve_local_cuda_visible_device(self.runtime.local_rank),
             "args": dict(vars(self.args)),
+            "runtime_rank": int(self.runtime.rank),
+            "runtime_local_rank": int(self.runtime.local_rank),
         }
         process = ctx.Process(
             target=rollout_worker_process_main,
@@ -3068,10 +3110,21 @@ class VLLMRolloutWorker:
         self._recv_response(expected_status="ready")
 
     def _stop_subprocess(self) -> None:
+        close_timeout_s = max(float(getattr(self.args, "rollout_worker_close_timeout_s", 10.0)), 0.0)
+        join_timeout_s = max(float(getattr(self.args, "rollout_worker_join_timeout_s", 10.0)), 0.0)
+        terminate_timeout_s = max(float(getattr(self.args, "rollout_worker_terminate_timeout_s", 5.0)), 0.0)
         if self._connection is not None:
             try:
                 self._connection.send({"cmd": "close"})
-                self._recv_response()
+                self._recv_response(timeout_s=close_timeout_s)
+            except TimeoutError:
+                rank_print(
+                    self.runtime,
+                    (
+                        "rollout worker close timed out; forcing subprocess termination "
+                        f"after {close_timeout_s:.1f}s"
+                    ),
+                )
             except Exception:
                 pass
             try:
@@ -3080,10 +3133,13 @@ class VLLMRolloutWorker:
                 pass
             self._connection = None
         if self._process is not None:
-            self._process.join(timeout=30.0)
+            self._process.join(timeout=join_timeout_s)
             if self._process.is_alive():
                 self._process.terminate()
-                self._process.join(timeout=10.0)
+                self._process.join(timeout=terminate_timeout_s)
+            if self._process.is_alive() and hasattr(self._process, "kill"):
+                self._process.kill()
+                self._process.join(timeout=terminate_timeout_s)
             self._process = None
 
     def unload(self) -> None:
@@ -3113,6 +3169,7 @@ class VLLMRolloutWorker:
         generation_seed = int(self.args.seed) + (int(self.runtime.rank) * 100003) + self._generation_counter
         self._generation_counter += 1
         if self.backend == "subprocess":
+            generate_timeout_s = max(float(getattr(self.args, "rollout_worker_generate_timeout_s", 900.0)), 0.0)
             if self._connection is None:
                 self._start_subprocess(self.checkpoint_dir)
             self._connection.send(
@@ -3124,7 +3181,22 @@ class VLLMRolloutWorker:
                     "seed": generation_seed,
                 }
             )
-            response = self._recv_response()
+            try:
+                response = self._recv_response(timeout_s=generate_timeout_s)
+            except TimeoutError as exc:
+                protein_id = normalize_text(query.sample_meta.get("protein_id", "")).strip() or "<unknown>"
+                rank_print(
+                    self.runtime,
+                    (
+                        "rollout worker generate timed out "
+                        f"(protein_id={protein_id}, repeat_count={int(repeat_count)}, timeout_s={generate_timeout_s:.1f})"
+                    ),
+                )
+                self._stop_subprocess()
+                raise RuntimeError(
+                    "Rollout worker generate timed out "
+                    f"after {generate_timeout_s:.1f}s for protein_id={protein_id}."
+                ) from exc
             return [normalize_text(output).strip() for output in response.get("outputs", [])]
         if self.model is None:
             self._load(self.checkpoint_dir)
@@ -3349,20 +3421,37 @@ def train(args: argparse.Namespace) -> None:
             local_groups: List[RolloutGroup] = []
             for query in local_queries:
                 rollout_started_at = time.perf_counter()
+                protein_id = normalize_text(query.sample_meta.get("protein_id", "")).strip() or "<unknown>"
+                local_repeat_count = resolve_local_rollouts_per_rank(algorithm, runtime.world_size)
+                rank_print(
+                    runtime,
+                    (
+                        f"step {step + 1}: starting rollout generation "
+                        f"(protein_id={protein_id}, local_repeat_count={local_repeat_count})"
+                    ),
+                )
                 completions = tracker.trace_rollout_call(
                     step=step + 1,
                     split="train",
                     query=query,
-                    repeat_count=resolve_local_rollouts_per_rank(algorithm, runtime.world_size),
+                    repeat_count=local_repeat_count,
                     sampling=sampling,
                     generator=lambda current_query=query: rollout_worker.generate_group(
                         current_query,
-                        resolve_local_rollouts_per_rank(algorithm, runtime.world_size),
+                        local_repeat_count,
                         sampling,
                     ),
                     tokenizer=policy_stack.tokenizer,
                 )
-                rollout_seconds += time.perf_counter() - rollout_started_at
+                rollout_duration = time.perf_counter() - rollout_started_at
+                rollout_seconds += rollout_duration
+                rank_print(
+                    runtime,
+                    (
+                        f"step {step + 1}: finished rollout generation "
+                        f"(protein_id={protein_id}, local_repeat_count={len(completions)}, duration_s={rollout_duration:.2f})"
+                    ),
+                )
                 completion_ids = tokenize_completion_texts(policy_stack.tokenizer, completions, runtime.device)
                 reward_started_at = time.perf_counter()
                 rewards = tracker.trace_reward_call(
@@ -3394,7 +3483,9 @@ def train(args: argparse.Namespace) -> None:
                     f"(local_queries={len(local_queries)}, local_rollouts={sum(len(group.completions) for group in local_groups)})"
                 ),
             )
+            rank_print(runtime, f"step {step + 1}: unloading rollout worker before reward reduction")
             rollout_worker.unload()
+            rank_print(runtime, f"step {step + 1}: rollout worker unload complete")
             global_reward_std = compute_global_reward_std(
                 [group.rewards for group in local_groups],
                 runtime=runtime,
