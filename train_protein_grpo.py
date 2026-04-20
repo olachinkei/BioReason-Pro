@@ -4453,7 +4453,7 @@ def train(args: argparse.Namespace) -> None:
         step loop to be reindented or refactored.
         """
 
-        for _step in range(int(args.max_steps)):
+        for _step in range(resume_start_step, int(args.max_steps)):
             with tracker.weave_step_span(
                 step=_step + 1,
                 queries_per_step=int(algorithm.queries_per_step),
