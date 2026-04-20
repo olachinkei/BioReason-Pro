@@ -709,17 +709,31 @@ class ProteinLLMModel(nn.Module):
             sampling_kwargs["min_p"] = generation_kwargs.get("min_p")
         if generation_kwargs.get("repetition_penalty") is not None:
             sampling_kwargs["repetition_penalty"] = generation_kwargs.get("repetition_penalty")
-        if generation_kwargs.get("seed") is not None:
-            sampling_kwargs["seed"] = int(generation_kwargs.get("seed"))
-        sampling_params = SamplingParams(**sampling_kwargs)
+
+        # Per-request SamplingParams so that rollouts in a group get DIFFERENT
+        # random streams. vLLM seeds a SamplingParams with the same seed for
+        # every prompt that shares it, which collapses a GRPO group (identical
+        # prompt_embeds repeated N times) to N identical completions. We
+        # stagger the seed per request index; if no seed is provided vLLM uses
+        # its own non-deterministic seeding which is also fine.
+        base_seed_raw = generation_kwargs.get("seed")
+        base_seed = int(base_seed_raw) if base_seed_raw is not None else None
+
+        sampling_params_list: List[SamplingParams] = []
+        for i in range(batch_size):
+            per_req_kwargs = dict(sampling_kwargs)
+            if base_seed is not None:
+                per_req_kwargs["seed"] = (base_seed + i) & 0xFFFFFFFF
+            sampling_params_list.append(SamplingParams(**per_req_kwargs))
 
         # Build requests for vLLM generation
         requests = []
         for i in range(batch_size):
             requests.append({"prompt_embeds": text_inputs_embeds[i]})
 
-        # Generate for the entire batch in one call
-        vllm_outputs = self.text_model.generate(requests, sampling_params=sampling_params)
+        # Generate for the entire batch in one call; vLLM accepts a
+        # list[SamplingParams] of length == len(requests) for per-prompt params.
+        vllm_outputs = self.text_model.generate(requests, sampling_params=sampling_params_list)
 
         # Extract the generated text from the output objects
         return [output.outputs[0].text for output in vllm_outputs]
