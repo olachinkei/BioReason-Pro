@@ -56,7 +56,6 @@ ROLLOUT_STOP_MARKERS = [
     "<|GO_SUMMARY_END|>",
     "<|im_end|>",
     "<|endoftext|>",
-    "</think>",
 ]
 FINAL_ANSWER_PATTERN = re.compile(
     r"<\|FINAL_ANSWER\|>\s*(.*?)\s*(?:<\|/FINAL_ANSWER\|>|</\|FINAL_ANSWER\|>)",
