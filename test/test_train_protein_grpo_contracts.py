@@ -962,6 +962,32 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
             sync_root = GRPO.resolve_sync_root(args, Path(tmpdir), args.execution_id)
             self.assertEqual(sync_root, Path(tmpdir).resolve() / "_run_sync" / "job-456")
 
+    def test_resolve_execution_id_prefers_env_for_shared_run_scope(self):
+        with mock.patch.dict(os.environ, {"EXECUTION_ID": "shared-run-123"}, clear=False):
+            args = GRPO.parse_args(["--text_model_name", "/tmp/demo-model"])
+            self.assertEqual(GRPO.resolve_execution_id(args), "shared-run-123")
+
+    def test_resolve_checkpoint_source_dir_falls_back_for_nonlocal_reference(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fallback = Path(tmpdir) / "bundle"
+            fallback.mkdir(parents=True, exist_ok=True)
+            resolved = GRPO.resolve_checkpoint_source_dir(
+                "wandb-healthcare/bioreason-pro/bioreason-pro-rl-paper:production",
+                fallback_dir=fallback,
+            )
+            self.assertEqual(resolved, fallback.resolve())
+
+    def test_resolve_warm_resume_state_prefers_local_text_model_for_nonlocal_base_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            text_model_dir = Path(tmpdir) / "materialized"
+            text_model_dir.mkdir(parents=True, exist_ok=True)
+            args = GRPO.parse_args(["--text_model_name", str(text_model_dir)])
+            args.base_checkpoint = "wandb-healthcare/bioreason-pro/bioreason-pro-rl-paper:production"
+            metadata = GRPO.resolve_warm_resume_state(args)
+            self.assertEqual(metadata, {})
+            self.assertEqual(args.reference_checkpoint_source, str(text_model_dir))
+            self.assertEqual(args.initial_rollout_checkpoint_source, str(text_model_dir))
+
     def test_resolve_warm_resume_state_rewires_export_checkpoint(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             checkpoint_root = Path(tmpdir) / "step-000005"
@@ -995,7 +1021,7 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
 
     def test_wrapper_mentions_execution_and_resume_flags(self):
         source = WRAPPER_PATH.read_text(encoding="utf-8")
-        self.assertIn('EXECUTION_ID=${EXECUTION_ID:-""}', source)
+        self.assertIn('EXECUTION_ID=${EXECUTION_ID:-"${SLURM_JOB_ID:-local}-$(date -u +%Y%m%d%H%M%S)"}', source)
         self.assertIn('SYNC_ROOT=${SYNC_ROOT:-""}', source)
         self.assertIn('RESUME_FROM_EXPORT_ARTIFACT=${RESUME_FROM_EXPORT_ARTIFACT:-""}', source)
         self.assertIn('RESUME_MODE=${RESUME_MODE:-warm}', source)

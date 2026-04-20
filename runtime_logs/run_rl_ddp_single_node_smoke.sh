@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd ~/BioReason-Pro
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "$REPO_ROOT"
 
 if [ -f .env ]; then
   set -a
@@ -29,11 +31,11 @@ export WEAVE_PROJECT="${WEAVE_PROJECT:-${WANDB_ENTITY}/${BASE_WANDB_PROJECT}}"
 
 export DATA_BUNDLE=main_production
 export TRAIN_PARTITION=h100
-export TRAIN_NUM_GPUS=8
-export TRAIN_CPUS_PER_TASK=96
-export TRAIN_MEM=512G
-export TRAIN_TIME_LIMIT=01:30:00
-export TRAIN_JOB_NAME=bioreason-rl-ddp-smoke
+export TRAIN_NUM_GPUS="${TRAIN_NUM_GPUS:-8}"
+export TRAIN_CPUS_PER_TASK="${TRAIN_CPUS_PER_TASK:-96}"
+export TRAIN_MEM="${TRAIN_MEM:-512G}"
+export TRAIN_TIME_LIMIT="${TRAIN_TIME_LIMIT:-01:30:00}"
+export TRAIN_JOB_NAME="${TRAIN_JOB_NAME:-bioreason-rl-ddp-smoke}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,max_split_size_mb:512}"
 export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
 export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
@@ -46,7 +48,7 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$TRAIN_CPUS_PER_TASK}"
 export WANDB_RUN_NAME="${WANDB_RUN_NAME:-rl-ddp-smoke-${TS}}"
 export CHECKPOINT_ARTIFACT_NAME="${CHECKPOINT_ARTIFACT_NAME:-train-rl-output-ddp-smoke-${TS}}"
 
-export BASE_CHECKPOINT_LOCAL_DIR="${BASE_CHECKPOINT_LOCAL_DIR:-$HOME/BioReason-Pro/data/artifacts/models/train_sft_output}"
+export BASE_CHECKPOINT_LOCAL_DIR="${BASE_CHECKPOINT_LOCAL_DIR:-}"
 export IA_FILE_PATH="${IA_FILE_PATH:-data/artifacts/benchmarks/213_221_225_228/temporal_split/IA.txt}"
 export REQUIRE_IA_FILE=True
 

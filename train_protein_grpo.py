@@ -274,7 +274,12 @@ def resolve_execution_id(args: Any) -> str:
     configured = normalize_text(getattr(args, "execution_id", None)).strip()
     if configured:
         return normalize_text(configured).strip().replace(os.sep, "-")
+    inherited = normalize_text(os.environ.get("EXECUTION_ID")).strip()
+    if inherited:
+        return normalize_text(inherited).strip().replace(os.sep, "-")
     slurm_job_id = normalize_text(os.environ.get("SLURM_JOB_ID")).strip() or "local"
+    if slurm_job_id != "local":
+        return slurm_job_id
     timestamp = time.strftime("%Y%m%d%H%M%S", time.gmtime())
     nonce = f"{os.getpid():05d}"
     return f"{slurm_job_id}-{timestamp}-{nonce}"
@@ -2850,6 +2855,21 @@ def resolve_checkpoint_dir(value: Any) -> Path:
     return checkpoint_dir.resolve()
 
 
+def resolve_checkpoint_source_dir(
+    value: Any,
+    *,
+    fallback_dir: Path,
+) -> Path:
+    raw_value = normalize_text(value).strip()
+    if raw_value:
+        candidate = Path(raw_value).expanduser()
+        if candidate.exists():
+            return candidate.resolve()
+        if is_probably_local_path(raw_value):
+            raise FileNotFoundError(f"Checkpoint source path does not exist: {candidate}")
+    return fallback_dir.resolve()
+
+
 def resolve_resume_checkpoint_root(value: Any) -> Path:
     raw_value = normalize_text(value).strip()
     if not raw_value:
@@ -2873,7 +2893,11 @@ def resolve_warm_resume_state(args: argparse.Namespace) -> Dict[str, Any]:
         args.resume_from_export_artifact = ""
         args.resume_parent_execution_id = ""
         args.resume_start_step = 0
-        args.reference_checkpoint_source = normalize_text(getattr(args, "base_checkpoint", None)).strip() or normalize_text(args.text_model_name).strip()
+        base_checkpoint = normalize_text(getattr(args, "base_checkpoint", None)).strip()
+        if base_checkpoint and is_probably_local_path(base_checkpoint) and Path(base_checkpoint).expanduser().exists():
+            args.reference_checkpoint_source = str(Path(base_checkpoint).expanduser().resolve())
+        else:
+            args.reference_checkpoint_source = normalize_text(args.text_model_name).strip()
         args.initial_rollout_checkpoint_source = normalize_text(args.text_model_name).strip()
         return {}
 
@@ -2954,8 +2978,14 @@ def initialize_policy_stack(
         engine=engine,
         tokenizer=tokenizer,
         pad_token_id=int(pad_token_id),
-        reference_checkpoint_dir=resolve_checkpoint_dir(reference_checkpoint_source),
-        rollout_checkpoint_dir=resolve_checkpoint_dir(initial_rollout_checkpoint_source),
+        reference_checkpoint_dir=resolve_checkpoint_source_dir(
+            reference_checkpoint_source,
+            fallback_dir=base_checkpoint_dir,
+        ),
+        rollout_checkpoint_dir=resolve_checkpoint_source_dir(
+            initial_rollout_checkpoint_source,
+            fallback_dir=base_checkpoint_dir,
+        ),
     )
 
 
