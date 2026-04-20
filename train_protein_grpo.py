@@ -28,7 +28,7 @@ import re
 import shutil
 import time
 import traceback
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -2176,6 +2176,8 @@ class RunTracker:
         self.weave_reward_trace_fn = None
         self.weave_scoring_trace_fn = None
         self.weave_update_trace_fn = None
+        self.weave_rollout_item_fn = None
+        self.weave_reward_item_fn = None
         self._weave_stage_callbacks: Dict[str, Any] = {}
         self.wandb_entity = ""
         self.wandb_project = ""
@@ -2373,9 +2375,87 @@ class RunTracker:
                     raise RuntimeError(f"Weave stage tracing expected an active callback for stage={stage_name!r}.")
                 return callback()
 
+            @weave.op(name="train_rl_rollout_item")
+            def trace_rollout_item(payload: Dict[str, Any]) -> Dict[str, Any]:
+                # Per-completion child span. Keeps the parent rollout op a
+                # concise summary while making each individual rollout visible
+                # as its own node in the Weave call tree (filterable by
+                # protein_id, rollout_idx, parsed GO ids, format flags, etc.).
+                return dict(payload)
+
+            @weave.op(name="train_rl_reward_item")
+            def trace_reward_item(payload: Dict[str, Any]) -> Dict[str, Any]:
+                # Per-completion child span for reward scoring: surfaces the
+                # target vs. predicted GO ids and the scalar reward as an
+                # individual tree node so each rollout's reward is inspectable.
+                return dict(payload)
+
+            def _emit_rollout_item_children(
+                base_payload: Dict[str, Any],
+                rollout_result: Mapping[str, Any],
+            ) -> None:
+                outputs = list(rollout_result.get("outputs", []) or [])
+                token_lengths = list(rollout_result.get("output_token_lengths", []) or [])
+                char_lengths = list(rollout_result.get("output_char_lengths", []) or [])
+                word_lengths = list(rollout_result.get("output_word_lengths", []) or [])
+                parsed_go_counts = list(rollout_result.get("output_parsed_go_counts", []) or [])
+                format_valid_flags = list(rollout_result.get("output_format_valid", []) or [])
+                final_answer_flags = list(rollout_result.get("output_has_final_answer_tag", []) or [])
+                go_summary_flags = list(rollout_result.get("output_has_go_summary_block", []) or [])
+                for idx, completion in enumerate(outputs):
+                    format_summary = build_completion_format_summary(completion)
+                    item_payload: Dict[str, Any] = {
+                        "run_name": base_payload.get("run_name"),
+                        "job_type": "train_rl",
+                        "stage": "rollout_item",
+                        "step": base_payload.get("step"),
+                        "rank": base_payload.get("rank"),
+                        "split": base_payload.get("split"),
+                        "protein_id": base_payload.get("protein_id"),
+                        "rollout_idx": idx,
+                        "completion": completion,
+                        "parsed_go_ids": list(format_summary.get("parsed_go_ids", [])),
+                        "parsed_go_count": int(
+                            parsed_go_counts[idx]
+                            if idx < len(parsed_go_counts)
+                            else format_summary.get("parsed_go_count", 0)
+                        ),
+                        "char_count": int(
+                            char_lengths[idx] if idx < len(char_lengths) else len(completion)
+                        ),
+                        "word_count": int(
+                            word_lengths[idx] if idx < len(word_lengths) else len(completion.split())
+                        ),
+                        "format_valid": bool(
+                            format_valid_flags[idx]
+                            if idx < len(format_valid_flags)
+                            else format_summary.get("format_valid", False)
+                        ),
+                        "has_final_answer_tag": bool(
+                            final_answer_flags[idx]
+                            if idx < len(final_answer_flags)
+                            else format_summary.get("has_final_answer_tag", False)
+                        ),
+                        "has_go_summary_block": bool(
+                            go_summary_flags[idx]
+                            if idx < len(go_summary_flags)
+                            else format_summary.get("has_go_summary_block", False)
+                        ),
+                    }
+                    if idx < len(token_lengths):
+                        item_payload["token_count"] = int(token_lengths[idx])
+                    try:
+                        trace_rollout_item(item_payload)
+                    except Exception as emit_exc:  # never let tracing break training
+                        print(f"⚠️  Weave rollout-item trace failed: {emit_exc}", flush=True)
+
             @weave.op(name="train_rl_rollout_generate")
             def trace_generation(payload: Dict[str, Any]) -> Dict[str, Any]:
                 rollout_result = dict(invoke_stage("rollout") or {})
+                # Emit one child op per completion so the Weave trace reflects
+                # the actual per-rollout structure instead of collapsing the
+                # group into a single flat node.
+                _emit_rollout_item_children(dict(payload), rollout_result)
                 return {
                     "run_name": payload.get("run_name"),
                     "job_type": "train_rl",
@@ -2393,6 +2473,40 @@ class RunTracker:
             @weave.op(name="train_rl_reward_score")
             def trace_reward(payload: Dict[str, Any]) -> Dict[str, Any]:
                 rewards = [float(item) for item in invoke_stage("reward")]
+                completions = list(payload.get("completions") or [])
+                target_go_ids = list(payload.get("target_go_ids") or [])
+                for idx, completion in enumerate(completions):
+                    format_summary = build_completion_format_summary(completion)
+                    predicted_go_ids = list(format_summary.get("parsed_go_ids", []))
+                    target_set = set(target_go_ids)
+                    predicted_set = set(predicted_go_ids)
+                    overlap = sorted(target_set & predicted_set)
+                    missed = sorted(target_set - predicted_set)
+                    extra = sorted(predicted_set - target_set)
+                    item_payload: Dict[str, Any] = {
+                        "run_name": payload.get("run_name"),
+                        "job_type": "train_rl",
+                        "stage": "reward_item",
+                        "step": payload.get("step"),
+                        "rank": payload.get("rank"),
+                        "split": payload.get("split"),
+                        "protein_id": payload.get("protein_id"),
+                        "rollout_idx": idx,
+                        "reward": float(rewards[idx]) if idx < len(rewards) else 0.0,
+                        "target_go_ids": target_go_ids,
+                        "predicted_go_ids": predicted_go_ids,
+                        "overlap_go_ids": overlap,
+                        "missed_go_ids": missed,
+                        "extra_go_ids": extra,
+                        "target_count": len(target_set),
+                        "predicted_count": len(predicted_set),
+                        "overlap_count": len(overlap),
+                        "format_valid": bool(format_summary.get("format_valid", False)),
+                    }
+                    try:
+                        trace_reward_item(item_payload)
+                    except Exception as emit_exc:
+                        print(f"⚠️  Weave reward-item trace failed: {emit_exc}", flush=True)
                 return {
                     "run_name": payload.get("run_name"),
                     "job_type": "train_rl",
@@ -2401,9 +2515,13 @@ class RunTracker:
                     "rank": payload.get("rank"),
                     "split": payload.get("split"),
                     "protein_id": payload.get("protein_id"),
-                    "target_go_ids": list(payload.get("target_go_ids") or []),
-                    "completions": list(payload.get("completions") or []),
+                    "target_go_ids": target_go_ids,
+                    "completions": completions,
                     "rewards": rewards,
+                    "reward_mean": (sum(rewards) / len(rewards)) if rewards else 0.0,
+                    "reward_max": max(rewards) if rewards else 0.0,
+                    "reward_min": min(rewards) if rewards else 0.0,
+                    "reward_nonzero_count": sum(1 for r in rewards if r > 0.0),
                 }
 
             @weave.op(name="train_rl_old_ref_score")
@@ -2436,6 +2554,8 @@ class RunTracker:
             self.weave_reward_trace_fn = trace_reward
             self.weave_scoring_trace_fn = trace_scoring
             self.weave_update_trace_fn = trace_update
+            self.weave_rollout_item_fn = trace_rollout_item
+            self.weave_reward_item_fn = trace_reward_item
             return trace_generation
         except Exception as exc:
             print(f"⚠️  Weave init failed for RL tracing: {exc}")
@@ -2669,6 +2789,125 @@ class RunTracker:
             ),
         )
         return dict(result or {})
+
+    @contextmanager
+    def weave_span(
+        self,
+        *,
+        op_name: str,
+        inputs: Mapping[str, Any],
+        attributes: Optional[Mapping[str, Any]] = None,
+        display_name: Optional[str] = None,
+    ):
+        """Wrap a block of training code in a Weave parent call.
+
+        Uses the low-level WeaveClient API so that all nested ``@weave.op``
+        calls (rollout, reward, scoring, policy update, and their
+        per-completion children) automatically attach as children of this
+        span in Weave's call tree.
+        """
+
+        if self.weave_client is None or self.runtime.rank != 0:
+            yield None
+            return
+        create_call = getattr(self.weave_client, "create_call", None)
+        finish_call = getattr(self.weave_client, "finish_call", None)
+        fail_call = getattr(self.weave_client, "fail_call", None)
+        if not callable(create_call) or not callable(finish_call):
+            yield None
+            return
+        weave_attributes = getattr(weave, "attributes", None)
+        attribute_context = (
+            weave_attributes(dict(attributes)) if callable(weave_attributes) and attributes else nullcontext()
+        )
+        try:
+            call = create_call(
+                op=op_name,
+                inputs=dict(inputs),
+                attributes=dict(attributes) if attributes else None,
+                display_name=display_name,
+            )
+        except Exception as exc:
+            print(f"⚠️  Weave span create_call({op_name}) failed: {exc}", flush=True)
+            yield None
+            return
+        try:
+            with attribute_context:
+                yield call
+            try:
+                finish_call(call, output={"ok": True})
+            except Exception as exc:
+                print(f"⚠️  Weave span finish_call({op_name}) failed: {exc}", flush=True)
+        except BaseException as exc:
+            if callable(fail_call):
+                try:
+                    fail_call(call, exc)
+                except Exception as fail_exc:
+                    print(f"⚠️  Weave span fail_call({op_name}) failed: {fail_exc}", flush=True)
+            else:
+                try:
+                    finish_call(call, output=None, exception=exc)
+                except Exception as finish_exc:
+                    print(f"⚠️  Weave span finish_call({op_name}) on error failed: {finish_exc}", flush=True)
+            raise
+
+    @contextmanager
+    def weave_step_span(self, *, step: int, queries_per_step: int, rollouts_per_query: int):
+        inputs = {
+            "run_name": normalize_text(self.args.run_name).strip() or "<auto>",
+            "job_type": "train_rl",
+            "stage": "step",
+            "step": int(step),
+            "rank": int(self.runtime.rank),
+            "world_size": int(self.runtime.world_size),
+            "queries_per_step": int(queries_per_step),
+            "rollouts_per_query": int(rollouts_per_query),
+            "reasoning_prompt_style": normalize_text(
+                getattr(self.args, "reasoning_prompt_style", None)
+            ).strip()
+            or "paper_native_tight",
+            "selected_weave_prompt_ref": self.selected_weave_prompt_ref,
+        }
+        attributes = {
+            "job_type": "train_rl",
+            "stage": "step",
+            "step": int(step),
+            "rank": int(self.runtime.rank),
+            "run_name": inputs["run_name"],
+            "reasoning_prompt_style": inputs["reasoning_prompt_style"],
+            "selected_weave_prompt_ref": inputs["selected_weave_prompt_ref"],
+        }
+        with self.weave_span(
+            op_name="train_rl_step",
+            inputs=inputs,
+            attributes=attributes,
+        ) as call:
+            yield call
+
+    @contextmanager
+    def weave_query_span(self, *, step: int, split: str, protein_id: str, rollouts_per_query: int):
+        inputs = {
+            "run_name": normalize_text(self.args.run_name).strip() or "<auto>",
+            "job_type": "train_rl",
+            "stage": "query",
+            "step": int(step),
+            "rank": int(self.runtime.rank),
+            "split": normalize_text(split).strip() or "train",
+            "protein_id": normalize_text(protein_id).strip(),
+            "rollouts_per_query": int(rollouts_per_query),
+        }
+        attributes = self._build_weave_attributes(
+            stage="query",
+            step=step,
+            split=split,
+            protein_id=protein_id,
+        )
+        with self.weave_span(
+            op_name="train_rl_query",
+            inputs=inputs,
+            attributes=attributes,
+        ) as call:
+            yield call
 
     def log_rollout_trace(self, payload: Mapping[str, Any], trace_to_weave: bool = True) -> None:
         payload_dict = dict(payload)
@@ -4204,8 +4443,41 @@ def train(args: argparse.Namespace) -> None:
     rank0_print(runtime, "Initializing the vLLM rollout worker from the canonical base checkpoint.")
     rollout_worker = VLLMRolloutWorker(args, policy_stack.rollout_checkpoint_dir, runtime)
 
+    def _iterate_steps_with_weave_span() -> Iterable[int]:
+        """Yield each training step inside a ``train_rl_step`` Weave parent span.
+
+        Using a generator with ``yield`` nested inside the ``with`` block means
+        every nested ``@weave.op`` call (rollout, reward, scoring, policy update
+        and their per-rollout/per-reward children) automatically attaches to
+        this parent in the Weave call tree — without requiring the body of the
+        step loop to be reindented or refactored.
+        """
+
+        for _step in range(int(args.max_steps)):
+            with tracker.weave_step_span(
+                step=_step + 1,
+                queries_per_step=int(algorithm.queries_per_step),
+                rollouts_per_query=int(algorithm.rollouts_per_query),
+            ):
+                yield _step
+
+    def _iterate_queries_with_weave_span(
+        step_index: int, queries: Sequence["PreparedQuery"]
+    ) -> Iterable["PreparedQuery"]:
+        """Yield each local query inside a ``train_rl_query`` parent span."""
+
+        for _query in queries:
+            protein_id = normalize_text(_query.sample_meta.get("protein_id", "")).strip()
+            with tracker.weave_query_span(
+                step=step_index + 1,
+                split="train",
+                protein_id=protein_id,
+                rollouts_per_query=int(algorithm.rollouts_per_query),
+            ):
+                yield _query
+
     try:
-        for step in range(resume_start_step, int(args.max_steps)):
+        for step in _iterate_steps_with_weave_span():
             step_started_at = time.perf_counter()
             rollout_seconds = 0.0
             reward_seconds = 0.0
@@ -4242,7 +4514,7 @@ def train(args: argparse.Namespace) -> None:
                 )
 
             local_groups: List[RolloutGroup] = []
-            for query in local_queries:
+            for query in _iterate_queries_with_weave_span(step, local_queries):
                 rollout_started_at = time.perf_counter()
                 protein_id = normalize_text(query.sample_meta.get("protein_id", "")).strip() or "<unknown>"
                 local_repeat_count = resolve_local_rollouts_per_rank(algorithm, runtime.world_size)
