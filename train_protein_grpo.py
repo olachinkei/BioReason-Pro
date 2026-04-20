@@ -87,6 +87,16 @@ def normalize_text(value: Any) -> str:
     return str(value)
 
 
+def default_runtime_root() -> Path:
+    configured = normalize_text(os.getenv("BIOREASON_RUNTIME_ROOT")).strip()
+    if configured:
+        return Path(configured).expanduser()
+    user = normalize_text(os.getenv("USER")).strip()
+    if user and Path("/mnt/data").exists():
+        return Path("/mnt/data") / user / "BioReason-Pro"
+    return Path.cwd()
+
+
 def normalize_path_value(value: Any) -> str:
     if value is None:
         return ""
@@ -558,7 +568,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save_every_n_steps", type=int, default=50)
     parser.add_argument("--checkpoint_export_only", type=str, default="false")
 
-    parser.add_argument("--output_dir", type=str, default="data/artifacts/models/train_rl_output")
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=str(default_runtime_root() / "data" / "artifacts" / "models" / "train_rl_output"),
+    )
     parser.add_argument("--checkpoint_artifact_name", type=str, default="train-rl-output")
     parser.add_argument("--checkpoint_artifact_aliases", type=str, default="latest")
     parser.add_argument("--execution_id", type=str, default=None)

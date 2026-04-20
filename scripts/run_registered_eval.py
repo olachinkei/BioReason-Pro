@@ -34,16 +34,29 @@ from bioreason2.utils.research_registry import (
     materialize_first_available_source,
     normalize_text,
 )
+def _default_runtime_root() -> Path:
+    configured = os.getenv("BIOREASON_RUNTIME_ROOT")
+    if configured:
+        return Path(configured).expanduser()
+    user = os.getenv("USER", "").strip()
+    if user and Path("/mnt/data").exists():
+        return Path("/mnt/data") / user / "BioReason-Pro"
+    return ROOT
+
+
+DEFAULT_RUNTIME_ROOT = _default_runtime_root()
+DEFAULT_ARTIFACTS_ROOT = DEFAULT_RUNTIME_ROOT / "data" / "artifacts"
+DEFAULT_CACHE_ROOT = DEFAULT_RUNTIME_ROOT / "cache"
 DEFAULT_DATA_REGISTRY = "configs/disease_benchmark/data_registry.json"
 DEFAULT_TARGET_REGISTRY = "configs/disease_benchmark/eval_target_registry.json"
 DEFAULT_GO_OBO_PATH = str((ROOT / "bioreason2" / "dataset" / "go-basic.obo").resolve())
 DEFAULT_STRUCTURE_DIR = str((ROOT / "data" / "structures").resolve())
-DEFAULT_EVAL_OUTPUT_ROOT = "data/artifacts/eval"
-DEFAULT_DATASET_CACHE_DIR = "data/artifacts/hf_cache"
+DEFAULT_EVAL_OUTPUT_ROOT = str(DEFAULT_ARTIFACTS_ROOT / "eval")
+DEFAULT_DATASET_CACHE_DIR = str(DEFAULT_ARTIFACTS_ROOT / "hf_cache")
 DEFAULT_REGISTRY_ENV_FILE = "configs/disease_benchmark/wandb_registry_paths.env"
-DEFAULT_MODEL_CACHE_DIR = "data/artifacts/cache/hf_models"
-DEFAULT_PAPER_MODEL_LOCAL_DIR = "data/artifacts/models/bioreason_pro_rl_paper"
-DEFAULT_TRAIN_SFT_HF_DIR = "data/artifacts/models/train_sft_output_hf"
+DEFAULT_MODEL_CACHE_DIR = str(DEFAULT_CACHE_ROOT / "hf_models")
+DEFAULT_PAPER_MODEL_LOCAL_DIR = str(DEFAULT_ARTIFACTS_ROOT / "models" / "bioreason_pro_rl_paper")
+DEFAULT_TRAIN_SFT_HF_DIR = str(DEFAULT_ARTIFACTS_ROOT / "models" / "train_sft_output_hf")
 SFT_TO_HF_CONVERTER = str((ROOT / "bioreason2" / "utils" / "save_unsloth_ckpt.py").resolve())
 
 SAMPLE_TABLE_COLUMNS = [

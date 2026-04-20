@@ -104,6 +104,11 @@ def resolve_repo_path(path_value: str, repo_root: Path) -> str:
     expanded = Path(expand_placeholders(path_value))
     if expanded.is_absolute():
         return str(expanded)
+    runtime_root = normalize_text(os.getenv("BIOREASON_RUNTIME_ROOT")).strip()
+    if runtime_root:
+        parts = expanded.parts
+        if len(parts) >= 2 and parts[0] == "data" and parts[1] == "artifacts":
+            return str((Path(runtime_root).expanduser() / expanded).resolve())
     return str((repo_root / expanded).resolve())
 
 

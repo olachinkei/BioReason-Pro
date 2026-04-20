@@ -9,6 +9,18 @@ if [ -z "$PROJECT_ROOT" ]; then
 fi
 cd "$PROJECT_ROOT"
 
+default_runtime_root() {
+  if [ -n "${BIOREASON_RUNTIME_ROOT:-}" ]; then
+    printf '%s\n' "$BIOREASON_RUNTIME_ROOT"
+    return 0
+  fi
+  if [ -d "/mnt/data" ] && [ -n "${USER:-}" ]; then
+    printf '/mnt/data/%s/BioReason-Pro\n' "$USER"
+    return 0
+  fi
+  printf '%s\n' "$PROJECT_ROOT"
+}
+
 if [ -f .env ]; then
   set -a
   source .env
@@ -22,6 +34,16 @@ if [ -f configs/disease_benchmark/wandb_registry_paths.env ]; then
 fi
 
 source "$PROJECT_ROOT/.venv-gpu/bin/activate"
+
+export BIOREASON_RUNTIME_ROOT="${BIOREASON_RUNTIME_ROOT:-$(default_runtime_root)}"
+export BIOREASON_ARTIFACTS_ROOT="${BIOREASON_ARTIFACTS_ROOT:-${BIOREASON_RUNTIME_ROOT}/data/artifacts}"
+export BIOREASON_CACHE_ROOT="${BIOREASON_CACHE_ROOT:-${BIOREASON_RUNTIME_ROOT}/cache}"
+export WANDB_DIR="${WANDB_DIR:-${BIOREASON_RUNTIME_ROOT}/wandb}"
+export WEAVE_SERVER_CACHE_DIR="${WEAVE_SERVER_CACHE_DIR:-${WANDB_DIR}/weave_server_cache}"
+export HF_HOME="${HF_HOME:-${BIOREASON_CACHE_ROOT}/huggingface}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}/transformers}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
+mkdir -p "$BIOREASON_ARTIFACTS_ROOT" "$BIOREASON_CACHE_ROOT" "$WANDB_DIR" "$WEAVE_SERVER_CACHE_DIR" "$TRANSFORMERS_CACHE" "$HF_DATASETS_CACHE"
 
 export WANDB_ENTITY="${WANDB_ENTITY:-wandb-healthcare}"
 export WANDB_PROJECT="${WANDB_PROJECT:-bioreason-pro}"
@@ -37,7 +59,7 @@ export SYNC_ROOT="${SYNC_ROOT:-}"
 export RESUME_FROM_EXPORT_ARTIFACT="${RESUME_FROM_EXPORT_ARTIFACT:-}"
 export RESUME_MODE="${RESUME_MODE:-warm}"
 export WANDB_RUN_NAME="${WANDB_RUN_NAME:-rl-paper-native-tight-2node-srun-$(date +%Y%m%d-%H%M%S)}"
-export OUTPUT_DIR="${OUTPUT_DIR:-data/artifacts/models/train_rl_output/paper_native_tight_2node_srun}"
+export OUTPUT_DIR="${OUTPUT_DIR:-${BIOREASON_ARTIFACTS_ROOT}/models/train_rl_output/paper_native_tight_2node_srun}"
 export NNODES="${NNODES:-2}"
 export GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
 export QUERIES_PER_STEP="${QUERIES_PER_STEP:-8}"
@@ -78,6 +100,14 @@ srun --nodes="${NNODES}" --ntasks="${NNODES}" --ntasks-per-node=1 bash -lc '
   export SYNC_ROOT="'"$SYNC_ROOT"'"
   export RESUME_FROM_EXPORT_ARTIFACT="'"$RESUME_FROM_EXPORT_ARTIFACT"'"
   export RESUME_MODE="'"$RESUME_MODE"'"
+  export BIOREASON_RUNTIME_ROOT="'"$BIOREASON_RUNTIME_ROOT"'"
+  export BIOREASON_ARTIFACTS_ROOT="'"$BIOREASON_ARTIFACTS_ROOT"'"
+  export BIOREASON_CACHE_ROOT="'"$BIOREASON_CACHE_ROOT"'"
+  export WANDB_DIR="'"$WANDB_DIR"'"
+  export WEAVE_SERVER_CACHE_DIR="'"$WEAVE_SERVER_CACHE_DIR"'"
+  export HF_HOME="'"$HF_HOME"'"
+  export TRANSFORMERS_CACHE="'"$TRANSFORMERS_CACHE"'"
+  export HF_DATASETS_CACHE="'"$HF_DATASETS_CACHE"'"
   export WANDB_RUN_NAME="'"$WANDB_RUN_NAME"'"
   export OUTPUT_DIR="'"$OUTPUT_DIR"'"
   export NNODES="'"$NNODES"'"
