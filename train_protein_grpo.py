@@ -28,7 +28,7 @@ import re
 import shutil
 import time
 import traceback
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -84,6 +84,16 @@ def normalize_text(value: Any) -> str:
     if isinstance(value, (list, tuple, set)):
         return ", ".join(str(item) for item in value if item not in (None, ""))
     return str(value)
+
+
+def default_runtime_root() -> Path:
+    configured = normalize_text(os.getenv("BIOREASON_RUNTIME_ROOT")).strip()
+    if configured:
+        return Path(configured).expanduser()
+    user = normalize_text(os.getenv("USER")).strip()
+    if user and Path("/mnt/data").exists():
+        return Path("/mnt/data") / user / "BioReason-Pro"
+    return Path.cwd()
 
 
 def normalize_path_value(value: Any) -> str:
@@ -289,6 +299,73 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
+def read_json(path: Path) -> Dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        return dict(json.load(handle))
+
+
+def resolve_execution_id(args: Any) -> str:
+    configured = normalize_text(getattr(args, "execution_id", None)).strip()
+    if configured:
+        return normalize_text(configured).strip().replace(os.sep, "-")
+    inherited = normalize_text(os.environ.get("EXECUTION_ID")).strip()
+    if inherited:
+        return normalize_text(inherited).strip().replace(os.sep, "-")
+    slurm_job_id = normalize_text(os.environ.get("SLURM_JOB_ID")).strip() or "local"
+    if slurm_job_id != "local":
+        return slurm_job_id
+    timestamp = time.strftime("%Y%m%d%H%M%S", time.gmtime())
+    nonce = f"{os.getpid():05d}"
+    return f"{slurm_job_id}-{timestamp}-{nonce}"
+
+
+def resolve_sync_root(args: Any, output_dir: Path, execution_id: str) -> Path:
+    configured = normalize_text(getattr(args, "sync_root", None)).strip()
+    if configured:
+        base_dir = Path(configured).expanduser().resolve()
+    else:
+        base_dir = (output_dir / "_run_sync").resolve()
+    return base_dir / execution_id
+
+
+def initialize_run_sync_root(runtime: "DistributedRuntime", sync_root: Path, execution_id: str) -> None:
+    ready_path = sync_root / ".ready.json"
+    if not runtime.enabled:
+        if sync_root.exists():
+            shutil.rmtree(sync_root)
+        sync_root.mkdir(parents=True, exist_ok=True)
+        save_json(
+            ready_path,
+            {
+                "execution_id": execution_id,
+                "status": "ready",
+                "created_at": float(time.time()),
+            },
+        )
+        return
+
+    if runtime.rank == 0:
+        if sync_root.exists():
+            shutil.rmtree(sync_root)
+        sync_root.mkdir(parents=True, exist_ok=True)
+        save_json(
+            ready_path,
+            {
+                "execution_id": execution_id,
+                "status": "ready",
+                "created_at": float(time.time()),
+            },
+        )
+        return
+
+    deadline = time.monotonic() + 600.0
+    while time.monotonic() < deadline:
+        if ready_path.exists():
+            return
+        time.sleep(0.5)
+    raise TimeoutError(f"Timed out waiting for sync root initialization at {sync_root}.")
+
+
 def require_torch() -> None:
     if torch is None or F is None:
         raise RuntimeError("train_protein_grpo.py requires torch to be installed.")
@@ -407,6 +484,8 @@ class RolloutGroup:
     completions: List[str]
     completion_ids: List[Any]
     rewards: List[float]
+    rollout_failed: bool = False
+    rollout_failure_reason: str = ""
     selected_completion_ids: Optional[List[Any]] = None
     filtered_rollouts: float = 0.0
     advantages: Optional[Any] = None
@@ -499,6 +578,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min_p", type=float, default=0.0)
     parser.add_argument("--repetition_penalty", type=float, default=1.0)
     parser.add_argument("--max_new_tokens", type=int, default=10_000)
+    parser.add_argument("--rollout_max_new_tokens", type=int, default=0)
     parser.add_argument("--max_loss_completion_tokens", type=int, default=0)
     parser.add_argument("--rollout_logprob_microbatch_size", type=int, default=4)
     parser.add_argument("--clip_epsilon_low", type=float, default=7e-4)
@@ -530,10 +610,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--validation_num_proteins", type=int, default=200)
     parser.add_argument("--validation_every_n_steps", type=int, default=50)
     parser.add_argument("--save_every_n_steps", type=int, default=50)
+    parser.add_argument("--checkpoint_export_only", type=str, default="false")
 
-    parser.add_argument("--output_dir", type=str, default="data/artifacts/models/train_rl_output")
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=str(default_runtime_root() / "data" / "artifacts" / "models" / "train_rl_output"),
+    )
     parser.add_argument("--checkpoint_artifact_name", type=str, default="train-rl-output")
     parser.add_argument("--checkpoint_artifact_aliases", type=str, default="latest")
+    parser.add_argument("--execution_id", type=str, default=None)
+    parser.add_argument("--sync_root", type=str, default=None)
+    parser.add_argument("--resume_from_export_artifact", type=str, default=None)
+    parser.add_argument("--resume_mode", type=str, default="warm", choices=["warm"])
 
     parser.add_argument("--wandb_project", type=str, default=os.environ.get("WANDB_PROJECT", "bioreasoning-pro"))
     parser.add_argument("--wandb_entity", type=str, default=None)
@@ -579,6 +668,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--rollout_backend", type=str, default="subprocess", choices=["subprocess", "inprocess"])
     parser.add_argument("--rollout_worker_start_method", type=str, default="spawn", choices=["spawn", "forkserver", "fork"])
+    parser.add_argument("--rollout_worker_generate_timeout_s", type=float, default=900.0)
+    parser.add_argument("--rollout_worker_startup_retry_count", type=int, default=2)
+    parser.add_argument("--rollout_worker_startup_retry_sleep_s", type=float, default=10.0)
+    parser.add_argument("--rollout_worker_vllm_port_base", type=int, default=39000)
+    parser.add_argument("--rollout_worker_vllm_port_stride", type=int, default=32)
+    parser.add_argument("--rollout_worker_vllm_host_ip", type=str, default="127.0.0.1")
 
     # DeepSpeed injects this flag into worker processes; accept it even though the
     # runtime primarily reads LOCAL_RANK from the environment.
@@ -600,6 +695,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "vllm_use_v1",
         "debug_single_process",
         "preflight_only",
+        "checkpoint_export_only",
     ):
         setattr(args, name, parse_bool(getattr(args, name)))
     return args
@@ -632,13 +728,16 @@ def build_runtime_spec(args: argparse.Namespace) -> RuntimeSpec:
 
 
 def build_sampling_spec(args: argparse.Namespace) -> SamplingSpec:
+    rollout_max_new_tokens = int(getattr(args, "rollout_max_new_tokens", 0) or 0)
+    if rollout_max_new_tokens <= 0:
+        rollout_max_new_tokens = int(args.max_new_tokens)
     return SamplingSpec(
         temperature=float(args.temperature),
         top_k=int(args.top_k),
         top_p=float(args.top_p),
         min_p=float(args.min_p),
         repetition_penalty=float(args.repetition_penalty),
-        max_new_tokens=int(args.max_new_tokens),
+        max_new_tokens=rollout_max_new_tokens,
     )
 
 
@@ -971,6 +1070,12 @@ def resolve_effective_vllm_max_num_seqs(args: argparse.Namespace) -> int:
     return max(configured, local_rollouts)
 
 
+def resolve_rollout_worker_vllm_port(args: argparse.Namespace, runtime_rank: int) -> int:
+    base = max(int(getattr(args, "rollout_worker_vllm_port_base", 39000)), 1024)
+    stride = max(int(getattr(args, "rollout_worker_vllm_port_stride", 32)), 1)
+    return base + (max(int(runtime_rank), 0) * stride)
+
+
 def configure_query_parallel_runtime(runtime: DistributedRuntime, algorithm: AlgorithmSpec) -> None:
     if not runtime.enabled:
         runtime.query_parallel_degree = 1
@@ -1058,6 +1163,399 @@ def all_reduce_max_scalar(value: float, runtime: DistributedRuntime, process_gro
 def barrier(runtime: DistributedRuntime) -> None:
     if runtime.enabled and is_distributed_initialized():
         torch.distributed.barrier()
+
+
+def resolve_sync_namespace_root(output_dir: Optional[Path] = None, sync_root: Optional[Path] = None) -> Path:
+    if sync_root is not None:
+        return Path(sync_root).resolve()
+    if output_dir is None:
+        raise ValueError("Either output_dir or sync_root must be provided for sync operations.")
+    return Path(output_dir).resolve()
+
+
+def build_rank0_section_marker_dir(output_dir: Optional[Path] = None, sync_root: Optional[Path] = None) -> Path:
+    return resolve_sync_namespace_root(output_dir=output_dir, sync_root=sync_root) / "_rank0_sections"
+
+
+def build_rank0_section_marker_paths(
+    output_dir: Optional[Path],
+    section_name: str,
+    step: int,
+    *,
+    sync_root: Optional[Path] = None,
+) -> Tuple[Path, Path]:
+    marker_dir = build_rank0_section_marker_dir(output_dir=output_dir, sync_root=sync_root)
+    base_name = f"{normalize_text(section_name).strip() or 'section'}-step-{int(step):06d}"
+    return marker_dir / f"{base_name}.done.json", marker_dir / f"{base_name}.error.json"
+
+
+def build_scalar_collective_dir(output_dir: Optional[Path] = None, sync_root: Optional[Path] = None) -> Path:
+    return resolve_sync_namespace_root(output_dir=output_dir, sync_root=sync_root) / "_scalar_collectives"
+
+
+def build_scalar_collective_base_name(reduction_name: str, step: int, group_name: str) -> str:
+    normalized_reduction = normalize_text(reduction_name).strip() or "reduction"
+    normalized_group = normalize_text(group_name).strip() or "world"
+    return f"{normalized_reduction}-step-{int(step):06d}-{normalized_group}"
+
+
+def build_scalar_collective_paths(
+    output_dir: Optional[Path],
+    reduction_name: str,
+    step: int,
+    group_name: str,
+    rank: int,
+    *,
+    sync_root: Optional[Path] = None,
+) -> Tuple[Path, Path, Path]:
+    collective_dir = build_scalar_collective_dir(output_dir=output_dir, sync_root=sync_root)
+    base_name = build_scalar_collective_base_name(reduction_name, step, group_name)
+    payload_path = collective_dir / f"{base_name}.rank{int(rank):02d}.json"
+    done_path = collective_dir / f"{base_name}.done.json"
+    error_path = collective_dir / f"{base_name}.error.json"
+    return payload_path, done_path, error_path
+
+
+def build_phase_journal_dir(output_dir: Optional[Path] = None, sync_root: Optional[Path] = None) -> Path:
+    return resolve_sync_namespace_root(output_dir=output_dir, sync_root=sync_root) / "_phase_journal"
+
+
+def build_phase_journal_paths(
+    output_dir: Optional[Path],
+    phase_name: str,
+    step: int,
+    group_name: str,
+    rank: int,
+    *,
+    sync_root: Optional[Path] = None,
+) -> Tuple[Path, Path, Path]:
+    journal_dir = build_phase_journal_dir(output_dir=output_dir, sync_root=sync_root)
+    normalized_phase = normalize_text(phase_name).strip() or "phase"
+    normalized_group = normalize_text(group_name).strip() or "world"
+    base_name = f"{normalized_phase}-step-{int(step):06d}-{normalized_group}"
+    payload_path = journal_dir / f"{base_name}.rank{int(rank):02d}.json"
+    done_path = journal_dir / f"{base_name}.done.json"
+    error_path = journal_dir / f"{base_name}.error.json"
+    return payload_path, done_path, error_path
+
+
+def run_phase_journal_barrier(
+    *,
+    runtime: DistributedRuntime,
+    output_dir: Optional[Path],
+    sync_root: Optional[Path],
+    phase_name: str,
+    step: int,
+    group_ranks: Sequence[int],
+    group_name: str = "world",
+    payload: Optional[Mapping[str, Any]] = None,
+    timeout_s: float = 7_200.0,
+    poll_interval_s: float = 1.0,
+) -> Mapping[str, Any]:
+    if not runtime.enabled:
+        return {
+            "phase_name": normalize_text(phase_name).strip() or "phase",
+            "participant_count": 1.0,
+        }
+
+    resolved_group_ranks = tuple(int(rank) for rank in group_ranks)
+    if runtime.rank not in resolved_group_ranks:
+        raise RuntimeError(
+            f"Rank {runtime.rank} is not part of phase barrier group {resolved_group_ranks} "
+            f"for {normalize_text(phase_name).strip() or 'phase'}."
+        )
+    leader_rank = min(resolved_group_ranks)
+    payload_path, done_path, error_path = build_phase_journal_paths(
+        output_dir=output_dir,
+        sync_root=sync_root,
+        phase_name=phase_name,
+        step=step,
+        group_name=group_name,
+        rank=runtime.rank,
+    )
+    payload_path.parent.mkdir(parents=True, exist_ok=True)
+    save_json(
+        payload_path,
+        {
+            "phase_name": normalize_text(phase_name).strip() or "phase",
+            "group_name": normalize_text(group_name).strip() or "world",
+            "rank": int(runtime.rank),
+            "step": int(step),
+            "payload": dict(payload or {}),
+            "heartbeat_at": float(time.time()),
+        },
+    )
+
+    if runtime.rank == leader_rank:
+        deadline = time.monotonic() + float(timeout_s)
+        while time.monotonic() < deadline:
+            missing_ranks: List[int] = []
+            for participant_rank in resolved_group_ranks:
+                participant_payload_path, _, _ = build_phase_journal_paths(
+                    output_dir=output_dir,
+                    sync_root=sync_root,
+                    phase_name=phase_name,
+                    step=step,
+                    group_name=group_name,
+                    rank=participant_rank,
+                )
+                if not participant_payload_path.exists():
+                    missing_ranks.append(int(participant_rank))
+                    continue
+                try:
+                    read_json(participant_payload_path)
+                except json.JSONDecodeError:
+                    missing_ranks.append(int(participant_rank))
+            if not missing_ranks:
+                result = {
+                    "phase_name": normalize_text(phase_name).strip() or "phase",
+                    "group_name": normalize_text(group_name).strip() or "world",
+                    "step": int(step),
+                    "participant_count": float(len(resolved_group_ranks)),
+                    "completed_at": float(time.time()),
+                }
+                save_json(done_path, result)
+                return result
+            time.sleep(float(poll_interval_s))
+        error_payload = {
+            "phase_name": normalize_text(phase_name).strip() or "phase",
+            "group_name": normalize_text(group_name).strip() or "world",
+            "step": int(step),
+            "message": (
+                f"Timed out waiting for ranks {resolved_group_ranks} to reach phase "
+                f"{normalize_text(phase_name).strip() or 'phase'}."
+            ),
+        }
+        save_json(error_path, error_payload)
+        raise TimeoutError(error_payload["message"])
+
+    deadline = time.monotonic() + float(timeout_s)
+    while time.monotonic() < deadline:
+        if error_path.exists():
+            payload_data = read_json(error_path)
+            raise RuntimeError(payload_data.get("message", f"Phase barrier {phase_name} failed."))
+        if done_path.exists():
+            return read_json(done_path)
+        time.sleep(float(poll_interval_s))
+    raise TimeoutError(
+        f"Timed out waiting for phase {normalize_text(phase_name).strip() or 'phase'} "
+        f"for step {int(step)} and group {normalize_text(group_name).strip() or 'world'}."
+    )
+
+
+def run_rank0_serial_section(
+    runtime: DistributedRuntime,
+    output_dir: Path,
+    section_name: str,
+    step: int,
+    action: Any,
+    *,
+    sync_root: Optional[Path] = None,
+    timeout_s: float = 7_200.0,
+    poll_interval_s: float = 1.0,
+) -> Any:
+    if not runtime.enabled:
+        return action()
+
+    done_path, error_path = build_rank0_section_marker_paths(
+        output_dir,
+        section_name,
+        step,
+        sync_root=sync_root,
+    )
+    done_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if runtime.rank == 0:
+        for marker_path in (done_path, error_path):
+            try:
+                marker_path.unlink()
+            except FileNotFoundError:
+                continue
+        try:
+            result = action()
+        except Exception as exc:
+            save_json(
+                error_path,
+                {
+                    "section": normalize_text(section_name).strip() or "section",
+                    "step": int(step),
+                    "error_type": type(exc).__name__,
+                    "message": normalize_text(exc).strip() or repr(exc),
+                },
+            )
+            raise
+        save_json(
+            done_path,
+            {
+                "section": normalize_text(section_name).strip() or "section",
+                "step": int(step),
+                "status": "ok",
+                "completed_at": float(time.time()),
+            },
+        )
+        return result
+
+    deadline = time.monotonic() + float(timeout_s)
+    while time.monotonic() < deadline:
+        if error_path.exists():
+            payload = json.loads(error_path.read_text(encoding="utf-8"))
+            message = normalize_text(payload.get("message")).strip() or "unknown rank0 section failure"
+            raise RuntimeError(
+                f"Rank 0 failed during {normalize_text(section_name).strip() or 'section'} "
+                f"for step {int(step)}: {message}"
+            )
+        if done_path.exists():
+            return None
+        time.sleep(float(poll_interval_s))
+    raise TimeoutError(
+        f"Timed out waiting for rank 0 to finish {normalize_text(section_name).strip() or 'section'} "
+        f"for step {int(step)}."
+    )
+
+
+def aggregate_global_reward_std_payloads(payloads: Sequence[Mapping[str, Any]], epsilon: float) -> float:
+    total_sum = sum(float(payload.get("sum", 0.0)) for payload in payloads)
+    total_sq_sum = sum(float(payload.get("sq_sum", 0.0)) for payload in payloads)
+    total_count = sum(float(payload.get("count", 0.0)) for payload in payloads)
+    if total_count <= 0.0:
+        return float(epsilon)
+    mean = total_sum / total_count
+    variance = max((total_sq_sum / total_count) - (mean * mean), 0.0)
+    return math.sqrt(variance) + float(epsilon)
+
+
+def aggregate_query_group_mean_payloads(payloads: Sequence[Mapping[str, Any]]) -> float:
+    total_sum = sum(float(payload.get("sum", 0.0)) for payload in payloads)
+    total_count = sum(float(payload.get("count", 0.0)) for payload in payloads)
+    if total_count <= 0.0:
+        return 0.0
+    return total_sum / total_count
+
+
+def aggregate_step_metric_payloads(
+    payloads: Sequence[Mapping[str, Any]],
+    *,
+    mean_keys: Sequence[str],
+    sum_keys: Sequence[str],
+    max_keys: Sequence[str],
+    passthrough_keys: Sequence[str],
+) -> Dict[str, float]:
+    if not payloads:
+        return {}
+    participant_count = float(len(payloads))
+    aggregated: Dict[str, float] = {}
+    for key in mean_keys:
+        aggregated[key] = sum(float(payload.get(key, 0.0)) for payload in payloads) / participant_count
+    for key in sum_keys:
+        aggregated[key] = sum(float(payload.get(key, 0.0)) for payload in payloads)
+    for key in max_keys:
+        aggregated[key] = max(float(payload.get(key, 0.0)) for payload in payloads)
+    first_payload = payloads[0]
+    for key in passthrough_keys:
+        aggregated[key] = float(first_payload.get(key, 0.0))
+    return aggregated
+
+
+def run_file_backed_scalar_collective(
+    *,
+    runtime: DistributedRuntime,
+    output_dir: Path,
+    sync_root: Optional[Path] = None,
+    reduction_name: str,
+    step: int,
+    group_ranks: Sequence[int],
+    group_name: str,
+    local_payload: Mapping[str, Any],
+    aggregate_fn: Any,
+    timeout_s: float = 7_200.0,
+    poll_interval_s: float = 1.0,
+) -> Mapping[str, Any]:
+    if not runtime.enabled:
+        return dict(aggregate_fn([dict(local_payload)]))
+
+    resolved_group_ranks = tuple(int(rank) for rank in group_ranks)
+    if runtime.rank not in resolved_group_ranks:
+        raise RuntimeError(
+            f"Rank {runtime.rank} is not part of scalar collective group {resolved_group_ranks} "
+            f"for {normalize_text(reduction_name).strip() or 'reduction'}."
+        )
+
+    leader_rank = min(resolved_group_ranks)
+    payload_path, done_path, error_path = build_scalar_collective_paths(
+        output_dir=output_dir,
+        sync_root=sync_root,
+        reduction_name=reduction_name,
+        step=step,
+        group_name=group_name,
+        rank=runtime.rank,
+    )
+    payload_path.parent.mkdir(parents=True, exist_ok=True)
+    save_json(payload_path, {"rank": int(runtime.rank), **dict(local_payload)})
+
+    if runtime.rank == leader_rank:
+        deadline = time.monotonic() + float(timeout_s)
+        while time.monotonic() < deadline:
+            payloads: List[Mapping[str, Any]] = []
+            missing_ranks: List[int] = []
+            for participant_rank in resolved_group_ranks:
+                participant_payload_path, _, _ = build_scalar_collective_paths(
+                    output_dir=output_dir,
+                    sync_root=sync_root,
+                    reduction_name=reduction_name,
+                    step=step,
+                    group_name=group_name,
+                    rank=participant_rank,
+                )
+                if not participant_payload_path.exists():
+                    missing_ranks.append(int(participant_rank))
+                    continue
+                try:
+                    payloads.append(json.loads(participant_payload_path.read_text(encoding="utf-8")))
+                except json.JSONDecodeError:
+                    missing_ranks.append(int(participant_rank))
+            if not missing_ranks:
+                result_payload = dict(aggregate_fn(payloads))
+                save_json(
+                    done_path,
+                    {
+                        "reduction": normalize_text(reduction_name).strip() or "reduction",
+                        "group_name": normalize_text(group_name).strip() or "world",
+                        "step": int(step),
+                        "result": result_payload,
+                    },
+                )
+                return result_payload
+            time.sleep(float(poll_interval_s))
+        save_json(
+            error_path,
+            {
+                "reduction": normalize_text(reduction_name).strip() or "reduction",
+                "group_name": normalize_text(group_name).strip() or "world",
+                "step": int(step),
+                "message": (
+                    f"Timed out waiting for ranks {resolved_group_ranks} to finish "
+                    f"{normalize_text(reduction_name).strip() or 'reduction'}."
+                ),
+            },
+        )
+        raise TimeoutError(
+            f"Timed out waiting for scalar collective {normalize_text(reduction_name).strip() or 'reduction'} "
+            f"for step {int(step)} and group {normalize_text(group_name).strip() or 'world'}."
+        )
+
+    deadline = time.monotonic() + float(timeout_s)
+    while time.monotonic() < deadline:
+        if error_path.exists():
+            payload = json.loads(error_path.read_text(encoding="utf-8"))
+            raise RuntimeError(payload.get("message", f"Scalar collective {reduction_name} failed."))
+        if done_path.exists():
+            payload = json.loads(done_path.read_text(encoding="utf-8"))
+            return dict(payload.get("result") or {})
+        time.sleep(float(poll_interval_s))
+    raise TimeoutError(
+        f"Timed out waiting for scalar collective {normalize_text(reduction_name).strip() or 'reduction'} "
+        f"for step {int(step)} and group {normalize_text(group_name).strip() or 'world'}."
+    )
 
 
 def broadcast_indices(indices: List[int], runtime: DistributedRuntime) -> List[int]:
@@ -1628,21 +2126,37 @@ def resolve_disease_loss_scale(sample_meta: Mapping[str, Any], disease_loss_weig
     return weight if is_priority else 1.0
 
 
-def compute_global_reward_std(local_group_rewards: Sequence[Sequence[float]], runtime: DistributedRuntime, epsilon: float) -> float:
+def compute_global_reward_std(
+    local_group_rewards: Sequence[Sequence[float]],
+    runtime: DistributedRuntime,
+    output_dir: Path,
+    step: int,
+    epsilon: float,
+    *,
+    sync_root: Optional[Path] = None,
+) -> float:
     flat_rewards = [float(reward) for group in local_group_rewards for reward in group]
     local_sum = sum(flat_rewards)
     local_sq_sum = sum(reward * reward for reward in flat_rewards)
     local_count = float(len(flat_rewards))
-
-    total_sum = all_reduce_sum_scalar(local_sum, runtime)
-    total_sq_sum = all_reduce_sum_scalar(local_sq_sum, runtime)
-    total_count = all_reduce_sum_scalar(local_count, runtime)
-    if total_count <= 0:
-        return epsilon
-
-    mean = total_sum / total_count
-    variance = max((total_sq_sum / total_count) - (mean * mean), 0.0)
-    return math.sqrt(variance) + epsilon
+    result = run_file_backed_scalar_collective(
+        runtime=runtime,
+        output_dir=output_dir,
+        sync_root=sync_root,
+        reduction_name="global_reward_std",
+        step=step,
+        group_ranks=tuple(range(runtime.world_size)) if runtime.enabled else (0,),
+        group_name="world",
+        local_payload={
+            "sum": local_sum,
+            "sq_sum": local_sq_sum,
+            "count": local_count,
+        },
+        aggregate_fn=lambda payloads: {
+            "global_reward_std": aggregate_global_reward_std_payloads(payloads, epsilon=epsilon),
+        },
+    )
+    return float(result.get("global_reward_std", epsilon))
 
 
 def compute_group_advantages(group_rewards: Sequence[float], global_std: float, group_mean: Optional[float] = None) -> List[float]:
@@ -1652,18 +2166,37 @@ def compute_group_advantages(group_rewards: Sequence[float], global_std: float, 
     return [(float(reward) - resolved_group_mean) / global_std for reward in group_rewards]
 
 
-def compute_query_group_mean(group_rewards: Sequence[float], runtime: DistributedRuntime) -> float:
+def compute_query_group_mean(
+    group_rewards: Sequence[float],
+    runtime: DistributedRuntime,
+    output_dir: Path,
+    step: int,
+    *,
+    sync_root: Optional[Path] = None,
+) -> float:
     if not group_rewards:
         return 0.0
     if (not runtime.enabled) or runtime.query_parallel_degree <= 1:
         return sum(float(reward) for reward in group_rewards) / float(len(group_rewards))
     local_sum = sum(float(reward) for reward in group_rewards)
     local_count = float(len(group_rewards))
-    total_sum = all_reduce_sum_scalar(local_sum, runtime, process_group=runtime.query_process_group)
-    total_count = all_reduce_sum_scalar(local_count, runtime, process_group=runtime.query_process_group)
-    if total_count <= 0.0:
-        return 0.0
-    return total_sum / total_count
+    result = run_file_backed_scalar_collective(
+        runtime=runtime,
+        output_dir=output_dir,
+        sync_root=sync_root,
+        reduction_name="query_group_mean",
+        step=step,
+        group_ranks=runtime.query_group_ranks or (runtime.rank,),
+        group_name=f"query-group-{int(runtime.query_group_index)}",
+        local_payload={
+            "sum": local_sum,
+            "count": local_count,
+        },
+        aggregate_fn=lambda payloads: {
+            "query_group_mean": aggregate_query_group_mean_payloads(payloads),
+        },
+    )
+    return float(result.get("query_group_mean", 0.0))
 
 
 def build_tracking_config(
@@ -1744,6 +2277,12 @@ def build_tracking_config(
     config.update(
         {
             "algorithm": "DR-GRPO",
+            "execution_id": normalize_text(getattr(args, "execution_id", None)).strip(),
+            "sync_root": normalize_text(getattr(args, "sync_root", None)).strip(),
+            "resume_from_export_artifact": normalize_text(getattr(args, "resume_from_export_artifact", None)).strip(),
+            "resume_mode": normalize_text(getattr(args, "resume_mode", None)).strip() or "warm",
+            "resume_parent_execution_id": normalize_text(getattr(args, "resume_parent_execution_id", None)).strip(),
+            "reasoning_prompt_style": normalize_text(getattr(args, "reasoning_prompt_style", None)).strip(),
             "queries_per_step": algorithm.queries_per_step,
             "rollouts_per_query": algorithm.rollouts_per_query,
             "total_trajectories_per_step": algorithm.total_trajectories,
@@ -1756,6 +2295,7 @@ def build_tracking_config(
             "importance_sampling_cap": algorithm.importance_sampling_cap,
             "kl_beta": algorithm.kl_beta,
             "max_new_tokens": algorithm.max_new_tokens,
+            "rollout_max_new_tokens": int(getattr(args, "rollout_max_new_tokens", 0) or 0),
             "optimizer_micro_batch_size_per_gpu": runtime_spec.optimizer_micro_batch_size_per_gpu,
             "target_world_size": runtime_spec.target_world_size,
             "world_size": runtime.world_size,
@@ -1773,6 +2313,10 @@ def build_tracking_config(
             "vllm_cpu_offload_gb": float(args.vllm_cpu_offload_gb),
             "vllm_swap_space_gb": float(args.vllm_swap_space_gb),
             "vllm_enforce_eager": parse_bool(args.vllm_enforce_eager),
+            "rollout_worker_generate_timeout_s": float(getattr(args, "rollout_worker_generate_timeout_s", 900.0)),
+            "rollout_worker_vllm_port_base": int(getattr(args, "rollout_worker_vllm_port_base", 39000)),
+            "rollout_worker_vllm_port_stride": int(getattr(args, "rollout_worker_vllm_port_stride", 32)),
+            "rollout_worker_vllm_host_ip": normalize_text(getattr(args, "rollout_worker_vllm_host_ip", "127.0.0.1")).strip() or "127.0.0.1",
             "vllm_attention_backend": normalize_text(args.vllm_attention_backend).strip() or "<auto>",
             "vllm_worker_multiproc_method": normalize_text(args.vllm_worker_multiproc_method).strip() or "spawn",
             "vllm_use_v1": parse_bool(args.vllm_use_v1),
@@ -1898,6 +2442,8 @@ class RunTracker:
         self.weave_reward_trace_fn = None
         self.weave_scoring_trace_fn = None
         self.weave_update_trace_fn = None
+        self.weave_rollout_item_fn = None
+        self.weave_reward_item_fn = None
         self._weave_stage_callbacks: Dict[str, Any] = {}
         self.wandb_entity = ""
         self.wandb_project = ""
@@ -2098,9 +2644,87 @@ class RunTracker:
                     raise RuntimeError(f"Weave stage tracing expected an active callback for stage={stage_name!r}.")
                 return callback()
 
+            @weave.op(name="train_rl_rollout_item")
+            def trace_rollout_item(payload: Dict[str, Any]) -> Dict[str, Any]:
+                # Per-completion child span. Keeps the parent rollout op a
+                # concise summary while making each individual rollout visible
+                # as its own node in the Weave call tree (filterable by
+                # protein_id, rollout_idx, parsed GO ids, format flags, etc.).
+                return dict(payload)
+
+            @weave.op(name="train_rl_reward_item")
+            def trace_reward_item(payload: Dict[str, Any]) -> Dict[str, Any]:
+                # Per-completion child span for reward scoring: surfaces the
+                # target vs. predicted GO ids and the scalar reward as an
+                # individual tree node so each rollout's reward is inspectable.
+                return dict(payload)
+
+            def _emit_rollout_item_children(
+                base_payload: Dict[str, Any],
+                rollout_result: Mapping[str, Any],
+            ) -> None:
+                outputs = list(rollout_result.get("outputs", []) or [])
+                token_lengths = list(rollout_result.get("output_token_lengths", []) or [])
+                char_lengths = list(rollout_result.get("output_char_lengths", []) or [])
+                word_lengths = list(rollout_result.get("output_word_lengths", []) or [])
+                parsed_go_counts = list(rollout_result.get("output_parsed_go_counts", []) or [])
+                format_valid_flags = list(rollout_result.get("output_format_valid", []) or [])
+                final_answer_flags = list(rollout_result.get("output_has_final_answer_tag", []) or [])
+                go_summary_flags = list(rollout_result.get("output_has_go_summary_block", []) or [])
+                for idx, completion in enumerate(outputs):
+                    format_summary = build_completion_format_summary(completion)
+                    item_payload: Dict[str, Any] = {
+                        "run_name": base_payload.get("run_name"),
+                        "job_type": "train_rl",
+                        "stage": "rollout_item",
+                        "step": base_payload.get("step"),
+                        "rank": base_payload.get("rank"),
+                        "split": base_payload.get("split"),
+                        "protein_id": base_payload.get("protein_id"),
+                        "rollout_idx": idx,
+                        "completion": completion,
+                        "parsed_go_ids": list(format_summary.get("parsed_go_ids", [])),
+                        "parsed_go_count": int(
+                            parsed_go_counts[idx]
+                            if idx < len(parsed_go_counts)
+                            else format_summary.get("parsed_go_count", 0)
+                        ),
+                        "char_count": int(
+                            char_lengths[idx] if idx < len(char_lengths) else len(completion)
+                        ),
+                        "word_count": int(
+                            word_lengths[idx] if idx < len(word_lengths) else len(completion.split())
+                        ),
+                        "format_valid": bool(
+                            format_valid_flags[idx]
+                            if idx < len(format_valid_flags)
+                            else format_summary.get("format_valid", False)
+                        ),
+                        "has_final_answer_tag": bool(
+                            final_answer_flags[idx]
+                            if idx < len(final_answer_flags)
+                            else format_summary.get("has_final_answer_tag", False)
+                        ),
+                        "has_go_summary_block": bool(
+                            go_summary_flags[idx]
+                            if idx < len(go_summary_flags)
+                            else format_summary.get("has_go_summary_block", False)
+                        ),
+                    }
+                    if idx < len(token_lengths):
+                        item_payload["token_count"] = int(token_lengths[idx])
+                    try:
+                        trace_rollout_item(item_payload)
+                    except Exception as emit_exc:  # never let tracing break training
+                        print(f"⚠️  Weave rollout-item trace failed: {emit_exc}", flush=True)
+
             @weave.op(name="train_rl_rollout_generate")
             def trace_generation(payload: Dict[str, Any]) -> Dict[str, Any]:
                 rollout_result = dict(invoke_stage("rollout") or {})
+                # Emit one child op per completion so the Weave trace reflects
+                # the actual per-rollout structure instead of collapsing the
+                # group into a single flat node.
+                _emit_rollout_item_children(dict(payload), rollout_result)
                 return {
                     "run_name": payload.get("run_name"),
                     "job_type": "train_rl",
@@ -2118,6 +2742,40 @@ class RunTracker:
             @weave.op(name="train_rl_reward_score")
             def trace_reward(payload: Dict[str, Any]) -> Dict[str, Any]:
                 rewards = [float(item) for item in invoke_stage("reward")]
+                completions = list(payload.get("completions") or [])
+                target_go_ids = list(payload.get("target_go_ids") or [])
+                for idx, completion in enumerate(completions):
+                    format_summary = build_completion_format_summary(completion)
+                    predicted_go_ids = list(format_summary.get("parsed_go_ids", []))
+                    target_set = set(target_go_ids)
+                    predicted_set = set(predicted_go_ids)
+                    overlap = sorted(target_set & predicted_set)
+                    missed = sorted(target_set - predicted_set)
+                    extra = sorted(predicted_set - target_set)
+                    item_payload: Dict[str, Any] = {
+                        "run_name": payload.get("run_name"),
+                        "job_type": "train_rl",
+                        "stage": "reward_item",
+                        "step": payload.get("step"),
+                        "rank": payload.get("rank"),
+                        "split": payload.get("split"),
+                        "protein_id": payload.get("protein_id"),
+                        "rollout_idx": idx,
+                        "reward": float(rewards[idx]) if idx < len(rewards) else 0.0,
+                        "target_go_ids": target_go_ids,
+                        "predicted_go_ids": predicted_go_ids,
+                        "overlap_go_ids": overlap,
+                        "missed_go_ids": missed,
+                        "extra_go_ids": extra,
+                        "target_count": len(target_set),
+                        "predicted_count": len(predicted_set),
+                        "overlap_count": len(overlap),
+                        "format_valid": bool(format_summary.get("format_valid", False)),
+                    }
+                    try:
+                        trace_reward_item(item_payload)
+                    except Exception as emit_exc:
+                        print(f"⚠️  Weave reward-item trace failed: {emit_exc}", flush=True)
                 return {
                     "run_name": payload.get("run_name"),
                     "job_type": "train_rl",
@@ -2126,9 +2784,13 @@ class RunTracker:
                     "rank": payload.get("rank"),
                     "split": payload.get("split"),
                     "protein_id": payload.get("protein_id"),
-                    "target_go_ids": list(payload.get("target_go_ids") or []),
-                    "completions": list(payload.get("completions") or []),
+                    "target_go_ids": target_go_ids,
+                    "completions": completions,
                     "rewards": rewards,
+                    "reward_mean": (sum(rewards) / len(rewards)) if rewards else 0.0,
+                    "reward_max": max(rewards) if rewards else 0.0,
+                    "reward_min": min(rewards) if rewards else 0.0,
+                    "reward_nonzero_count": sum(1 for r in rewards if r > 0.0),
                 }
 
             @weave.op(name="train_rl_old_ref_score")
@@ -2161,6 +2823,8 @@ class RunTracker:
             self.weave_reward_trace_fn = trace_reward
             self.weave_scoring_trace_fn = trace_scoring
             self.weave_update_trace_fn = trace_update
+            self.weave_rollout_item_fn = trace_rollout_item
+            self.weave_reward_item_fn = trace_reward_item
             return trace_generation
         except Exception as exc:
             print(f"⚠️  Weave init failed for RL tracing: {exc}")
@@ -2395,6 +3059,125 @@ class RunTracker:
         )
         return dict(result or {})
 
+    @contextmanager
+    def weave_span(
+        self,
+        *,
+        op_name: str,
+        inputs: Mapping[str, Any],
+        attributes: Optional[Mapping[str, Any]] = None,
+        display_name: Optional[str] = None,
+    ):
+        """Wrap a block of training code in a Weave parent call.
+
+        Uses the low-level WeaveClient API so that all nested ``@weave.op``
+        calls (rollout, reward, scoring, policy update, and their
+        per-completion children) automatically attach as children of this
+        span in Weave's call tree.
+        """
+
+        if self.weave_client is None or self.runtime.rank != 0:
+            yield None
+            return
+        create_call = getattr(self.weave_client, "create_call", None)
+        finish_call = getattr(self.weave_client, "finish_call", None)
+        fail_call = getattr(self.weave_client, "fail_call", None)
+        if not callable(create_call) or not callable(finish_call):
+            yield None
+            return
+        weave_attributes = getattr(weave, "attributes", None)
+        attribute_context = (
+            weave_attributes(dict(attributes)) if callable(weave_attributes) and attributes else nullcontext()
+        )
+        try:
+            call = create_call(
+                op=op_name,
+                inputs=dict(inputs),
+                attributes=dict(attributes) if attributes else None,
+                display_name=display_name,
+            )
+        except Exception as exc:
+            print(f"⚠️  Weave span create_call({op_name}) failed: {exc}", flush=True)
+            yield None
+            return
+        try:
+            with attribute_context:
+                yield call
+            try:
+                finish_call(call, output={"ok": True})
+            except Exception as exc:
+                print(f"⚠️  Weave span finish_call({op_name}) failed: {exc}", flush=True)
+        except BaseException as exc:
+            if callable(fail_call):
+                try:
+                    fail_call(call, exc)
+                except Exception as fail_exc:
+                    print(f"⚠️  Weave span fail_call({op_name}) failed: {fail_exc}", flush=True)
+            else:
+                try:
+                    finish_call(call, output=None, exception=exc)
+                except Exception as finish_exc:
+                    print(f"⚠️  Weave span finish_call({op_name}) on error failed: {finish_exc}", flush=True)
+            raise
+
+    @contextmanager
+    def weave_step_span(self, *, step: int, queries_per_step: int, rollouts_per_query: int):
+        inputs = {
+            "run_name": normalize_text(self.args.run_name).strip() or "<auto>",
+            "job_type": "train_rl",
+            "stage": "step",
+            "step": int(step),
+            "rank": int(self.runtime.rank),
+            "world_size": int(self.runtime.world_size),
+            "queries_per_step": int(queries_per_step),
+            "rollouts_per_query": int(rollouts_per_query),
+            "reasoning_prompt_style": normalize_text(
+                getattr(self.args, "reasoning_prompt_style", None)
+            ).strip()
+            or "paper_native_tight",
+            "selected_weave_prompt_ref": self.selected_weave_prompt_ref,
+        }
+        attributes = {
+            "job_type": "train_rl",
+            "stage": "step",
+            "step": int(step),
+            "rank": int(self.runtime.rank),
+            "run_name": inputs["run_name"],
+            "reasoning_prompt_style": inputs["reasoning_prompt_style"],
+            "selected_weave_prompt_ref": inputs["selected_weave_prompt_ref"],
+        }
+        with self.weave_span(
+            op_name="train_rl_step",
+            inputs=inputs,
+            attributes=attributes,
+        ) as call:
+            yield call
+
+    @contextmanager
+    def weave_query_span(self, *, step: int, split: str, protein_id: str, rollouts_per_query: int):
+        inputs = {
+            "run_name": normalize_text(self.args.run_name).strip() or "<auto>",
+            "job_type": "train_rl",
+            "stage": "query",
+            "step": int(step),
+            "rank": int(self.runtime.rank),
+            "split": normalize_text(split).strip() or "train",
+            "protein_id": normalize_text(protein_id).strip(),
+            "rollouts_per_query": int(rollouts_per_query),
+        }
+        attributes = self._build_weave_attributes(
+            stage="query",
+            step=step,
+            split=split,
+            protein_id=protein_id,
+        )
+        with self.weave_span(
+            op_name="train_rl_query",
+            inputs=inputs,
+            attributes=attributes,
+        ) as call:
+            yield call
+
     def log_rollout_trace(self, payload: Mapping[str, Any], trace_to_weave: bool = True) -> None:
         payload_dict = dict(payload)
         payload_dict.setdefault("run_name", normalize_text(self.args.run_name).strip() or "<auto>")
@@ -2594,6 +3377,81 @@ def resolve_checkpoint_dir(value: Any) -> Path:
     return checkpoint_dir.resolve()
 
 
+def resolve_checkpoint_source_dir(
+    value: Any,
+    *,
+    fallback_dir: Path,
+) -> Path:
+    raw_value = normalize_text(value).strip()
+    if raw_value:
+        candidate = Path(raw_value).expanduser()
+        if candidate.exists():
+            return candidate.resolve()
+        if is_probably_local_path(raw_value):
+            raise FileNotFoundError(f"Checkpoint source path does not exist: {candidate}")
+    return fallback_dir.resolve()
+
+
+def resolve_resume_checkpoint_root(value: Any) -> Path:
+    raw_value = normalize_text(value).strip()
+    if not raw_value:
+        raise ValueError("resume_from_export_artifact must be non-empty.")
+    resume_path = Path(raw_value).expanduser().resolve()
+    if not resume_path.exists():
+        raise FileNotFoundError(f"Resume checkpoint path does not exist: {resume_path}")
+    if resume_path.is_dir() and (resume_path / "training_metadata.json").exists():
+        return resume_path
+    if resume_path.is_dir() and resume_path.name == "inference_export" and (resume_path.parent / "training_metadata.json").exists():
+        return resume_path.parent
+    raise FileNotFoundError(
+        "Resume checkpoint must point to a checkpoint root containing training_metadata.json "
+        f"or its inference_export directory. Got: {resume_path}"
+    )
+
+
+def resolve_warm_resume_state(args: argparse.Namespace) -> Dict[str, Any]:
+    raw_resume = normalize_text(getattr(args, "resume_from_export_artifact", None)).strip()
+    if not raw_resume:
+        args.resume_from_export_artifact = ""
+        args.resume_parent_execution_id = ""
+        args.resume_start_step = 0
+        base_checkpoint = normalize_text(getattr(args, "base_checkpoint", None)).strip()
+        if base_checkpoint and is_probably_local_path(base_checkpoint) and Path(base_checkpoint).expanduser().exists():
+            args.reference_checkpoint_source = str(Path(base_checkpoint).expanduser().resolve())
+        else:
+            args.reference_checkpoint_source = normalize_text(args.text_model_name).strip()
+        args.initial_rollout_checkpoint_source = normalize_text(args.text_model_name).strip()
+        return {}
+
+    if normalize_text(getattr(args, "resume_mode", "warm")).strip() != "warm":
+        raise ValueError(f"Unsupported resume_mode={args.resume_mode!r}. Only 'warm' is supported.")
+
+    checkpoint_root = resolve_resume_checkpoint_root(raw_resume)
+    metadata = read_json(checkpoint_root / "training_metadata.json")
+    export_dir = checkpoint_root / "inference_export"
+    if not export_dir.exists():
+        raise FileNotFoundError(f"Resume checkpoint is missing inference_export: {export_dir}")
+
+    args.resume_from_export_artifact = str(checkpoint_root)
+    args.resume_checkpoint_root = str(checkpoint_root)
+    args.resume_export_dir = str(export_dir)
+    args.resume_parent_execution_id = normalize_text(metadata.get("execution_id")).strip()
+    args.resume_start_step = max(int(metadata.get("global_step", 0)), 0)
+    args.text_model_name = str(export_dir)
+    args.initial_rollout_checkpoint_source = str(export_dir)
+
+    reference_source = (
+        normalize_text(metadata.get("reference_checkpoint_source")).strip()
+        or normalize_text(metadata.get("base_checkpoint")).strip()
+        or normalize_text(getattr(args, "base_checkpoint", None)).strip()
+        or str(export_dir)
+    )
+    args.reference_checkpoint_source = reference_source
+    if not normalize_text(getattr(args, "base_checkpoint", None)).strip():
+        args.base_checkpoint = reference_source
+    return metadata
+
+
 def initialize_policy_stack(
     args: argparse.Namespace,
     runtime_spec: RuntimeSpec,
@@ -2632,12 +3490,24 @@ def initialize_policy_stack(
     tokenizer = engine.module.text_tokenizer
     pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
     base_checkpoint_dir = resolve_checkpoint_dir(args.text_model_name)
+    reference_checkpoint_source = (
+        normalize_text(getattr(args, "reference_checkpoint_source", None)).strip() or str(base_checkpoint_dir)
+    )
+    initial_rollout_checkpoint_source = (
+        normalize_text(getattr(args, "initial_rollout_checkpoint_source", None)).strip() or str(base_checkpoint_dir)
+    )
     return PolicyStack(
         engine=engine,
         tokenizer=tokenizer,
         pad_token_id=int(pad_token_id),
-        reference_checkpoint_dir=base_checkpoint_dir,
-        rollout_checkpoint_dir=base_checkpoint_dir,
+        reference_checkpoint_dir=resolve_checkpoint_source_dir(
+            reference_checkpoint_source,
+            fallback_dir=base_checkpoint_dir,
+        ),
+        rollout_checkpoint_dir=resolve_checkpoint_source_dir(
+            initial_rollout_checkpoint_source,
+            fallback_dir=base_checkpoint_dir,
+        ),
     )
 
 
@@ -3001,6 +3871,24 @@ def compute_chunk_loss(
     return loss, metrics
 
 
+def build_noop_policy_loss(current_model: Any, device: Any) -> Any:
+    require_torch()
+    for parameter in current_model.parameters():
+        if getattr(parameter, "requires_grad", False):
+            return parameter.reshape(-1)[:1].sum() * 0.0
+    return torch.zeros((), dtype=torch.float32, device=device, requires_grad=True)
+
+
+def assign_noop_log_probs(group: RolloutGroup, device: Any, policy_role: str) -> None:
+    require_torch()
+    selected_count = len(group.selected_completion_ids or [])
+    fallback = torch.zeros((selected_count,), dtype=torch.float32, device=device)
+    if policy_role == "old":
+        group.old_log_probs = fallback
+        return
+    group.ref_log_probs = fallback
+
+
 def prepare_group_for_loss(
     group: RolloutGroup,
     *,
@@ -3043,6 +3931,53 @@ def prepare_group_for_loss(
     }
 
 
+def build_policy_update_chunks(
+    local_groups: Sequence[RolloutGroup],
+    *,
+    chunk_size: int,
+    steps_per_generation: int,
+) -> List[Dict[str, Any]]:
+    resolved_chunk_size = max(1, int(chunk_size))
+    chunks: List[Dict[str, Any]] = []
+    for generation_index in range(int(steps_per_generation)):
+        for group_index, group in enumerate(local_groups):
+            selected_completion_ids = list(group.selected_completion_ids or [])
+            if not selected_completion_ids:
+                continue
+            total_rollouts = len(selected_completion_ids)
+            for start_idx in range(0, total_rollouts, resolved_chunk_size):
+                end_idx = min(total_rollouts, start_idx + resolved_chunk_size)
+                chunks.append(
+                    {
+                        "generation_index": int(generation_index),
+                        "group_index": int(group_index),
+                        "group": group,
+                        "completion_ids": selected_completion_ids[start_idx:end_idx],
+                        "advantages": group.advantages[start_idx:end_idx],
+                        "old_log_probs": group.old_log_probs[start_idx:end_idx],
+                        "ref_log_probs": group.ref_log_probs[start_idx:end_idx],
+                    }
+                )
+    return chunks
+
+
+def aggregate_policy_update_plan_payloads(payloads: Sequence[Mapping[str, Any]]) -> Dict[str, float]:
+    chunk_counts = [max(0, int(payload.get("chunk_count", 0))) for payload in payloads]
+    if not chunk_counts:
+        return {
+            "chunk_count_min": 0.0,
+            "chunk_count_max": 0.0,
+            "chunk_count_mean": 0.0,
+            "chunk_count_sum": 0.0,
+        }
+    return {
+        "chunk_count_min": float(min(chunk_counts)),
+        "chunk_count_max": float(max(chunk_counts)),
+        "chunk_count_mean": float(sum(chunk_counts) / len(chunk_counts)),
+        "chunk_count_sum": float(sum(chunk_counts)),
+    }
+
+
 def score_group_log_probs(
     *,
     policy_model: Any,
@@ -3082,8 +4017,10 @@ def score_group_log_probs(
 
 def save_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
+    tmp_path = path.with_name(f"{path.name}.tmp-{os.getpid()}-{time.time_ns()}")
+    with tmp_path.open("w", encoding="utf-8") as handle:
         json.dump(dict(payload), handle, indent=2, sort_keys=True)
+    os.replace(tmp_path, path)
 
 
 def export_inference_checkpoint(model: Any, export_dir: Path) -> None:
@@ -3207,7 +4144,20 @@ def rollout_worker_process_main(connection: Any, bootstrap: Mapping[str, Any]) -
         os.environ["WORLD_SIZE"] = "1"
 
         args = argparse.Namespace(**dict(bootstrap.get("args", {})))
+        runtime_rank = int(bootstrap.get("runtime_rank", 0))
         checkpoint_dir = Path(bootstrap["checkpoint_dir"])
+        vllm_port = resolve_rollout_worker_vllm_port(args, runtime_rank)
+        os.environ["VLLM_PORT"] = str(vllm_port)
+        vllm_host_ip = normalize_text(getattr(args, "rollout_worker_vllm_host_ip", "127.0.0.1")).strip() or "127.0.0.1"
+        os.environ["VLLM_HOST_IP"] = vllm_host_ip
+        print(
+            (
+                "[rollout-worker bootstrap] "
+                f"rank={runtime_rank} cuda={normalize_text(bootstrap.get('cuda_visible_device')).strip() or 'unknown'} "
+                f"VLLM_PORT={vllm_port} VLLM_HOST_IP={vllm_host_ip}"
+            ),
+            flush=True,
+        )
 
         def load_model(checkpoint_path: Path) -> Any:
             nonlocal model, sleeping
@@ -3302,12 +4252,62 @@ class VLLMRolloutWorker:
         self._connection = None
         self._process = None
         self._generation_counter = 0
+        self._last_generation_timed_out = False
+        self._last_generation_failed = False
+        self._last_generation_failure_reason = ""
         if self.backend != "subprocess":
             self._load(checkpoint_dir)
 
-    def _recv_response(self, expected_status: str = "ok") -> Mapping[str, Any]:
+    @property
+    def last_generation_timed_out(self) -> bool:
+        return bool(self._last_generation_timed_out)
+
+    @property
+    def last_generation_failed(self) -> bool:
+        return bool(self._last_generation_failed)
+
+    @property
+    def last_generation_failure_reason(self) -> str:
+        return normalize_text(self._last_generation_failure_reason).strip()
+
+    def _reset_generation_status(self) -> None:
+        self._last_generation_timed_out = False
+        self._last_generation_failed = False
+        self._last_generation_failure_reason = ""
+
+    def _fallback_outputs(
+        self,
+        *,
+        repeat_count: int,
+        query: PreparedQuery,
+        reason: str,
+        timed_out: bool = False,
+    ) -> List[str]:
+        protein_id = normalize_text(query.sample_meta.get("protein_id", "")).strip() or "<unknown>"
+        normalized_reason = normalize_text(reason).strip() or "rollout generation failed"
+        self._last_generation_timed_out = bool(timed_out)
+        self._last_generation_failed = True
+        self._last_generation_failure_reason = normalized_reason
+        rank_print(
+            self.runtime,
+            (
+                "rollout worker falling back to empty completions "
+                f"(protein_id={protein_id}, repeat_count={int(repeat_count)}, reason={normalized_reason})"
+            ),
+        )
+        return [""] * max(int(repeat_count), 0)
+
+    def _recv_response(self, expected_status: str = "ok", timeout_s: Optional[float] = None) -> Mapping[str, Any]:
         if self._connection is None:
             raise RuntimeError("Rollout worker subprocess is not initialized.")
+        if timeout_s is not None:
+            poll = getattr(self._connection, "poll", None)
+            if callable(poll) and not poll(float(timeout_s)):
+                exitcode = self._process.exitcode if self._process is not None else None
+                raise TimeoutError(
+                    "Timed out waiting for rollout worker subprocess response "
+                    f"after {float(timeout_s):.1f}s (exitcode={exitcode})."
+                )
         try:
             response = self._connection.recv()
         except EOFError as exc:
@@ -3323,29 +4323,66 @@ class VLLMRolloutWorker:
         return response
 
     def _start_subprocess(self, checkpoint_dir: Path) -> None:
-        ctx = mp.get_context(normalize_text(self.args.rollout_worker_start_method).strip() or "spawn")
-        parent_conn, child_conn = ctx.Pipe()
-        bootstrap = {
-            "checkpoint_dir": str(checkpoint_dir),
-            "cuda_visible_device": resolve_local_cuda_visible_device(self.runtime.local_rank),
-            "args": dict(vars(self.args)),
-        }
-        process = ctx.Process(
-            target=rollout_worker_process_main,
-            args=(child_conn, bootstrap),
-            daemon=False,
-        )
-        process.start()
-        child_conn.close()
-        self._connection = parent_conn
-        self._process = process
-        self._recv_response(expected_status="ready")
+        retry_count = max(int(getattr(self.args, "rollout_worker_startup_retry_count", 2)), 0)
+        retry_sleep_s = max(float(getattr(self.args, "rollout_worker_startup_retry_sleep_s", 10.0)), 0.0)
+        last_error: Optional[BaseException] = None
+        for attempt in range(retry_count + 1):
+            gc.collect()
+            if torch is not None and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            try:
+                ctx = mp.get_context(normalize_text(self.args.rollout_worker_start_method).strip() or "spawn")
+                parent_conn, child_conn = ctx.Pipe()
+                bootstrap = {
+                    "checkpoint_dir": str(checkpoint_dir),
+                    "cuda_visible_device": resolve_local_cuda_visible_device(self.runtime.local_rank),
+                    "args": dict(vars(self.args)),
+                    "runtime_rank": int(self.runtime.rank),
+                    "runtime_local_rank": int(self.runtime.local_rank),
+                }
+                process = ctx.Process(
+                    target=rollout_worker_process_main,
+                    args=(child_conn, bootstrap),
+                    daemon=False,
+                )
+                process.start()
+                child_conn.close()
+                self._connection = parent_conn
+                self._process = process
+                self._recv_response(expected_status="ready")
+                return
+            except Exception as exc:
+                last_error = exc
+                self._stop_subprocess()
+                if attempt >= retry_count:
+                    break
+                rank_print(
+                    self.runtime,
+                    (
+                        "rollout worker startup failed; retrying "
+                        f"(attempt={attempt + 1}/{retry_count + 1}, sleep_s={retry_sleep_s:.1f}, error={exc})"
+                    ),
+                )
+                if retry_sleep_s > 0:
+                    time.sleep(retry_sleep_s)
+        raise RuntimeError(f"Rollout worker startup failed after {retry_count + 1} attempt(s): {last_error}")
 
     def _stop_subprocess(self) -> None:
+        close_timeout_s = max(float(getattr(self.args, "rollout_worker_close_timeout_s", 10.0)), 0.0)
+        join_timeout_s = max(float(getattr(self.args, "rollout_worker_join_timeout_s", 10.0)), 0.0)
+        terminate_timeout_s = max(float(getattr(self.args, "rollout_worker_terminate_timeout_s", 5.0)), 0.0)
         if self._connection is not None:
             try:
                 self._connection.send({"cmd": "close"})
-                self._recv_response()
+                self._recv_response(timeout_s=close_timeout_s)
+            except TimeoutError:
+                rank_print(
+                    self.runtime,
+                    (
+                        "rollout worker close timed out; forcing subprocess termination "
+                        f"after {close_timeout_s:.1f}s"
+                    ),
+                )
             except Exception:
                 pass
             try:
@@ -3354,10 +4391,13 @@ class VLLMRolloutWorker:
                 pass
             self._connection = None
         if self._process is not None:
-            self._process.join(timeout=30.0)
+            self._process.join(timeout=join_timeout_s)
             if self._process.is_alive():
                 self._process.terminate()
-                self._process.join(timeout=10.0)
+                self._process.join(timeout=terminate_timeout_s)
+            if self._process.is_alive() and hasattr(self._process, "kill"):
+                self._process.kill()
+                self._process.join(timeout=terminate_timeout_s)
             self._process = None
 
     def unload(self) -> None:
@@ -3384,22 +4424,62 @@ class VLLMRolloutWorker:
         self._load(checkpoint_dir)
 
     def generate_group(self, query: PreparedQuery, repeat_count: int, sampling: SamplingSpec) -> List[str]:
+        self._reset_generation_status()
         generation_seed = int(self.args.seed) + (int(self.runtime.rank) * 100003) + self._generation_counter
         self._generation_counter += 1
         if self.backend == "subprocess":
-            if self._connection is None:
-                self._start_subprocess(self.checkpoint_dir)
-            self._connection.send(
-                {
-                    "cmd": "generate",
-                    "query": build_rollout_query_payload(query),
-                    "repeat_count": int(repeat_count),
-                    "sampling": asdict(sampling),
-                    "seed": generation_seed,
-                }
-            )
-            response = self._recv_response()
-            return [normalize_text(output).strip() for output in response.get("outputs", [])]
+            generate_timeout_s = max(float(getattr(self.args, "rollout_worker_generate_timeout_s", 900.0)), 0.0)
+            try:
+                if self._connection is None:
+                    self._start_subprocess(self.checkpoint_dir)
+                self._connection.send(
+                    {
+                        "cmd": "generate",
+                        "query": build_rollout_query_payload(query),
+                        "repeat_count": int(repeat_count),
+                        "sampling": asdict(sampling),
+                        "seed": generation_seed,
+                    }
+                )
+                response = self._recv_response(timeout_s=generate_timeout_s)
+            except TimeoutError as exc:
+                protein_id = normalize_text(query.sample_meta.get("protein_id", "")).strip() or "<unknown>"
+                rank_print(
+                    self.runtime,
+                    (
+                        "rollout worker generate timed out "
+                        f"(protein_id={protein_id}, repeat_count={int(repeat_count)}, timeout_s={generate_timeout_s:.1f})"
+                    ),
+                )
+                self._stop_subprocess()
+                return self._fallback_outputs(
+                    repeat_count=repeat_count,
+                    query=query,
+                    reason=(
+                        "rollout worker generate timed out "
+                        f"after {generate_timeout_s:.1f}s for protein_id={protein_id}"
+                    ),
+                    timed_out=True,
+                )
+            except Exception as exc:
+                self._stop_subprocess()
+                return self._fallback_outputs(
+                    repeat_count=repeat_count,
+                    query=query,
+                    reason=f"rollout worker subprocess error: {exc}",
+                )
+            outputs = [normalize_text(output).strip() for output in response.get("outputs", [])]
+            if len(outputs) != int(repeat_count):
+                protein_id = normalize_text(query.sample_meta.get("protein_id", "")).strip() or "<unknown>"
+                rank_print(
+                    self.runtime,
+                    (
+                        "rollout worker returned an unexpected number of outputs; normalizing "
+                        f"(protein_id={protein_id}, expected={int(repeat_count)}, received={len(outputs)})"
+                    ),
+                )
+                outputs = outputs[: int(repeat_count)] + [""] * max(int(repeat_count) - len(outputs), 0)
+            return outputs
         if self.model is None:
             self._load(self.checkpoint_dir)
         rollout_batch = repeat_query_for_rollouts(query, repeat_count, query.input_ids.device)
@@ -3421,7 +4501,21 @@ class VLLMRolloutWorker:
             seed=generation_seed,
             stop=ROLLOUT_STOP_MARKERS,
         )
-        return [normalize_text(output).strip() for output in outputs]
+        normalized_outputs = [normalize_text(output).strip() for output in outputs]
+        if len(normalized_outputs) != int(repeat_count):
+            protein_id = normalize_text(query.sample_meta.get("protein_id", "")).strip() or "<unknown>"
+            rank_print(
+                self.runtime,
+                (
+                    "direct rollout model returned an unexpected number of outputs; normalizing "
+                    f"(protein_id={protein_id}, expected={int(repeat_count)}, received={len(normalized_outputs)})"
+                ),
+            )
+            normalized_outputs = normalized_outputs[: int(repeat_count)] + [""] * max(
+                int(repeat_count) - len(normalized_outputs),
+                0,
+            )
+        return normalized_outputs
 
     def close(self) -> None:
         if self.backend == "subprocess":
@@ -3454,6 +4548,8 @@ def maybe_trace_group(
                 "rollout_idx": rollout_idx,
                 "reward": float(reward),
                 "completion": completion,
+                "rollout_failed": bool(group.rollout_failed),
+                "rollout_failure_reason": normalize_text(group.rollout_failure_reason).strip(),
                 "target_go_ids": build_target_go_ids(group.query.sample_meta),
                 "predicted_go_ids": list(format_summary["parsed_go_ids"]),
                 "format_summary": dict(format_summary),
@@ -3529,26 +4625,54 @@ def save_training_checkpoint(
     step: int,
     tracker: RunTracker,
     runtime: DistributedRuntime,
+    *,
+    sync_root: Optional[Path] = None,
 ) -> None:
     checkpoint_root = Path(args.output_dir) / "checkpoints" / f"step-{step:06d}"
     checkpoint_root.mkdir(parents=True, exist_ok=True)
-    policy_stack.engine.save_checkpoint(str(checkpoint_root / "deepspeed"))
-    barrier(runtime)
-    if runtime.rank == 0:
+    if not parse_bool(getattr(args, "checkpoint_export_only", False)):
+        policy_stack.engine.save_checkpoint(str(checkpoint_root / "deepspeed"))
+        barrier(runtime)
+    else:
+        rank0_print(runtime, f"Skipping DeepSpeed checkpoint save for export-only checkpoint at step {step}.")
+
+    def rank0_checkpoint_action() -> None:
         export_dir = checkpoint_root / "inference_export"
         export_inference_checkpoint(policy_stack.engine.module, export_dir)
         metadata = {
             "global_step": step,
+            "execution_id": normalize_text(getattr(args, "execution_id", None)).strip(),
             "checkpoint_artifact_name": args.checkpoint_artifact_name,
             "base_checkpoint": normalize_text(args.base_checkpoint).strip() or args.text_model_name,
             "benchmark_version": args.benchmark_version,
             "dataset_artifact": args.dataset_artifact,
             "runtime_stack": args.runtime_stack,
+            "checkpoint_export_only": bool(parse_bool(getattr(args, "checkpoint_export_only", False))),
+            "reasoning_prompt_style": normalize_text(getattr(args, "reasoning_prompt_style", None)).strip(),
+            "seed": int(getattr(args, "seed", 0)),
+            "queries_per_step": int(getattr(args, "queries_per_step", 0)),
+            "rollouts_per_query": int(getattr(args, "rollouts_per_query", 0)),
+            "max_new_tokens": int(getattr(args, "max_new_tokens", 0)),
+            "steps_per_generation": int(getattr(args, "steps_per_generation", 0)),
+            "sync_root": normalize_text(getattr(args, "sync_root", None)).strip(),
+            "resume_mode": normalize_text(getattr(args, "resume_mode", None)).strip() or "warm",
+            "resume_from_export_artifact": normalize_text(getattr(args, "resume_from_export_artifact", None)).strip(),
+            "resume_parent_execution_id": normalize_text(getattr(args, "resume_parent_execution_id", None)).strip(),
+            "reference_checkpoint_source": str(policy_stack.reference_checkpoint_dir),
+            "rollout_checkpoint_source": str(policy_stack.rollout_checkpoint_dir),
         }
         save_json(checkpoint_root / "training_metadata.json", metadata)
         aliases = [item.strip() for item in normalize_text(args.checkpoint_artifact_aliases).split(",") if item.strip()]
         tracker.log_checkpoint_artifact(checkpoint_root, aliases=aliases or ["latest"], metadata=metadata)
-    barrier(runtime)
+
+    run_rank0_serial_section(
+        runtime=runtime,
+        output_dir=Path(args.output_dir).resolve(),
+        section_name="checkpoint_artifact",
+        step=step,
+        action=rank0_checkpoint_action,
+        sync_root=sync_root,
+    )
 
 
 def refresh_old_policy_and_rollout_worker(
@@ -3569,8 +4693,12 @@ def train(args: argparse.Namespace) -> None:
     validate_runtime_dependencies()
     run_name = normalize_text(args.run_name).strip() or f"train-rl-{int(time.time())}"
     args.run_name = run_name
+    output_dir = Path(args.output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    resolve_warm_resume_state(args)
     if not normalize_text(args.base_checkpoint).strip():
-        args.base_checkpoint = args.text_model_name
+        args.base_checkpoint = normalize_text(getattr(args, "reference_checkpoint_source", None)).strip() or args.text_model_name
     validate_spec_inputs(args)
 
     algorithm = build_algorithm_spec(args)
@@ -3580,9 +4708,11 @@ def train(args: argparse.Namespace) -> None:
     runtime = initialize_runtime(args)
     validate_runtime_shape(runtime, algorithm, runtime_spec, args)
     configure_query_parallel_runtime(runtime, algorithm)
-
-    output_dir = Path(args.output_dir).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    args.execution_id = resolve_execution_id(args)
+    sync_root = resolve_sync_root(args, output_dir, args.execution_id)
+    args.sync_root = str(sync_root)
+    initialize_run_sync_root(runtime, sync_root, args.execution_id)
+    resume_start_step = int(getattr(args, "resume_start_step", 0))
 
     rank0_print(runtime, "Loading train / validation datasets for spec-first DR-GRPO.")
     train_dataset, validation_dataset = load_reasoning_datasets(args, runtime)
@@ -3610,8 +4740,41 @@ def train(args: argparse.Namespace) -> None:
     rank0_print(runtime, "Initializing the vLLM rollout worker from the canonical base checkpoint.")
     rollout_worker = VLLMRolloutWorker(args, policy_stack.rollout_checkpoint_dir, runtime)
 
+    def _iterate_steps_with_weave_span() -> Iterable[int]:
+        """Yield each training step inside a ``train_rl_step`` Weave parent span.
+
+        Using a generator with ``yield`` nested inside the ``with`` block means
+        every nested ``@weave.op`` call (rollout, reward, scoring, policy update
+        and their per-rollout/per-reward children) automatically attaches to
+        this parent in the Weave call tree — without requiring the body of the
+        step loop to be reindented or refactored.
+        """
+
+        for _step in range(resume_start_step, int(args.max_steps)):
+            with tracker.weave_step_span(
+                step=_step + 1,
+                queries_per_step=int(algorithm.queries_per_step),
+                rollouts_per_query=int(algorithm.rollouts_per_query),
+            ):
+                yield _step
+
+    def _iterate_queries_with_weave_span(
+        step_index: int, queries: Sequence["PreparedQuery"]
+    ) -> Iterable["PreparedQuery"]:
+        """Yield each local query inside a ``train_rl_query`` parent span."""
+
+        for _query in queries:
+            protein_id = normalize_text(_query.sample_meta.get("protein_id", "")).strip()
+            with tracker.weave_query_span(
+                step=step_index + 1,
+                split="train",
+                protein_id=protein_id,
+                rollouts_per_query=int(algorithm.rollouts_per_query),
+            ):
+                yield _query
+
     try:
-        for step in range(int(args.max_steps)):
+        for step in _iterate_steps_with_weave_span():
             step_started_at = time.perf_counter()
             rollout_seconds = 0.0
             reward_seconds = 0.0
@@ -3620,6 +4783,10 @@ def train(args: argparse.Namespace) -> None:
             refresh_seconds = 0.0
             validation_seconds = 0.0
             checkpoint_seconds = 0.0
+            scoring_failure_count = 0.0
+            policy_noop_chunk_count = 0.0
+            rank_phase_mismatch_count = 0.0
+            degraded_step = 0.0
             global_query_indices = sample_query_indices(
                 dataset_length=len(train_dataset),
                 queries_per_step=algorithm.queries_per_step,
@@ -3644,22 +4811,39 @@ def train(args: argparse.Namespace) -> None:
                 )
 
             local_groups: List[RolloutGroup] = []
-            for query in local_queries:
+            for query in _iterate_queries_with_weave_span(step, local_queries):
                 rollout_started_at = time.perf_counter()
+                protein_id = normalize_text(query.sample_meta.get("protein_id", "")).strip() or "<unknown>"
+                local_repeat_count = resolve_local_rollouts_per_rank(algorithm, runtime.world_size)
+                rank_print(
+                    runtime,
+                    (
+                        f"step {step + 1}: starting rollout generation "
+                        f"(protein_id={protein_id}, local_repeat_count={local_repeat_count})"
+                    ),
+                )
                 completions = tracker.trace_rollout_call(
                     step=step + 1,
                     split="train",
                     query=query,
-                    repeat_count=resolve_local_rollouts_per_rank(algorithm, runtime.world_size),
+                    repeat_count=local_repeat_count,
                     sampling=sampling,
                     generator=lambda current_query=query: rollout_worker.generate_group(
                         current_query,
-                        resolve_local_rollouts_per_rank(algorithm, runtime.world_size),
+                        local_repeat_count,
                         sampling,
                     ),
                     tokenizer=policy_stack.tokenizer,
                 )
-                rollout_seconds += time.perf_counter() - rollout_started_at
+                rollout_duration = time.perf_counter() - rollout_started_at
+                rollout_seconds += rollout_duration
+                rank_print(
+                    runtime,
+                    (
+                        f"step {step + 1}: finished rollout generation "
+                        f"(protein_id={protein_id}, local_repeat_count={len(completions)}, duration_s={rollout_duration:.2f})"
+                    ),
+                )
                 completion_ids = tokenize_completion_texts(policy_stack.tokenizer, completions, runtime.device)
                 reward_started_at = time.perf_counter()
                 rewards = tracker.trace_reward_call(
@@ -3683,6 +4867,8 @@ def train(args: argparse.Namespace) -> None:
                     completions=completions,
                     completion_ids=completion_ids,
                     rewards=rewards,
+                    rollout_failed=rollout_worker.last_generation_failed,
+                    rollout_failure_reason=rollout_worker.last_generation_failure_reason,
                 )
                 local_groups.append(group)
                 maybe_trace_group(tracker, runtime, step, group)
@@ -3694,15 +4880,40 @@ def train(args: argparse.Namespace) -> None:
                     f"(local_queries={len(local_queries)}, local_rollouts={sum(len(group.completions) for group in local_groups)})"
                 ),
             )
+            rank_print(runtime, f"step {step + 1}: unloading rollout worker before reward reduction")
             rollout_worker.unload()
+            rank_print(runtime, f"step {step + 1}: rollout worker unload complete")
+            run_phase_journal_barrier(
+                runtime=runtime,
+                output_dir=output_dir,
+                sync_root=sync_root,
+                phase_name="reward_reduce_start",
+                step=step + 1,
+                group_ranks=tuple(range(runtime.world_size)) if runtime.enabled else (0,),
+                group_name="world",
+                payload={
+                    "local_query_count": len(local_queries),
+                    "local_rollout_count": sum(len(group.completions) for group in local_groups),
+                },
+            )
+            rank_print(runtime, f"step {step + 1}: starting reward reduction")
             global_reward_std = compute_global_reward_std(
                 [group.rewards for group in local_groups],
                 runtime=runtime,
+                output_dir=output_dir,
+                step=step + 1,
                 epsilon=algorithm.reward_std_epsilon,
+                sync_root=sync_root,
             )
 
             for group in local_groups:
-                query_group_mean = compute_query_group_mean(group.rewards, runtime)
+                query_group_mean = compute_query_group_mean(
+                    group.rewards,
+                    runtime,
+                    output_dir=output_dir,
+                    step=step + 1,
+                    sync_root=sync_root,
+                )
                 prepare_group_for_loss(
                     group,
                     global_reward_std=global_reward_std,
@@ -3710,6 +4921,20 @@ def train(args: argparse.Namespace) -> None:
                     runtime_device=runtime.device,
                     max_loss_completion_tokens=int(args.max_loss_completion_tokens),
                 )
+            rank_print(
+                runtime,
+                f"step {step + 1}: reward reduction complete (global_reward_std={global_reward_std:.6f})",
+            )
+            run_phase_journal_barrier(
+                runtime=runtime,
+                output_dir=output_dir,
+                sync_root=sync_root,
+                phase_name="reward_reduce_done",
+                step=step + 1,
+                group_ranks=tuple(range(runtime.world_size)) if runtime.enabled else (0,),
+                group_name="world",
+                payload={"global_reward_std": float(global_reward_std)},
+            )
 
             rank_print(runtime, f"step {step + 1}: starting old/ref log-prob scoring")
             scoring_started_at = time.perf_counter()
@@ -3719,33 +4944,69 @@ def train(args: argparse.Namespace) -> None:
                     ("ref", policy_stack.reference_checkpoint_dir),
                 ]
                 for policy_role, checkpoint_dir in scoring_specs:
-                    scoring_model = load_frozen_scoring_model(args, checkpoint_dir, runtime)
+                    try:
+                        scoring_model = load_frozen_scoring_model(args, checkpoint_dir, runtime)
+                    except Exception as exc:
+                        scoring_failure_count += float(len(local_groups))
+                        degraded_step = 1.0
+                        rank_print(
+                            runtime,
+                            (
+                                f"step {step + 1}: failed to load {policy_role} scoring model; "
+                                f"falling back to no-op log probs (error={exc})"
+                            ),
+                        )
+                        for group in local_groups:
+                            assign_noop_log_probs(group, runtime.device, policy_role)
+                        continue
                     try:
                         for group in local_groups:
                             completion_token_lengths = [int(item.numel()) for item in group.completion_ids]
-                            tracker.trace_scoring_call(
-                                step=step + 1,
-                                split="train",
-                                query=group.query,
-                                payload={
-                                    "policy_role": policy_role,
-                                    "checkpoint_dir": str(checkpoint_dir),
-                                    "raw_rollout_count": len(group.completion_ids),
-                                    "completion_token_lengths": completion_token_lengths,
-                                    "max_loss_completion_tokens": int(args.max_loss_completion_tokens),
-                                },
-                                callback=lambda current_group=group, current_role=policy_role, current_model=scoring_model: score_group_log_probs(
-                                    policy_model=current_model,
-                                    group=current_group,
-                                    pad_token_id=policy_stack.pad_token_id,
-                                    device=runtime.device,
-                                    logprob_microbatch_size=int(args.rollout_logprob_microbatch_size),
-                                    policy_role=current_role,
-                                ),
-                            )
+                            try:
+                                tracker.trace_scoring_call(
+                                    step=step + 1,
+                                    split="train",
+                                    query=group.query,
+                                    payload={
+                                        "policy_role": policy_role,
+                                        "checkpoint_dir": str(checkpoint_dir),
+                                        "raw_rollout_count": len(group.completion_ids),
+                                        "completion_token_lengths": completion_token_lengths,
+                                        "max_loss_completion_tokens": int(args.max_loss_completion_tokens),
+                                    },
+                                    callback=lambda current_group=group, current_role=policy_role, current_model=scoring_model: score_group_log_probs(
+                                        policy_model=current_model,
+                                        group=current_group,
+                                        pad_token_id=policy_stack.pad_token_id,
+                                        device=runtime.device,
+                                        logprob_microbatch_size=int(args.rollout_logprob_microbatch_size),
+                                        policy_role=current_role,
+                                    ),
+                                )
+                            except Exception as exc:
+                                scoring_failure_count += 1.0
+                                degraded_step = 1.0
+                                rank_print(
+                                    runtime,
+                                    (
+                                        f"step {step + 1}: scoring failed for {policy_role}; "
+                                        f"falling back to no-op log probs (protein_id={normalize_text(group.query.sample_meta.get('protein_id', '')).strip() or '<unknown>'}, error={exc})"
+                                    ),
+                                )
+                                assign_noop_log_probs(group, runtime.device, policy_role)
                     finally:
                         cleanup_policy_model(scoring_model)
             scoring_seconds = time.perf_counter() - scoring_started_at
+            run_phase_journal_barrier(
+                runtime=runtime,
+                output_dir=output_dir,
+                sync_root=sync_root,
+                phase_name="scoring_done",
+                step=step + 1,
+                group_ranks=tuple(range(runtime.world_size)) if runtime.enabled else (0,),
+                group_name="world",
+                payload={"scoring_failure_count": float(scoring_failure_count)},
+            )
 
             rank_print(
                 runtime,
@@ -3761,50 +5022,108 @@ def train(args: argparse.Namespace) -> None:
             ratio_maxes: List[float] = []
             filtered_rollout_counts = [float(group.filtered_rollouts) for group in local_groups]
             valid_rollout_counts = [float(len(group.selected_completion_ids or [])) for group in local_groups]
+            chunk_size = max(1, int(runtime_spec.optimizer_micro_batch_size_per_gpu))
+            planned_update_chunks = build_policy_update_chunks(
+                local_groups,
+                chunk_size=chunk_size,
+                steps_per_generation=algorithm.steps_per_generation,
+            )
+            chunk_plan_metrics = run_file_backed_scalar_collective(
+                runtime=runtime,
+                output_dir=output_dir,
+                sync_root=sync_root,
+                reduction_name="policy_update_plan",
+                step=step + 1,
+                group_ranks=tuple(range(runtime.world_size)),
+                group_name="world",
+                local_payload={"chunk_count": len(planned_update_chunks)},
+                aggregate_fn=aggregate_policy_update_plan_payloads,
+            )
+            planned_chunk_count = int(len(planned_update_chunks))
+            min_chunk_count = int(chunk_plan_metrics.get("chunk_count_min", 0.0))
+            max_chunk_count = int(chunk_plan_metrics.get("chunk_count_max", 0.0))
+            agreed_chunk_count = int(max_chunk_count)
+            chunk_plan_mismatch = float(planned_chunk_count != max_chunk_count or min_chunk_count != max_chunk_count)
+            if chunk_plan_mismatch > 0.0:
+                rank_print(
+                    runtime,
+                    (
+                        f"step {step + 1}: policy update chunk mismatch detected "
+                        f"(local={planned_chunk_count}, min={min_chunk_count}, max={max_chunk_count}); "
+                        f"padding to agreed count."
+                    ),
+                )
+                degraded_step = 1.0
+            effective_update_chunks = list(planned_update_chunks)
+            if len(effective_update_chunks) < agreed_chunk_count:
+                effective_update_chunks.extend({"noop": True} for _ in range(agreed_chunk_count - len(effective_update_chunks)))
 
             rank_print(runtime, f"step {step + 1}: starting policy updates")
 
             def run_policy_updates() -> Dict[str, Any]:
                 chunk_count = 0
-                for _ in range(algorithm.steps_per_generation):
-                    for group in local_groups:
-                        selected_completion_ids = list(group.selected_completion_ids or [])
-                        if not selected_completion_ids:
-                            continue
-                        policy_stack.engine.zero_grad()
-                        chunk_size = int(runtime_spec.optimizer_micro_batch_size_per_gpu)
-                        total_rollouts = len(selected_completion_ids)
-                        for start_idx in range(0, total_rollouts, chunk_size):
-                            end_idx = min(total_rollouts, start_idx + chunk_size)
-                            chunk_completion_ids = selected_completion_ids[start_idx:end_idx]
-                            chunk_advantages = group.advantages[start_idx:end_idx]
-                            chunk_old_log_probs = group.old_log_probs[start_idx:end_idx]
-                            chunk_ref_log_probs = group.ref_log_probs[start_idx:end_idx]
-                            loss_scale = resolve_disease_loss_scale(
-                                group.query.sample_meta, disease_loss_weight
-                            )
+                noop_chunk_count = 0
+                for chunk in effective_update_chunks:
+                    policy_stack.engine.zero_grad()
+                    if chunk.get("noop"):
+                        loss = build_noop_policy_loss(policy_stack.engine.module, runtime.device)
+                        chunk_metrics = {
+                            "ratio_mean": 1.0,
+                            "ratio_max": 1.0,
+                            "kl_mean": 0.0,
+                            "policy_objective_mean": 0.0,
+                        }
+                        noop_chunk_count += 1
+                    else:
+                        group = chunk["group"]
+                        loss_scale = resolve_disease_loss_scale(
+                            group.query.sample_meta, disease_loss_weight
+                        )
+                        try:
                             loss, chunk_metrics = compute_chunk_loss(
                                 current_model=policy_stack.engine.module,
                                 query=group.query,
-                                completion_ids=chunk_completion_ids,
-                                advantages=chunk_advantages,
-                                old_log_probs=chunk_old_log_probs,
-                                ref_log_probs=chunk_ref_log_probs,
+                                completion_ids=chunk["completion_ids"],
+                                advantages=chunk["advantages"],
+                                old_log_probs=chunk["old_log_probs"],
+                                ref_log_probs=chunk["ref_log_probs"],
                                 algorithm=algorithm,
                                 pad_token_id=policy_stack.pad_token_id,
                                 device=runtime.device,
                                 logprob_microbatch_size=int(args.rollout_logprob_microbatch_size),
                                 loss_scale=loss_scale,
                             )
-                            policy_stack.engine.backward(loss)
-                            policy_stack.engine.step()
-                            policy_loss_values.append(float(loss.detach().item()))
-                            kl_values.append(float(chunk_metrics["kl_mean"]))
-                            ratio_means.append(float(chunk_metrics["ratio_mean"]))
-                            ratio_maxes.append(float(chunk_metrics["ratio_max"]))
-                            chunk_count += 1
+                        except Exception as exc:
+                            rank_print(
+                                runtime,
+                                (
+                                    f"step {step + 1}: policy chunk failed; using no-op loss "
+                                    f"(error={exc})"
+                                ),
+                            )
+                            loss = build_noop_policy_loss(policy_stack.engine.module, runtime.device)
+                            chunk_metrics = {
+                                "ratio_mean": 1.0,
+                                "ratio_max": 1.0,
+                                "kl_mean": 0.0,
+                                "policy_objective_mean": 0.0,
+                            }
+                            noop_chunk_count += 1
+                    policy_stack.engine.backward(loss)
+                    policy_stack.engine.step()
+                    policy_loss_values.append(float(loss.detach().item()))
+                    kl_values.append(float(chunk_metrics["kl_mean"]))
+                    ratio_means.append(float(chunk_metrics["ratio_mean"]))
+                    ratio_maxes.append(float(chunk_metrics["ratio_max"]))
+                    chunk_count += 1
                 return {
                     "update_chunk_count": chunk_count,
+                    "planned_update_chunk_count": int(planned_chunk_count),
+                    "agreed_update_chunk_count": int(agreed_chunk_count),
+                    "min_update_chunk_count": int(min_chunk_count),
+                    "max_update_chunk_count": int(max_chunk_count),
+                    "update_chunk_mismatch": float(chunk_plan_mismatch),
+                    "policy_noop_chunk_count": int(noop_chunk_count),
                     "valid_rollout_count": int(sum(len(group.selected_completion_ids or []) for group in local_groups)),
                     "policy_loss_mean": mean_or_zero(policy_loss_values),
                     "kl_mean": mean_or_zero(kl_values),
@@ -3813,7 +5132,7 @@ def train(args: argparse.Namespace) -> None:
                 }
 
             policy_update_started_at = time.perf_counter()
-            tracker.trace_policy_update_call(
+            policy_update_summary = tracker.trace_policy_update_call(
                 step=step + 1,
                 split="train",
                 callback=run_policy_updates,
@@ -3822,9 +5141,17 @@ def train(args: argparse.Namespace) -> None:
                     "optimizer_micro_batch_size_per_gpu": int(runtime_spec.optimizer_micro_batch_size_per_gpu),
                     "valid_rollout_counts": [int(value) for value in valid_rollout_counts],
                     "filtered_rollout_counts": [int(value) for value in filtered_rollout_counts],
+                    "planned_update_chunk_count": int(planned_chunk_count),
+                    "agreed_update_chunk_count": int(agreed_chunk_count),
+                    "min_update_chunk_count": int(min_chunk_count),
+                    "max_update_chunk_count": int(max_chunk_count),
+                    "update_chunk_mismatch": float(chunk_plan_mismatch),
                 },
             )
             policy_update_seconds = time.perf_counter() - policy_update_started_at
+            policy_noop_chunk_count = float(policy_update_summary.get("policy_noop_chunk_count", 0.0))
+            if policy_noop_chunk_count > 0.0:
+                degraded_step = 1.0
 
             rank_print(runtime, f"step {step + 1}: policy updates complete, refreshing rollout worker")
             refresh_started_at = time.perf_counter()
@@ -3836,7 +5163,19 @@ def train(args: argparse.Namespace) -> None:
                 step=step + 1,
             )
             rank_print(runtime, f"step {step + 1}: waiting at post-refresh barrier")
-            barrier(runtime)
+            run_phase_journal_barrier(
+                runtime=runtime,
+                output_dir=output_dir,
+                sync_root=sync_root,
+                phase_name="refresh_done",
+                step=step + 1,
+                group_ranks=tuple(range(runtime.world_size)) if runtime.enabled else (0,),
+                group_name="world",
+                payload={
+                    "update_chunk_count": int(policy_update_summary.get("update_chunk_count", 0)),
+                    "policy_noop_chunk_count": int(policy_noop_chunk_count),
+                },
+            )
             rank_print(runtime, f"step {step + 1}: passed post-refresh barrier")
             refresh_seconds = time.perf_counter() - refresh_started_at
 
@@ -3850,6 +5189,11 @@ def train(args: argparse.Namespace) -> None:
                 "reward_mean": mean_or_zero(local_rewards),
                 "reward_nonzero_rate": mean_or_zero([1.0 if reward > 0.0 else 0.0 for reward in local_rewards]),
                 "reward_std": float(global_reward_std),
+                "degraded_step": float(degraded_step),
+                "rollout_failure_count": sum(1.0 for group in local_groups if group.rollout_failed),
+                "scoring_failure_count": float(scoring_failure_count),
+                "policy_noop_chunk_count": float(policy_noop_chunk_count),
+                "rank_phase_mismatch_count": float(rank_phase_mismatch_count),
                 "format_valid_rate": mean_or_zero(
                     [1.0 if summary["format_valid"] else 0.0 for summary in local_format_summaries]
                 ),
@@ -3883,6 +5227,12 @@ def train(args: argparse.Namespace) -> None:
                 "ratio_max": max(ratio_maxes) if ratio_maxes else 0.0,
                 "filtered_rollouts": sum(filtered_rollout_counts),
                 "valid_rollouts": sum(valid_rollout_counts),
+                "update_chunk_count": float(policy_update_summary.get("update_chunk_count", len(effective_update_chunks))),
+                "planned_update_chunk_count": float(planned_chunk_count),
+                "agreed_update_chunk_count": float(agreed_chunk_count),
+                "min_update_chunk_count": float(min_chunk_count),
+                "max_update_chunk_count": float(max_chunk_count),
+                "update_chunk_mismatch": float(chunk_plan_mismatch),
                 "learning_rate": float(policy_stack.engine.optimizer.param_groups[0]["lr"]),
                 "step": float(step + 1),
                 "timing_rollout_seconds": rollout_seconds,
@@ -3892,43 +5242,62 @@ def train(args: argparse.Namespace) -> None:
                 "timing_refresh_seconds": refresh_seconds,
             }
 
-            aggregated_metrics = {
-                "reward_mean": all_reduce_sum_scalar(metrics["reward_mean"], runtime) / float(runtime.world_size),
-                "reward_nonzero_rate": all_reduce_sum_scalar(metrics["reward_nonzero_rate"], runtime) / float(runtime.world_size),
-                "reward_std": metrics["reward_std"],
-                "format_valid_rate": all_reduce_sum_scalar(metrics["format_valid_rate"], runtime) / float(runtime.world_size),
-                "final_answer_tag_rate": all_reduce_sum_scalar(metrics["final_answer_tag_rate"], runtime) / float(runtime.world_size),
-                "go_summary_block_rate": all_reduce_sum_scalar(metrics["go_summary_block_rate"], runtime) / float(runtime.world_size),
-                "alt_final_answer_close_tag_rate": all_reduce_sum_scalar(
-                    metrics["alt_final_answer_close_tag_rate"], runtime
-                )
-                / float(runtime.world_size),
-                "unclosed_final_answer_tag_rate": all_reduce_sum_scalar(
-                    metrics["unclosed_final_answer_tag_rate"], runtime
-                )
-                / float(runtime.world_size),
-                "repeated_final_answer_open_tag_rate": all_reduce_sum_scalar(
-                    metrics["repeated_final_answer_open_tag_rate"], runtime
-                )
-                / float(runtime.world_size),
-                "tool_call_residue_rate": all_reduce_sum_scalar(metrics["tool_call_residue_rate"], runtime)
-                / float(runtime.world_size),
-                "think_residue_rate": all_reduce_sum_scalar(metrics["think_residue_rate"], runtime)
-                / float(runtime.world_size),
-                "parsed_go_count_mean": all_reduce_sum_scalar(metrics["parsed_go_count_mean"], runtime) / float(runtime.world_size),
-                "loss_mean": all_reduce_sum_scalar(metrics["loss_mean"], runtime) / float(runtime.world_size),
-                "kl_mean": all_reduce_sum_scalar(metrics["kl_mean"], runtime) / float(runtime.world_size),
-                "ratio_mean": all_reduce_sum_scalar(metrics["ratio_mean"], runtime) / float(runtime.world_size),
-                "ratio_max": all_reduce_max_scalar(metrics["ratio_max"], runtime),
-                "filtered_rollouts": all_reduce_sum_scalar(metrics["filtered_rollouts"], runtime),
-                "valid_rollouts": all_reduce_sum_scalar(metrics["valid_rollouts"], runtime),
-                "learning_rate": metrics["learning_rate"],
-                "timing_rollout_seconds": all_reduce_max_scalar(metrics["timing_rollout_seconds"], runtime),
-                "timing_reward_seconds": all_reduce_max_scalar(metrics["timing_reward_seconds"], runtime),
-                "timing_scoring_seconds": all_reduce_max_scalar(metrics["timing_scoring_seconds"], runtime),
-                "timing_policy_update_seconds": all_reduce_max_scalar(metrics["timing_policy_update_seconds"], runtime),
-                "timing_refresh_seconds": all_reduce_max_scalar(metrics["timing_refresh_seconds"], runtime),
-            }
+            aggregated_metrics = run_file_backed_scalar_collective(
+                runtime=runtime,
+                output_dir=output_dir,
+                sync_root=sync_root,
+                reduction_name="step_metrics",
+                step=step + 1,
+                group_ranks=tuple(range(runtime.world_size)) if runtime.enabled else (0,),
+                group_name="world",
+                local_payload=metrics,
+                aggregate_fn=lambda payloads: aggregate_step_metric_payloads(
+                    payloads,
+                    mean_keys=(
+                        "reward_mean",
+                        "reward_nonzero_rate",
+                        "format_valid_rate",
+                        "final_answer_tag_rate",
+                        "go_summary_block_rate",
+                        "alt_final_answer_close_tag_rate",
+                        "unclosed_final_answer_tag_rate",
+                        "repeated_final_answer_open_tag_rate",
+                        "tool_call_residue_rate",
+                        "think_residue_rate",
+                        "parsed_go_count_mean",
+                        "loss_mean",
+                        "kl_mean",
+                        "ratio_mean",
+                        "update_chunk_count",
+                    ),
+                    sum_keys=(
+                        "rollout_failure_count",
+                        "scoring_failure_count",
+                        "policy_noop_chunk_count",
+                        "rank_phase_mismatch_count",
+                        "filtered_rollouts",
+                        "valid_rollouts",
+                    ),
+                    max_keys=(
+                        "degraded_step",
+                        "ratio_max",
+                        "timing_rollout_seconds",
+                        "timing_reward_seconds",
+                        "timing_scoring_seconds",
+                        "timing_policy_update_seconds",
+                        "timing_refresh_seconds",
+                    ),
+                    passthrough_keys=(
+                        "reward_std",
+                        "learning_rate",
+                        "planned_update_chunk_count",
+                        "agreed_update_chunk_count",
+                        "min_update_chunk_count",
+                        "max_update_chunk_count",
+                        "update_chunk_mismatch",
+                    ),
+                ),
+            )
             tracker.log_metrics(aggregated_metrics, step=step + 1)
             rank0_print(
                 runtime,
@@ -3940,26 +5309,61 @@ def train(args: argparse.Namespace) -> None:
             )
 
             if eval_spec.validation_every_n_steps > 0 and (step + 1) % eval_spec.validation_every_n_steps == 0:
-                validation_started_at = time.perf_counter()
-                validation_metrics = evaluate_validation_subset(
-                    validation_dataset=validation_dataset,
-                    policy_worker=rollout_worker,
-                    policy_model=policy_stack.engine.module,
-                    ia_weights=ia_weights,
-                    go_graph=go_graph,
-                    eval_spec=eval_spec,
+                run_phase_journal_barrier(
                     runtime=runtime,
-                    max_new_tokens=int(args.max_new_tokens),
-                    reward_mode=reward_mode,
-                    go_aspects=go_aspects_map,
-                    lin_partial_credit_cap=lin_partial_credit_cap,
+                    output_dir=output_dir,
+                    sync_root=sync_root,
+                    phase_name="validation_start",
+                    step=step + 1,
+                    group_ranks=tuple(range(runtime.world_size)) if runtime.enabled else (0,),
+                    group_name="world",
+                )
+                validation_started_at = time.perf_counter()
+                validation_metrics = run_rank0_serial_section(
+                    runtime=runtime,
+                    output_dir=output_dir,
+                    section_name="validation",
+                    step=step + 1,
+                    sync_root=sync_root,
+                    action=lambda: evaluate_validation_subset(
+                        validation_dataset=validation_dataset,
+                        policy_worker=rollout_worker,
+                        policy_model=policy_stack.engine.module,
+                        ia_weights=ia_weights,
+                        go_graph=go_graph,
+                        eval_spec=eval_spec,
+                        runtime=runtime,
+                        max_new_tokens=int(args.max_new_tokens),
+                        reward_mode=reward_mode,
+                        go_aspects=go_aspects_map,
+                        lin_partial_credit_cap=lin_partial_credit_cap,
+                    ),
                 )
                 validation_seconds = time.perf_counter() - validation_started_at
                 if validation_metrics:
                     validation_metrics["timing_validation_seconds"] = validation_seconds
                     tracker.log_metrics(validation_metrics, step=step + 1)
+                run_phase_journal_barrier(
+                    runtime=runtime,
+                    output_dir=output_dir,
+                    sync_root=sync_root,
+                    phase_name="validation_done",
+                    step=step + 1,
+                    group_ranks=tuple(range(runtime.world_size)) if runtime.enabled else (0,),
+                    group_name="world",
+                    payload={"validation_seconds": float(validation_seconds)},
+                )
 
             if eval_spec.save_every_n_steps > 0 and (step + 1) % eval_spec.save_every_n_steps == 0:
+                run_phase_journal_barrier(
+                    runtime=runtime,
+                    output_dir=output_dir,
+                    sync_root=sync_root,
+                    phase_name="checkpoint_start",
+                    step=step + 1,
+                    group_ranks=tuple(range(runtime.world_size)) if runtime.enabled else (0,),
+                    group_name="world",
+                )
                 checkpoint_started_at = time.perf_counter()
                 save_training_checkpoint(
                     policy_stack=policy_stack,
@@ -3967,6 +5371,7 @@ def train(args: argparse.Namespace) -> None:
                     step=step + 1,
                     tracker=tracker,
                     runtime=runtime,
+                    sync_root=sync_root,
                 )
                 checkpoint_seconds = time.perf_counter() - checkpoint_started_at
                 tracker.log_metrics(
@@ -3975,13 +5380,35 @@ def train(args: argparse.Namespace) -> None:
                     },
                     step=step + 1,
                 )
+                run_phase_journal_barrier(
+                    runtime=runtime,
+                    output_dir=output_dir,
+                    sync_root=sync_root,
+                    phase_name="checkpoint_done",
+                    step=step + 1,
+                    group_ranks=tuple(range(runtime.world_size)) if runtime.enabled else (0,),
+                    group_name="world",
+                    payload={"checkpoint_seconds": float(checkpoint_seconds)},
+                )
 
-            tracker.log_metrics(
-                {
-                    "timing_step_seconds": all_reduce_max_scalar(time.perf_counter() - step_started_at, runtime),
-                },
+            timing_step_metrics = run_file_backed_scalar_collective(
+                runtime=runtime,
+                output_dir=output_dir,
+                sync_root=sync_root,
+                reduction_name="step_timing",
                 step=step + 1,
+                group_ranks=tuple(range(runtime.world_size)) if runtime.enabled else (0,),
+                group_name="world",
+                local_payload={"timing_step_seconds": time.perf_counter() - step_started_at},
+                aggregate_fn=lambda payloads: aggregate_step_metric_payloads(
+                    payloads,
+                    mean_keys=(),
+                    sum_keys=(),
+                    max_keys=("timing_step_seconds",),
+                    passthrough_keys=(),
+                ),
             )
+            tracker.log_metrics(timing_step_metrics, step=step + 1)
     finally:
         rollout_worker.close()
         tracker.finish()

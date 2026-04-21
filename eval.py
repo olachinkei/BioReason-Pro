@@ -95,6 +95,16 @@ SAMPLE_TABLE_FIELDNAMES = [
     "attempt_predictions_json",
 ]
 
+
+def default_runtime_root() -> Path:
+    configured = (os.getenv("BIOREASON_RUNTIME_ROOT") or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    user = (os.getenv("USER") or "").strip()
+    if user and Path("/mnt/data").exists():
+        return Path("/mnt/data") / user / "BioReason-Pro"
+    return Path.cwd()
+
 # GO Aspect mapping for cleaner filenames
 GO_ASPECT_CODES = {"molecular_function": "MF", "cellular_component": "CC", "biological_process": "BP"}
 
@@ -950,7 +960,8 @@ def ensure_weave_server_cache_dir(args) -> str:
     if configured_dir:
         cache_dir = Path(configured_dir).expanduser()
     else:
-        base_dir = (getattr(args, "wandb_dir", None) or getattr(args, "evals_path", None) or "wandb").strip()
+        default_base_dir = str(default_runtime_root() / "wandb")
+        base_dir = (getattr(args, "wandb_dir", None) or getattr(args, "evals_path", None) or default_base_dir).strip()
         cache_dir = Path(base_dir).expanduser() / "weave_server_cache"
         os.environ["WEAVE_SERVER_CACHE_DIR"] = str(cache_dir.resolve())
 
@@ -988,7 +999,8 @@ def maybe_init_wandb_run(args, run_summary: Dict[str, Any], metrics_summary: Dic
     if not project:
         return None
 
-    wandb_dir = (getattr(args, "wandb_dir", None) or os.getenv("WANDB_DIR") or os.getcwd()).strip()
+    default_wandb_dir = str(default_runtime_root() / "wandb")
+    wandb_dir = (getattr(args, "wandb_dir", None) or os.getenv("WANDB_DIR") or default_wandb_dir).strip()
     os.makedirs(wandb_dir, exist_ok=True)
 
     init_kwargs = {
