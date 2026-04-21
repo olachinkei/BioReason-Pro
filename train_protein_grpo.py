@@ -2849,15 +2849,6 @@ class RunTracker:
             return
         if self.wandb_run is not None:
             self.wandb_run.log(self._augment_metrics_for_wandb(metrics, step=step), step=step)
-            self._flush_wandb()
-
-    def _flush_wandb(self) -> None:
-        if self.wandb_run is None:
-            return
-        try:
-            self.wandb_run.summary.update()
-        except Exception:
-            pass
 
     def claim_full_group_trace(self) -> bool:
         if not callable(self.weave_trace_fn) or self.weave_remaining_budget <= 0 or self.weave_full_group_budget <= 0:
