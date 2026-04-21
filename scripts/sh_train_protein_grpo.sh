@@ -154,13 +154,19 @@ MASTER_ADDR=${MASTER_ADDR:-""}
 MASTER_PORT=${MASTER_PORT:-""}
 NODE_RANK=${NODE_RANK:-""}
 
-if [ "$NNODES" != "2" ]; then
-  echo "Error: exact production launch requires NNODES=2 (got $NNODES)."
+if [ "$NNODES" != "2" ] && [ "$NNODES" != "1" ]; then
+  echo "Error: launch requires NNODES in {1,2} (got $NNODES)."
   exit 1
 fi
-if [ "$GPUS_PER_NODE" != "8" ]; then
-  echo "Error: exact production launch requires GPUS_PER_NODE=8 (got $GPUS_PER_NODE)."
+if [ "$NNODES" = "1" ]; then
+  echo "Warning: running single-node mode (NNODES=1); this is a non-production baseline run."
+fi
+if [ "$GPUS_PER_NODE" != "8" ] && [ "$GPUS_PER_NODE" != "1" ]; then
+  echo "Error: launch requires GPUS_PER_NODE in {1,8} (got $GPUS_PER_NODE)."
   exit 1
+fi
+if [ "$GPUS_PER_NODE" = "1" ]; then
+  echo "Warning: running single-GPU mode (GPUS_PER_NODE=1); this is a non-production baseline run."
 fi
 
 if [ -z "$BASE_CHECKPOINT" ]; then
@@ -286,6 +292,11 @@ if [ -n "${WANDB_RUN_NAME:-}" ]; then
 fi
 if [ -n "$WEAVE_PROJECT" ]; then
   TRAIN_ARGS+=(--weave_project "$WEAVE_PROJECT")
+fi
+
+# Single-rank launches require explicit debug_single_process mode in trainer.
+if [ "$NNODES" = "1" ] && [ "$GPUS_PER_NODE" = "1" ]; then
+  TRAIN_ARGS+=(--debug_single_process true)
 fi
 
 if has_preflight_only "$@"; then

@@ -75,6 +75,33 @@ PAPER_TARGET_STEPS_PER_GENERATION = 2
 PAPER_TARGET_NUM_ITERATIONS = 1
 PAPER_TARGET_RUNTIME_STACK = "deepspeed_vllm_colocate"
 
+DEBUG_SESSION_ID = "695728"
+DEBUG_LOG_PATH = Path("/Users/umakrishnaswamy/.cursor/debug-logs/debug-695728.log")
+
+
+def emit_debug_log(
+    run_id: str,
+    hypothesis_id: str,
+    location: str,
+    message: str,
+    data: Optional[Mapping[str, Any]] = None,
+) -> None:
+    payload = {
+        "sessionId": DEBUG_SESSION_ID,
+        "runId": normalize_text(run_id) or "unknown-run",
+        "hypothesisId": normalize_text(hypothesis_id) or "H-unknown",
+        "location": normalize_text(location),
+        "message": normalize_text(message),
+        "data": dict(data or {}),
+        "timestamp": int(time.time() * 1000),
+    }
+    try:
+        with DEBUG_LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+    except Exception:
+        # Never fail training because of debug instrumentation writes.
+        pass
+
 
 def normalize_text(value: Any) -> str:
     if value is None:
@@ -898,10 +925,29 @@ def is_distributed_initialized() -> bool:
 def initialize_runtime(args: argparse.Namespace) -> DistributedRuntime:
     require_torch()
 
+    run_id = normalize_text(os.environ.get("SLURM_JOB_ID")).strip() or "local"
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", str(getattr(args, "local_rank", 0))))
     enabled = world_size > 1
+    #region agent log
+    emit_debug_log(
+        run_id=run_id,
+        hypothesis_id="H4",
+        location="train_protein_grpo.py:initialize_runtime:pre_init",
+        message="distributed runtime env snapshot",
+        data={
+            "world_size": world_size,
+            "rank": rank,
+            "local_rank": local_rank,
+            "enabled": enabled,
+            "master_addr": normalize_text(os.environ.get("MASTER_ADDR")),
+            "master_port": normalize_text(os.environ.get("MASTER_PORT")),
+            "nccl_timeout_env": normalize_text(os.environ.get("NCCL_TIMEOUT")),
+            "torch_nccl_heartbeat_env": normalize_text(os.environ.get("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC")),
+        },
+    )
+    #endregion
 
     if enabled:
         import deepspeed
@@ -923,6 +969,23 @@ def initialize_runtime(args: argparse.Namespace) -> DistributedRuntime:
             deepspeed.init_distributed(dist_backend="nccl")
         torch.cuda.set_device(0)
         device = torch.device("cuda", 0)
+
+    #region agent log
+    emit_debug_log(
+        run_id=run_id,
+        hypothesis_id="H4",
+        location="train_protein_grpo.py:initialize_runtime:post_init",
+        message="distributed runtime initialized",
+        data={
+            "world_size": world_size,
+            "rank": rank,
+            "local_rank": local_rank,
+            "is_distributed_initialized": bool(is_distributed_initialized()),
+            "device": normalize_text(device),
+            "cuda_visible_devices": normalize_text(os.environ.get("CUDA_VISIBLE_DEVICES")),
+        },
+    )
+    #endregion
 
     return DistributedRuntime(
         enabled=enabled,
@@ -1040,7 +1103,40 @@ def all_reduce_sum_scalar(value: float, runtime: DistributedRuntime, process_gro
         return float(value)
     tensor = torch.tensor(float(value), device=runtime.device, dtype=torch.float64)
     if runtime.enabled:
-        torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM, group=process_group)
+        started_at = time.perf_counter()
+        try:
+            torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM, group=process_group)
+        except Exception as exc:
+            #region agent log
+            emit_debug_log(
+                run_id=normalize_text(os.environ.get("SLURM_JOB_ID")).strip() or "local",
+                hypothesis_id="H1",
+                location="train_protein_grpo.py:all_reduce_sum_scalar",
+                message="all_reduce_sum_scalar failed",
+                data={
+                    "rank": int(runtime.rank),
+                    "world_size": int(runtime.world_size),
+                    "value": float(value),
+                    "error": normalize_text(exc),
+                },
+            )
+            #endregion
+            raise
+        elapsed_seconds = time.perf_counter() - started_at
+        if elapsed_seconds >= 30.0:
+            #region agent log
+            emit_debug_log(
+                run_id=normalize_text(os.environ.get("SLURM_JOB_ID")).strip() or "local",
+                hypothesis_id="H1",
+                location="train_protein_grpo.py:all_reduce_sum_scalar",
+                message="all_reduce_sum_scalar slow",
+                data={
+                    "rank": int(runtime.rank),
+                    "world_size": int(runtime.world_size),
+                    "elapsed_seconds": float(elapsed_seconds),
+                },
+            )
+            #endregion
     return float(tensor.item())
 
 
@@ -1051,7 +1147,40 @@ def all_reduce_max_scalar(value: float, runtime: DistributedRuntime, process_gro
         return float(value)
     tensor = torch.tensor(float(value), device=runtime.device, dtype=torch.float64)
     if runtime.enabled:
-        torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MAX, group=process_group)
+        started_at = time.perf_counter()
+        try:
+            torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MAX, group=process_group)
+        except Exception as exc:
+            #region agent log
+            emit_debug_log(
+                run_id=normalize_text(os.environ.get("SLURM_JOB_ID")).strip() or "local",
+                hypothesis_id="H1",
+                location="train_protein_grpo.py:all_reduce_max_scalar",
+                message="all_reduce_max_scalar failed",
+                data={
+                    "rank": int(runtime.rank),
+                    "world_size": int(runtime.world_size),
+                    "value": float(value),
+                    "error": normalize_text(exc),
+                },
+            )
+            #endregion
+            raise
+        elapsed_seconds = time.perf_counter() - started_at
+        if elapsed_seconds >= 30.0:
+            #region agent log
+            emit_debug_log(
+                run_id=normalize_text(os.environ.get("SLURM_JOB_ID")).strip() or "local",
+                hypothesis_id="H1",
+                location="train_protein_grpo.py:all_reduce_max_scalar",
+                message="all_reduce_max_scalar slow",
+                data={
+                    "rank": int(runtime.rank),
+                    "world_size": int(runtime.world_size),
+                    "elapsed_seconds": float(elapsed_seconds),
+                },
+            )
+            #endregion
     return float(tensor.item())
 
 
@@ -3620,6 +3749,32 @@ def train(args: argparse.Namespace) -> None:
             refresh_seconds = 0.0
             validation_seconds = 0.0
             checkpoint_seconds = 0.0
+            if runtime.rank == 0:
+                #region agent log
+                emit_debug_log(
+                    run_id=normalize_text(os.environ.get("SLURM_JOB_ID")).strip() or "local",
+                    hypothesis_id="H3",
+                    location="train_protein_grpo.py:train:step_start",
+                    message="starting train step",
+                    data={
+                        "step": int(step + 1),
+                        "max_steps": int(args.max_steps),
+                        "queries_per_step": int(algorithm.queries_per_step),
+                        "rollouts_per_query": int(algorithm.rollouts_per_query),
+                    },
+                )
+                #endregion
+
+            # Emit lightweight stage-heartbeat metrics so W&B shows progress
+            # before the first full step finishes.
+            tracker.log_metrics(
+                {
+                    "system_stage_code": 0.0,
+                    "timing_step_elapsed_seconds": 0.0,
+                },
+                step=step + 1,
+            )
+
             global_query_indices = sample_query_indices(
                 dataset_length=len(train_dataset),
                 queries_per_step=algorithm.queries_per_step,
@@ -3694,6 +3849,14 @@ def train(args: argparse.Namespace) -> None:
                     f"(local_queries={len(local_queries)}, local_rollouts={sum(len(group.completions) for group in local_groups)})"
                 ),
             )
+            tracker.log_metrics(
+                {
+                    "system_stage_code": 1.0,
+                    "timing_rollout_elapsed_seconds": rollout_seconds,
+                    "timing_step_elapsed_seconds": time.perf_counter() - step_started_at,
+                },
+                step=step + 1,
+            )
             rollout_worker.unload()
             global_reward_std = compute_global_reward_std(
                 [group.rewards for group in local_groups],
@@ -3754,6 +3917,14 @@ def train(args: argparse.Namespace) -> None:
                     f"(valid_rollouts={sum(len(group.selected_completion_ids or []) for group in local_groups)}, "
                     f"filtered_rollouts={sum(float(group.filtered_rollouts) for group in local_groups):.0f})"
                 ),
+            )
+            tracker.log_metrics(
+                {
+                    "system_stage_code": 2.0,
+                    "timing_scoring_elapsed_seconds": scoring_seconds,
+                    "timing_step_elapsed_seconds": time.perf_counter() - step_started_at,
+                },
+                step=step + 1,
             )
             policy_loss_values: List[float] = []
             kl_values: List[float] = []
@@ -3825,9 +3996,27 @@ def train(args: argparse.Namespace) -> None:
                 },
             )
             policy_update_seconds = time.perf_counter() - policy_update_started_at
+            tracker.log_metrics(
+                {
+                    "system_stage_code": 3.0,
+                    "timing_policy_update_elapsed_seconds": policy_update_seconds,
+                    "timing_step_elapsed_seconds": time.perf_counter() - step_started_at,
+                },
+                step=step + 1,
+            )
 
             rank_print(runtime, f"step {step + 1}: policy updates complete, refreshing rollout worker")
             refresh_started_at = time.perf_counter()
+            if runtime.rank == 0:
+                #region agent log
+                emit_debug_log(
+                    run_id=normalize_text(os.environ.get("SLURM_JOB_ID")).strip() or "local",
+                    hypothesis_id="H2",
+                    location="train_protein_grpo.py:train:pre_refresh",
+                    message="starting rollout worker refresh",
+                    data={"step": int(step + 1)},
+                )
+                #endregion
             refresh_old_policy_and_rollout_worker(
                 policy_stack=policy_stack,
                 rollout_worker=rollout_worker,
@@ -3836,8 +4025,24 @@ def train(args: argparse.Namespace) -> None:
                 step=step + 1,
             )
             rank_print(runtime, f"step {step + 1}: waiting at post-refresh barrier")
+            barrier_started_at = time.perf_counter()
             barrier(runtime)
             rank_print(runtime, f"step {step + 1}: passed post-refresh barrier")
+            barrier_elapsed_seconds = time.perf_counter() - barrier_started_at
+            if runtime.rank == 0:
+                #region agent log
+                emit_debug_log(
+                    run_id=normalize_text(os.environ.get("SLURM_JOB_ID")).strip() or "local",
+                    hypothesis_id="H2",
+                    location="train_protein_grpo.py:train:post_refresh_barrier",
+                    message="finished rollout refresh barrier",
+                    data={
+                        "step": int(step + 1),
+                        "barrier_elapsed_seconds": float(barrier_elapsed_seconds),
+                        "refresh_elapsed_seconds": float(time.perf_counter() - refresh_started_at),
+                    },
+                )
+                #endregion
             refresh_seconds = time.perf_counter() - refresh_started_at
 
             local_rewards = [reward for group in local_groups for reward in group.rewards]

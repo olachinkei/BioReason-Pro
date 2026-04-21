@@ -68,9 +68,29 @@ export VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-32768}"
 export VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-32}"
 export VLLM_SWAP_SPACE_GB="${VLLM_SWAP_SPACE_GB:-0}"
 export ROLLOUT_LOGPROB_MICROBATCH_SIZE="${ROLLOUT_LOGPROB_MICROBATCH_SIZE:-4}"
+export MAX_STEPS="${MAX_STEPS:-20}"
+export VALIDATION_EVERY_N_STEPS="${VALIDATION_EVERY_N_STEPS:-5}"
+export SAVE_EVERY_N_STEPS="${SAVE_EVERY_N_STEPS:-10}"
+export TRACE_ROLLOUTS_TO_WEAVE="${TRACE_ROLLOUTS_TO_WEAVE:-true}"
+export WEAVE_TRACE_BUDGET="${WEAVE_TRACE_BUDGET:-64}"
+export WEAVE_TRACE_FULL_GROUP_COUNT="${WEAVE_TRACE_FULL_GROUP_COUNT:-4}"
+export WEAVE_TRACE_FULL_ROLLOUTS_PER_GROUP="${WEAVE_TRACE_FULL_ROLLOUTS_PER_GROUP:-24}"
+export LIGHTWEIGHT_PROFILE="${LIGHTWEIGHT_PROFILE:-false}"
 export MASTER_ADDR="${MASTER_ADDR:-$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)}"
 export MASTER_PORT="${MASTER_PORT:-29511}"
 export ABLATION
+
+lightweight_flag="$(printf '%s' "$LIGHTWEIGHT_PROFILE" | tr '[:upper:]' '[:lower:]')"
+if [ "$lightweight_flag" = "1" ] || [ "$lightweight_flag" = "true" ] || [ "$lightweight_flag" = "yes" ]; then
+  # Low-memory profile for one-node debugging/baselines: fewer generations,
+  # and a microbatch contract compatible with rollouts=5.
+  export ROLLOUTS_PER_QUERY="${LIGHTWEIGHT_ROLLOUTS_PER_QUERY:-5}"
+  export OPTIMIZER_MICRO_BATCH_SIZE_PER_GPU="${LIGHTWEIGHT_OPTIMIZER_MICRO_BATCH_SIZE_PER_GPU:-5}"
+  export GRADIENT_ACCUMULATION_STEPS="${LIGHTWEIGHT_GRADIENT_ACCUMULATION_STEPS:-1}"
+  export MAX_NEW_TOKENS="${LIGHTWEIGHT_MAX_NEW_TOKENS:-4096}"
+  export VLLM_MAX_NUM_SEQS="${LIGHTWEIGHT_VLLM_MAX_NUM_SEQS:-16}"
+  echo "Info: LIGHTWEIGHT_PROFILE enabled (rollouts=${ROLLOUTS_PER_QUERY}, micro_batch=${OPTIMIZER_MICRO_BATCH_SIZE_PER_GPU}, grad_accum=${GRADIENT_ACCUMULATION_STEPS})."
+fi
 
 srun --nodes="${NNODES}" --ntasks="${NNODES}" --ntasks-per-node=1 bash -lc '
   set -euo pipefail
@@ -94,10 +114,24 @@ srun --nodes="${NNODES}" --ntasks="${NNODES}" --ntasks-per-node=1 bash -lc '
   export VLLM_MAX_NUM_SEQS="'"$VLLM_MAX_NUM_SEQS"'"
   export VLLM_SWAP_SPACE_GB="'"$VLLM_SWAP_SPACE_GB"'"
   export ROLLOUT_LOGPROB_MICROBATCH_SIZE="'"$ROLLOUT_LOGPROB_MICROBATCH_SIZE"'"
+  export MAX_STEPS="'"$MAX_STEPS"'"
+  export VALIDATION_EVERY_N_STEPS="'"$VALIDATION_EVERY_N_STEPS"'"
+  export SAVE_EVERY_N_STEPS="'"$SAVE_EVERY_N_STEPS"'"
+  export TRACE_ROLLOUTS_TO_WEAVE="'"$TRACE_ROLLOUTS_TO_WEAVE"'"
+  export WEAVE_TRACE_BUDGET="'"$WEAVE_TRACE_BUDGET"'"
+  export WEAVE_TRACE_FULL_GROUP_COUNT="'"$WEAVE_TRACE_FULL_GROUP_COUNT"'"
+  export WEAVE_TRACE_FULL_ROLLOUTS_PER_GROUP="'"$WEAVE_TRACE_FULL_ROLLOUTS_PER_GROUP"'"
   export MASTER_ADDR="'"$MASTER_ADDR"'"
   export MASTER_PORT="'"$MASTER_PORT"'"
   export ABLATION="'"$ABLATION"'"
   export NODE_RANK="$SLURM_NODEID"
   export HOSTFILE=""
-  bash scripts/sh_train_protein_grpo_phase_a.sh --max_steps 20 --validation_every_n_steps 5 --save_every_n_steps 10
+  bash scripts/sh_train_protein_grpo_phase_a.sh \
+    --trace_rollouts_to_weave "$TRACE_ROLLOUTS_TO_WEAVE" \
+    --weave_trace_budget "$WEAVE_TRACE_BUDGET" \
+    --weave_trace_full_group_count "$WEAVE_TRACE_FULL_GROUP_COUNT" \
+    --weave_trace_full_rollouts_per_group "$WEAVE_TRACE_FULL_ROLLOUTS_PER_GROUP" \
+    --max_steps "$MAX_STEPS" \
+    --validation_every_n_steps "$VALIDATION_EVERY_N_STEPS" \
+    --save_every_n_steps "$SAVE_EVERY_N_STEPS"
 '
