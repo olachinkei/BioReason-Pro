@@ -21,6 +21,18 @@ set -eo pipefail
 # Run from project root
 cd "$(dirname "$0")/.."
 
+default_runtime_root() {
+    if [ -n "${BIOREASON_RUNTIME_ROOT:-}" ]; then
+        printf '%s\n' "$BIOREASON_RUNTIME_ROOT"
+        return 0
+    fi
+    if [ -d "/mnt/data" ] && [ -n "${USER:-}" ]; then
+        printf '/mnt/data/%s/BioReason-Pro\n' "$USER"
+        return 0
+    fi
+    pwd
+}
+
 # ===================================================================================================
 # Environment Setup
 # Set these to your conda environment and project root.
@@ -34,6 +46,18 @@ cd "$(dirname "$0")/.."
 export PYTHONUNBUFFERED=1
 export PYTHONDONTWRITEBYTECODE=1
 
+BIOREASON_RUNTIME_ROOT="$(default_runtime_root)"
+BIOREASON_ARTIFACTS_ROOT="${BIOREASON_ARTIFACTS_ROOT:-${BIOREASON_RUNTIME_ROOT}/data/artifacts}"
+BIOREASON_CACHE_ROOT="${BIOREASON_CACHE_ROOT:-${BIOREASON_RUNTIME_ROOT}/cache}"
+WANDB_DIR=${WANDB_DIR:-"${BIOREASON_RUNTIME_ROOT}/wandb"}
+WEAVE_SERVER_CACHE_DIR=${WEAVE_SERVER_CACHE_DIR:-"$WANDB_DIR/weave_server_cache"}
+HF_HOME="${HF_HOME:-${BIOREASON_CACHE_ROOT}/huggingface}"
+TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}/transformers}"
+HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
+mkdir -p "$BIOREASON_ARTIFACTS_ROOT" "$BIOREASON_CACHE_ROOT" "$WANDB_DIR" "$WEAVE_SERVER_CACHE_DIR" "$TRANSFORMERS_CACHE" "$HF_DATASETS_CACHE"
+export BIOREASON_RUNTIME_ROOT BIOREASON_ARTIFACTS_ROOT BIOREASON_CACHE_ROOT
+export WANDB_DIR WEAVE_SERVER_CACHE_DIR HF_HOME TRANSFORMERS_CACHE HF_DATASETS_CACHE
+
 PYTHON_BIN=${PYTHON_BIN:-}
 if [ -z "$PYTHON_BIN" ]; then
     if [ -x "./.venv-gpu/bin/python" ]; then
@@ -45,11 +69,8 @@ if [ -z "$PYTHON_BIN" ]; then
     fi
 fi
 
-EVALS_DIR=${EVALS_DIR:-"./evals"}
+EVALS_DIR=${EVALS_DIR:-"${BIOREASON_RUNTIME_ROOT}/evals"}
 mkdir -p "$EVALS_DIR"
-
-export TRANSFORMERS_CACHE="$EVALS_DIR/transformers"
-mkdir -p "$TRANSFORMERS_CACHE"
 
 # ===================================================================================================
 # Model Checkpoint
@@ -67,11 +88,9 @@ PROTEIN_MODEL_NAME=${PROTEIN_MODEL_NAME:-"esm3_sm_open_v1"}
 GO_OBO_PATH=${GO_OBO_PATH:-"bioreason2/dataset/go-basic.obo"}  # repo-local default
 IA_FILE_PATH=${IA_FILE_PATH:-""}                   # e.g., /path/to/IA.txt
 GO_EMBEDDINGS_PATH=${GO_EMBEDDINGS_PATH:-""}       # e.g., /data/bioreason/go_embeddings
-DATASET_CACHE_DIR=${DATASET_CACHE_DIR:-"data/artifacts/hf_cache"}
-STRUCTURE_DIR=${STRUCTURE_DIR:-"data/structures"}
+DATASET_CACHE_DIR=${DATASET_CACHE_DIR:-"${BIOREASON_ARTIFACTS_ROOT}/hf_cache"}
+STRUCTURE_DIR=${STRUCTURE_DIR:-"${BIOREASON_RUNTIME_ROOT}/data/structures"}
 KEEP_LOCAL_EVAL_OUTPUTS=${KEEP_LOCAL_EVAL_OUTPUTS:-0}
-WANDB_DIR=${WANDB_DIR:-"./wandb"}
-WEAVE_SERVER_CACHE_DIR=${WEAVE_SERVER_CACHE_DIR:-"$WANDB_DIR/weave_server_cache"}
 
 EVAL_SCRIPT="eval.py"
 EVALS_PATH=${EVALS_PATH:-"$EVALS_DIR/results"}

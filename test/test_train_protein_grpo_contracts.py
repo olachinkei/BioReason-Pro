@@ -141,6 +141,51 @@ class FakeWandbModule:
         self.define_metric_calls.append({"name": name, "kwargs": dict(kwargs)})
 
 
+class FakePipeConnection:
+    def __init__(self, *, poll_result: bool = True, response: dict[str, object] | None = None) -> None:
+        self.poll_result = poll_result
+        self.response = response or {"status": "ok"}
+        self.sent: list[dict[str, object]] = []
+        self.closed = False
+        self.poll_calls: list[float] = []
+
+    def poll(self, timeout: float) -> bool:
+        self.poll_calls.append(float(timeout))
+        return self.poll_result
+
+    def recv(self):
+        return dict(self.response)
+
+    def send(self, payload):
+        self.sent.append(dict(payload))
+
+    def close(self):
+        self.closed = True
+
+
+class FakeProcess:
+    def __init__(self, *, alive: bool = True, exitcode: int | None = None) -> None:
+        self._alive = alive
+        self.exitcode = exitcode
+        self.join_calls: list[float] = []
+        self.terminate_called = False
+        self.kill_called = False
+
+    def join(self, timeout: float | None = None) -> None:
+        self.join_calls.append(float(timeout or 0.0))
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+    def terminate(self) -> None:
+        self.terminate_called = True
+        self._alive = False
+
+    def kill(self) -> None:
+        self.kill_called = True
+        self._alive = False
+
+
 class TrainProteinGrpoContractsTest(unittest.TestCase):
     def test_policy_model_instantiation_uses_lazy_protein_encoder(self):
         source = SCRIPT_PATH.read_text(encoding="utf-8")
@@ -149,6 +194,67 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
     def test_export_checkpoint_copies_frozen_protein_model_when_available(self):
         source = SCRIPT_PATH.read_text(encoding="utf-8")
         self.assertIn("copy_or_save_frozen_protein_model", source)
+
+    def test_aggregate_global_reward_std_payloads_matches_expected(self):
+        result = GRPO.aggregate_global_reward_std_payloads(
+            [
+                {"sum": 1.0, "sq_sum": 1.0, "count": 1.0},
+                {"sum": 3.0, "sq_sum": 9.0, "count": 1.0},
+            ],
+            epsilon=1e-6,
+        )
+        self.assertAlmostEqual(result, 1.000001, places=5)
+
+    def test_aggregate_query_group_mean_payloads_matches_expected(self):
+        result = GRPO.aggregate_query_group_mean_payloads(
+            [
+                {"sum": 1.0, "count": 1.0},
+                {"sum": 3.0, "count": 1.0},
+            ]
+        )
+        self.assertAlmostEqual(result, 2.0)
+
+    def test_aggregate_step_metric_payloads_combines_mean_sum_max_and_passthrough(self):
+        result = GRPO.aggregate_step_metric_payloads(
+            [
+                {
+                    "reward_mean": 0.1,
+                    "rollout_failure_count": 1.0,
+                    "ratio_max": 1.5,
+                    "reward_std": 0.2,
+                    "learning_rate": 1e-5,
+                },
+                {
+                    "reward_mean": 0.3,
+                    "rollout_failure_count": 2.0,
+                    "ratio_max": 1.7,
+                    "reward_std": 0.2,
+                    "learning_rate": 1e-5,
+                },
+            ],
+            mean_keys=("reward_mean",),
+            sum_keys=("rollout_failure_count",),
+            max_keys=("ratio_max",),
+            passthrough_keys=("reward_std", "learning_rate"),
+        )
+        self.assertAlmostEqual(result["reward_mean"], 0.2)
+        self.assertAlmostEqual(result["rollout_failure_count"], 3.0)
+        self.assertAlmostEqual(result["ratio_max"], 1.7)
+        self.assertAlmostEqual(result["reward_std"], 0.2)
+        self.assertAlmostEqual(result["learning_rate"], 1e-5)
+
+    def test_aggregate_policy_update_plan_payloads_reports_min_max_mean(self):
+        result = GRPO.aggregate_policy_update_plan_payloads(
+            [
+                {"chunk_count": 4},
+                {"chunk_count": 2},
+                {"chunk_count": 6},
+            ]
+        )
+        self.assertAlmostEqual(result["chunk_count_min"], 2.0)
+        self.assertAlmostEqual(result["chunk_count_max"], 6.0)
+        self.assertAlmostEqual(result["chunk_count_mean"], 4.0)
+        self.assertAlmostEqual(result["chunk_count_sum"], 12.0)
 
     def write_executable(self, path: Path, body: str) -> Path:
         path.write_text(body, encoding="utf-8")
@@ -456,7 +562,14 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
 
     def test_compute_group_advantages_uses_batch_global_std(self):
         runtime = GRPO.DistributedRuntime(enabled=False, rank=0, world_size=1, local_rank=0, device="cpu")
-        global_std = GRPO.compute_global_reward_std([[1.0, 1.0, 3.0], [0.0, 0.0, 2.0]], runtime, epsilon=1e-6)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            global_std = GRPO.compute_global_reward_std(
+                [[1.0, 1.0, 3.0], [0.0, 0.0, 2.0]],
+                runtime,
+                output_dir=Path(tmpdir),
+                step=1,
+                epsilon=1e-6,
+            )
         self.assertGreater(global_std, 0.0)
 
         first_group = GRPO.compute_group_advantages([1.0, 1.0, 3.0], global_std)
@@ -580,6 +693,114 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         start_mock.assert_called_once_with(Path("/tmp/current"))
         recv_mock.assert_called_once()
 
+    def test_rollout_worker_recv_response_times_out_when_pipe_never_replies(self):
+        worker = object.__new__(GRPO.VLLMRolloutWorker)
+        worker._connection = FakePipeConnection(poll_result=False)
+        worker._process = FakeProcess(alive=True, exitcode=None)
+
+        with self.assertRaises(TimeoutError):
+            worker._recv_response(timeout_s=1.5)
+
+    def test_rollout_worker_stop_subprocess_terminates_when_close_ack_times_out(self):
+        worker = object.__new__(GRPO.VLLMRolloutWorker)
+        worker.backend = "subprocess"
+        worker.args = types.SimpleNamespace(
+            rollout_worker_close_timeout_s=0.25,
+            rollout_worker_join_timeout_s=0.5,
+            rollout_worker_terminate_timeout_s=0.25,
+        )
+        worker.runtime = types.SimpleNamespace(rank=3)
+        connection = FakePipeConnection(poll_result=False)
+        process = FakeProcess(alive=True, exitcode=None)
+        worker._connection = connection
+        worker._process = process
+
+        worker._stop_subprocess()
+
+        self.assertEqual(connection.sent, [{"cmd": "close"}])
+        self.assertTrue(connection.closed)
+        self.assertTrue(process.terminate_called)
+        self.assertEqual(worker._connection, None)
+        self.assertEqual(worker._process, None)
+
+    def test_rollout_worker_generate_group_terminates_stuck_subprocess(self):
+        worker = object.__new__(GRPO.VLLMRolloutWorker)
+        worker.backend = "subprocess"
+        worker.args = types.SimpleNamespace(
+            seed=7,
+            rollout_worker_generate_timeout_s=0.5,
+        )
+        worker.runtime = types.SimpleNamespace(rank=4)
+        worker.checkpoint_dir = Path("/tmp/current")
+        worker._connection = FakePipeConnection(poll_result=False)
+        worker._process = FakeProcess(alive=True, exitcode=None)
+        worker._generation_counter = 0
+        worker._last_generation_timed_out = False
+        worker._last_generation_failed = False
+        worker._last_generation_failure_reason = ""
+
+        with mock.patch.object(worker, "_stop_subprocess") as stop_mock, mock.patch.object(
+            GRPO, "build_rollout_query_payload", return_value={"query": "payload"}
+        ):
+            outputs = worker.generate_group(
+                query=GRPO.PreparedQuery(
+                    input_ids=None,
+                    attention_mask=None,
+                    protein_sequences=[],
+                    batch_idx_map=[],
+                    structure_coords=None,
+                    go_aspects=[],
+                    sample_meta={"protein_id": "P12345"},
+                    prompt_text="",
+                    multimodal_cache=None,
+                ),
+                repeat_count=12,
+                sampling=GRPO.SamplingSpec(),
+            )
+        stop_mock.assert_called_once_with()
+        self.assertEqual(outputs, [""] * 12)
+        self.assertTrue(worker.last_generation_timed_out)
+        self.assertTrue(worker.last_generation_failed)
+        self.assertIn("generate timed out", worker.last_generation_failure_reason)
+
+    def test_rollout_worker_generate_group_falls_back_when_startup_fails(self):
+        worker = object.__new__(GRPO.VLLMRolloutWorker)
+        worker.backend = "subprocess"
+        worker.args = types.SimpleNamespace(
+            seed=7,
+            rollout_worker_generate_timeout_s=0.5,
+        )
+        worker.runtime = types.SimpleNamespace(rank=2)
+        worker.checkpoint_dir = Path("/tmp/current")
+        worker._connection = None
+        worker._process = None
+        worker._generation_counter = 0
+        worker._last_generation_timed_out = False
+        worker._last_generation_failed = False
+        worker._last_generation_failure_reason = ""
+
+        with mock.patch.object(worker, "_start_subprocess", side_effect=RuntimeError("startup oom")):
+            outputs = worker.generate_group(
+                query=GRPO.PreparedQuery(
+                    input_ids=None,
+                    attention_mask=None,
+                    protein_sequences=[],
+                    batch_idx_map=[],
+                    structure_coords=None,
+                    go_aspects=[],
+                    sample_meta={"protein_id": "Q8NFU7"},
+                    prompt_text="",
+                    multimodal_cache=None,
+                ),
+                repeat_count=12,
+                sampling=GRPO.SamplingSpec(),
+            )
+
+        self.assertEqual(outputs, [""] * 12)
+        self.assertFalse(worker.last_generation_timed_out)
+        self.assertTrue(worker.last_generation_failed)
+        self.assertIn("startup oom", worker.last_generation_failure_reason)
+
     def test_build_deepspeed_config_matches_spec_shape(self):
         args = GRPO.parse_args(["--text_model_name", "/tmp/demo-model"])
         runtime_spec = GRPO.build_runtime_spec(args)
@@ -590,6 +811,317 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertEqual(ds_config["gradient_clipping"], 1.0)
         self.assertEqual(ds_config["zero_optimization"]["stage"], 2)
         self.assertTrue(ds_config["bf16"]["enabled"])
+
+    def test_build_sampling_spec_prefers_rollout_override_when_present(self):
+        args = GRPO.parse_args(
+            [
+                "--text_model_name",
+                "/tmp/demo-model",
+                "--max_new_tokens",
+                "10000",
+                "--rollout_max_new_tokens",
+                "4096",
+            ]
+        )
+        sampling = GRPO.build_sampling_spec(args)
+        self.assertEqual(sampling.max_new_tokens, 4096)
+
+    def test_resolve_rollout_worker_vllm_port_is_rank_scoped(self):
+        args = GRPO.parse_args(
+            [
+                "--text_model_name",
+                "/tmp/demo-model",
+                "--rollout_worker_vllm_port_base",
+                "39000",
+                "--rollout_worker_vllm_port_stride",
+                "32",
+            ]
+        )
+        self.assertEqual(GRPO.resolve_rollout_worker_vllm_port(args, 0), 39000)
+        self.assertEqual(GRPO.resolve_rollout_worker_vllm_port(args, 1), 39032)
+        self.assertEqual(GRPO.resolve_rollout_worker_vllm_port(args, 15), 39480)
+
+    def test_run_rank0_serial_section_returns_result_for_single_process(self):
+        runtime = GRPO.DistributedRuntime(enabled=False, rank=0, world_size=1, local_rank=0, device="cpu")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = GRPO.run_rank0_serial_section(
+                runtime=runtime,
+                output_dir=Path(tmpdir),
+                section_name="validation",
+                step=1,
+                action=lambda: {"ok": True},
+            )
+        self.assertEqual(result, {"ok": True})
+
+    def test_run_rank0_serial_section_writes_done_marker_on_rank0(self):
+        runtime = GRPO.DistributedRuntime(enabled=True, rank=0, world_size=16, local_rank=0, device="cpu")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            result = GRPO.run_rank0_serial_section(
+                runtime=runtime,
+                output_dir=output_dir,
+                section_name="checkpoint_artifact",
+                step=5,
+                action=lambda: "saved",
+            )
+            done_path, error_path = GRPO.build_rank0_section_marker_paths(output_dir, "checkpoint_artifact", 5)
+            self.assertEqual(result, "saved")
+            self.assertTrue(done_path.exists())
+            self.assertFalse(error_path.exists())
+            payload = json.loads(done_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["status"], "ok")
+            self.assertEqual(payload["step"], 5)
+
+    def test_run_rank0_serial_section_waits_for_done_marker_on_nonzero_rank(self):
+        runtime = GRPO.DistributedRuntime(enabled=True, rank=3, world_size=16, local_rank=3, device="cpu")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            done_path, _ = GRPO.build_rank0_section_marker_paths(output_dir, "validation", 2)
+            done_path.parent.mkdir(parents=True, exist_ok=True)
+            done_path.write_text(json.dumps({"status": "ok", "step": 2}), encoding="utf-8")
+            result = GRPO.run_rank0_serial_section(
+                runtime=runtime,
+                output_dir=output_dir,
+                section_name="validation",
+                step=2,
+                action=lambda: self.fail("non-rank0 should not execute action"),
+                timeout_s=0.01,
+                poll_interval_s=0.0,
+            )
+        self.assertIsNone(result)
+
+    def test_run_rank0_serial_section_raises_rank0_error_on_nonzero_rank(self):
+        runtime = GRPO.DistributedRuntime(enabled=True, rank=4, world_size=16, local_rank=4, device="cpu")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            _, error_path = GRPO.build_rank0_section_marker_paths(output_dir, "validation", 2)
+            error_path.parent.mkdir(parents=True, exist_ok=True)
+            error_path.write_text(
+                json.dumps({"message": "rank0 validation failed", "error_type": "RuntimeError"}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "rank0 validation failed"):
+                GRPO.run_rank0_serial_section(
+                    runtime=runtime,
+                    output_dir=output_dir,
+                    section_name="validation",
+                    step=2,
+                    action=lambda: self.fail("non-rank0 should not execute action"),
+                    timeout_s=0.01,
+                    poll_interval_s=0.0,
+                )
+
+    def test_paper_tight_2node_run_script_validates_and_saves_every_step(self):
+        script_path = ROOT / "runtime_logs" / "run_rl_paper_tight_2node_srun.sh"
+        source = script_path.read_text(encoding="utf-8")
+        self.assertIn('VALIDATION_NUM_PROTEINS="${VALIDATION_NUM_PROTEINS:-8}"', source)
+        self.assertIn('VALIDATION_EVERY_N_STEPS="${VALIDATION_EVERY_N_STEPS:-1}"', source)
+        self.assertIn('SAVE_EVERY_N_STEPS="${SAVE_EVERY_N_STEPS:-1}"', source)
+        self.assertIn('CHECKPOINT_EXPORT_ONLY="${CHECKPOINT_EXPORT_ONLY:-true}"', source)
+        self.assertIn('--validation_num_proteins "$VALIDATION_NUM_PROTEINS"', source)
+        self.assertIn('--validation_every_n_steps "$VALIDATION_EVERY_N_STEPS"', source)
+        self.assertIn('--save_every_n_steps "$SAVE_EVERY_N_STEPS"', source)
+
+    def test_parse_args_accepts_checkpoint_export_only_flag(self):
+        args = GRPO.parse_args(
+            [
+                "--text_model_name",
+                "/tmp/demo-model",
+                "--checkpoint_export_only",
+                "true",
+            ]
+        )
+
+        self.assertTrue(args.checkpoint_export_only)
+
+    def test_parse_args_accepts_execution_and_resume_flags(self):
+        args = GRPO.parse_args(
+            [
+                "--text_model_name",
+                "/tmp/demo-model",
+                "--execution_id",
+                "job-123",
+                "--sync_root",
+                "/tmp/demo-sync",
+                "--resume_from_export_artifact",
+                "/tmp/demo-export",
+                "--resume_mode",
+                "warm",
+            ]
+        )
+
+        self.assertEqual(args.execution_id, "job-123")
+        self.assertEqual(args.sync_root, "/tmp/demo-sync")
+        self.assertEqual(args.resume_from_export_artifact, "/tmp/demo-export")
+        self.assertEqual(args.resume_mode, "warm")
+
+    def test_resolve_sync_root_defaults_to_execution_namespace(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = GRPO.parse_args(["--text_model_name", "/tmp/demo-model"])
+            args.execution_id = "job-456"
+            sync_root = GRPO.resolve_sync_root(args, Path(tmpdir), args.execution_id)
+            self.assertEqual(sync_root, Path(tmpdir).resolve() / "_run_sync" / "job-456")
+
+    def test_resolve_execution_id_prefers_env_for_shared_run_scope(self):
+        with mock.patch.dict(os.environ, {"EXECUTION_ID": "shared-run-123"}, clear=False):
+            args = GRPO.parse_args(["--text_model_name", "/tmp/demo-model"])
+            self.assertEqual(GRPO.resolve_execution_id(args), "shared-run-123")
+
+    def test_resolve_checkpoint_source_dir_falls_back_for_nonlocal_reference(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fallback = Path(tmpdir) / "bundle"
+            fallback.mkdir(parents=True, exist_ok=True)
+            resolved = GRPO.resolve_checkpoint_source_dir(
+                "wandb-healthcare/bioreason-pro/bioreason-pro-rl-paper:production",
+                fallback_dir=fallback,
+            )
+            self.assertEqual(resolved, fallback.resolve())
+
+    def test_resolve_warm_resume_state_prefers_local_text_model_for_nonlocal_base_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            text_model_dir = Path(tmpdir) / "materialized"
+            text_model_dir.mkdir(parents=True, exist_ok=True)
+            args = GRPO.parse_args(["--text_model_name", str(text_model_dir)])
+            args.base_checkpoint = "wandb-healthcare/bioreason-pro/bioreason-pro-rl-paper:production"
+            metadata = GRPO.resolve_warm_resume_state(args)
+            self.assertEqual(metadata, {})
+            self.assertEqual(args.reference_checkpoint_source, str(text_model_dir))
+            self.assertEqual(args.initial_rollout_checkpoint_source, str(text_model_dir))
+
+    def test_resolve_warm_resume_state_rewires_export_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint_root = Path(tmpdir) / "step-000005"
+            export_dir = checkpoint_root / "inference_export"
+            export_dir.mkdir(parents=True, exist_ok=True)
+            (export_dir / "config.json").write_text("{}", encoding="utf-8")
+            metadata = {
+                "global_step": 5,
+                "execution_id": "parent-run",
+                "base_checkpoint": "wandb-healthcare/bioreason-pro/bioreason-pro-rl-paper:production",
+                "reference_checkpoint_source": "/tmp/reference",
+                "rollout_checkpoint_source": "/tmp/rollout",
+            }
+            (checkpoint_root / "training_metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+            args = GRPO.parse_args(
+                [
+                    "--text_model_name",
+                    "/tmp/original-model",
+                    "--resume_from_export_artifact",
+                    str(checkpoint_root),
+                ]
+            )
+            GRPO.resolve_warm_resume_state(args)
+
+            self.assertEqual(args.text_model_name, str(export_dir.resolve()))
+            self.assertEqual(args.initial_rollout_checkpoint_source, str(export_dir.resolve()))
+            self.assertEqual(args.reference_checkpoint_source, "/tmp/reference")
+            self.assertEqual(args.resume_parent_execution_id, "parent-run")
+            self.assertEqual(args.resume_start_step, 5)
+
+    def test_wrapper_mentions_execution_and_resume_flags(self):
+        source = WRAPPER_PATH.read_text(encoding="utf-8")
+        self.assertIn('EXECUTION_ID=${EXECUTION_ID:-"${SLURM_JOB_ID:-local}-$(date -u +%Y%m%d%H%M%S)"}', source)
+        self.assertIn('SYNC_ROOT=${SYNC_ROOT:-""}', source)
+        self.assertIn('RESUME_FROM_EXPORT_ARTIFACT=${RESUME_FROM_EXPORT_ARTIFACT:-""}', source)
+        self.assertIn('RESUME_MODE=${RESUME_MODE:-warm}', source)
+        self.assertIn('--resume_mode "$RESUME_MODE"', source)
+        self.assertIn('TRAIN_ARGS+=(--execution_id "$EXECUTION_ID")', source)
+        self.assertIn('TRAIN_ARGS+=(--sync_root "$SYNC_ROOT")', source)
+        self.assertIn('TRAIN_ARGS+=(--resume_from_export_artifact "$RESUME_FROM_EXPORT_ARTIFACT")', source)
+
+    def test_scalar_collective_paths_are_run_scoped(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            payload_a, done_a, _ = GRPO.build_scalar_collective_paths(
+                output_dir=root,
+                sync_root=root / "run-a",
+                reduction_name="global_reward_std",
+                step=1,
+                group_name="world",
+                rank=0,
+            )
+            payload_b, done_b, _ = GRPO.build_scalar_collective_paths(
+                output_dir=root,
+                sync_root=root / "run-b",
+                reduction_name="global_reward_std",
+                step=1,
+                group_name="world",
+                rank=0,
+            )
+        self.assertNotEqual(payload_a, payload_b)
+        self.assertNotEqual(done_a, done_b)
+
+    def test_save_training_checkpoint_export_only_skips_deepspeed_save(self):
+        runtime = GRPO.DistributedRuntime(enabled=False, rank=0, world_size=1, local_rank=0, device="cpu")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = GRPO.parse_args(
+                [
+                    "--text_model_name",
+                    "/tmp/demo-model",
+                    "--output_dir",
+                    tmpdir,
+                    "--checkpoint_export_only",
+                    "true",
+                    "--checkpoint_artifact_name",
+                    "demo-artifact",
+                    "--checkpoint_artifact_aliases",
+                    "latest,smoke",
+                ]
+            )
+            args.base_checkpoint = "wandb-healthcare/bioreason-pro/bioreason-pro-rl-paper:production"
+            args.dataset_artifact = "wandb-healthcare/bioreason-pro/disease-temporal-reasoning:production"
+            args.runtime_stack = "deepspeed_vllm_colocate"
+            policy_stack = types.SimpleNamespace(
+                engine=types.SimpleNamespace(
+                    module=object(),
+                    save_checkpoint=mock.Mock(),
+                ),
+                reference_checkpoint_dir=Path("/tmp/reference"),
+                rollout_checkpoint_dir=Path("/tmp/rollout"),
+            )
+            tracker = types.SimpleNamespace(log_checkpoint_artifact=mock.Mock())
+
+            with mock.patch.object(GRPO, "export_inference_checkpoint") as export_mock:
+                GRPO.save_training_checkpoint(policy_stack, args, 1, tracker, runtime)
+
+        policy_stack.engine.save_checkpoint.assert_not_called()
+        export_mock.assert_called_once()
+        tracker.log_checkpoint_artifact.assert_called_once()
+        metadata = tracker.log_checkpoint_artifact.call_args.kwargs["metadata"]
+        self.assertTrue(metadata["checkpoint_export_only"])
+
+    def test_save_training_checkpoint_export_only_skips_barrier(self):
+        runtime = GRPO.DistributedRuntime(enabled=True, rank=0, world_size=16, local_rank=0, device="cpu")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = GRPO.parse_args(
+                [
+                    "--text_model_name",
+                    "/tmp/demo-model",
+                    "--output_dir",
+                    tmpdir,
+                    "--checkpoint_export_only",
+                    "true",
+                ]
+            )
+            policy_stack = types.SimpleNamespace(
+                engine=types.SimpleNamespace(
+                    module=object(),
+                    save_checkpoint=mock.Mock(),
+                ),
+                reference_checkpoint_dir=Path("/tmp/reference"),
+                rollout_checkpoint_dir=Path("/tmp/rollout"),
+            )
+            tracker = types.SimpleNamespace(log_checkpoint_artifact=mock.Mock())
+
+            with (
+                mock.patch.object(GRPO, "export_inference_checkpoint"),
+                mock.patch.object(GRPO, "barrier") as barrier_mock,
+                mock.patch.object(GRPO, "run_rank0_serial_section", side_effect=lambda **kwargs: kwargs["action"]()),
+            ):
+                GRPO.save_training_checkpoint(policy_stack, args, 1, tracker, runtime)
+
+        barrier_mock.assert_not_called()
 
     def test_build_tracking_config_carries_required_spec_fields(self):
         args = GRPO.parse_args(["--text_model_name", "/tmp/demo-model"])
@@ -1251,30 +1783,50 @@ relationship: part_of GO:0000002 ! child
             self.assertNotIn("final_answer", fake_weave.trace_payloads[0]["query"]["sample_meta"])
             self.assertEqual(fake_weave.attribute_calls[0]["run_name"], "demo-run")
             self.assertEqual(fake_weave.attribute_calls[0]["step"], 4)
-            self.assertEqual(fake_weave.trace_results[0]["output_count"], 1)
+            # With the multi-step Weave tree, trace_generation emits one
+            # per-rollout child op before returning its own result, so the
+            # parent rollout result is the last entry appended to
+            # trace_results (the FakeWeaveModule records results after fn
+            # returns — children finish before the parent).
+            parent_rollout_result = next(
+                result for result in reversed(fake_weave.trace_results) if "output_count" in result
+            )
+            self.assertEqual(parent_rollout_result["output_count"], 1)
             self.assertEqual(
-                fake_weave.trace_results[0]["output_char_lengths"],
+                parent_rollout_result["output_char_lengths"],
                 [len("<|FINAL_ANSWER|>GO:0000001<|/FINAL_ANSWER|>")],
             )
-            self.assertEqual(fake_weave.trace_results[0]["output_word_lengths"], [1])
+            self.assertEqual(parent_rollout_result["output_word_lengths"], [1])
             self.assertEqual(
-                fake_weave.trace_results[0]["output_token_lengths"],
+                parent_rollout_result["output_token_lengths"],
                 [len("<|FINAL_ANSWER|>GO:0000001<|/FINAL_ANSWER|>")],
             )
-            self.assertEqual(fake_weave.trace_results[0]["output_length_summary"]["chars"]["count"], 1)
-            self.assertEqual(fake_weave.trace_results[0]["output_length_summary"]["tokens"]["count"], 1)
-            self.assertEqual(fake_weave.trace_results[0]["output_format_valid"], [True])
-            self.assertEqual(fake_weave.trace_results[0]["output_has_final_answer_tag"], [True])
-            self.assertEqual(fake_weave.trace_results[0]["output_has_go_summary_block"], [False])
-            self.assertEqual(fake_weave.trace_results[0]["output_uses_alt_final_answer_close_tag"], [False])
-            self.assertEqual(fake_weave.trace_results[0]["output_has_unclosed_final_answer_tag"], [False])
-            self.assertEqual(fake_weave.trace_results[0]["output_has_repeated_final_answer_open_tag"], [False])
-            self.assertEqual(fake_weave.trace_results[0]["output_has_tool_call_residue"], [False])
-            self.assertEqual(fake_weave.trace_results[0]["output_has_think_residue"], [False])
-            self.assertEqual(fake_weave.trace_results[0]["output_parsed_go_counts"], [1])
-            self.assertEqual(fake_weave.trace_results[0]["output_format_summary"]["format_valid"]["true_count"], 1)
-            self.assertEqual(fake_weave.trace_results[0]["output_format_summary"]["alt_final_answer_close_tag"]["true_count"], 0)
+            self.assertEqual(parent_rollout_result["output_length_summary"]["chars"]["count"], 1)
+            self.assertEqual(parent_rollout_result["output_length_summary"]["tokens"]["count"], 1)
+            self.assertEqual(parent_rollout_result["output_format_valid"], [True])
+            self.assertEqual(parent_rollout_result["output_has_final_answer_tag"], [True])
+            self.assertEqual(parent_rollout_result["output_has_go_summary_block"], [False])
+            self.assertEqual(parent_rollout_result["output_uses_alt_final_answer_close_tag"], [False])
+            self.assertEqual(parent_rollout_result["output_has_unclosed_final_answer_tag"], [False])
+            self.assertEqual(parent_rollout_result["output_has_repeated_final_answer_open_tag"], [False])
+            self.assertEqual(parent_rollout_result["output_has_tool_call_residue"], [False])
+            self.assertEqual(parent_rollout_result["output_has_think_residue"], [False])
+            self.assertEqual(parent_rollout_result["output_parsed_go_counts"], [1])
+            self.assertEqual(parent_rollout_result["output_format_summary"]["format_valid"]["true_count"], 1)
+            self.assertEqual(parent_rollout_result["output_format_summary"]["alt_final_answer_close_tag"]["true_count"], 0)
             self.assertEqual(tracker.weave_remaining_budget, args.weave_trace_budget - 1)
+            # Per-completion child op is emitted inside the parent rollout span.
+            rollout_item_payloads = [
+                payload for payload in fake_weave.trace_payloads if payload.get("stage") == "rollout_item"
+            ]
+            self.assertEqual(len(rollout_item_payloads), 1)
+            self.assertEqual(rollout_item_payloads[0]["rollout_idx"], 0)
+            self.assertEqual(rollout_item_payloads[0]["protein_id"], "P12345")
+            self.assertEqual(
+                rollout_item_payloads[0]["completion"],
+                "<|FINAL_ANSWER|>GO:0000001<|/FINAL_ANSWER|>",
+            )
+            self.assertEqual(rollout_item_payloads[0]["parsed_go_ids"], ["GO:0000001"])
 
     def test_trace_reward_call_uses_stage_specific_targets(self):
         fake_weave = FakeWeaveModule()
@@ -1321,6 +1873,20 @@ relationship: part_of GO:0000002 ! child
             self.assertEqual(fake_weave.trace_payloads[0]["target_go_ids"], ["GO:0000001"])
             self.assertEqual(fake_weave.trace_payloads[0]["completions"], ["<|FINAL_ANSWER|>GO:0000001<|/FINAL_ANSWER|>"])
             self.assertEqual(fake_weave.attribute_calls[0]["stage"], "reward")
+            # Per-completion reward child op is emitted inside the parent
+            # reward span, surfacing overlap/missed/extra GO ids for filtering.
+            reward_item_payloads = [
+                payload for payload in fake_weave.trace_payloads if payload.get("stage") == "reward_item"
+            ]
+            self.assertEqual(len(reward_item_payloads), 1)
+            self.assertEqual(reward_item_payloads[0]["rollout_idx"], 0)
+            self.assertEqual(reward_item_payloads[0]["reward"], 1.0)
+            self.assertEqual(reward_item_payloads[0]["protein_id"], "P12345")
+            self.assertEqual(reward_item_payloads[0]["target_go_ids"], ["GO:0000001"])
+            self.assertEqual(reward_item_payloads[0]["predicted_go_ids"], ["GO:0000001"])
+            self.assertEqual(reward_item_payloads[0]["overlap_go_ids"], ["GO:0000001"])
+            self.assertEqual(reward_item_payloads[0]["missed_go_ids"], [])
+            self.assertEqual(reward_item_payloads[0]["extra_go_ids"], [])
 
     def test_trace_policy_update_call_uses_stage_specific_op(self):
         fake_weave = FakeWeaveModule()
