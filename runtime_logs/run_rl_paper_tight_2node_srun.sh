@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #SBATCH --mem=0
-#SBATCH -o /mnt/home/kkamata+cwb607/BioReason-Pro/runtime_logs/coreweave/train_rl_paper_tight_2node_srun_%j.log
+#SBATCH -o /mnt/home/%u/BioReason-Pro/runtime_logs/coreweave/train_rl_paper_tight_2node_srun_%j.log
 set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-${SLURM_SUBMIT_DIR:-}}"
@@ -50,6 +50,9 @@ export WANDB_PROJECT="${WANDB_PROJECT:-bioreason-pro}"
 export BASE_WANDB_PROJECT="${BASE_WANDB_PROJECT:-$WANDB_PROJECT}"
 export WEAVE_PROJECT="${WEAVE_PROJECT:-${WANDB_ENTITY}/${WANDB_PROJECT}}"
 export REGISTRY_ENV_FILE="${REGISTRY_ENV_FILE:-configs/disease_benchmark/wandb_registry_paths.env}"
+export BASE_CHECKPOINT="${BASE_CHECKPOINT:-wandb-healthcare/bioreason-pro/bioreason-pro-rl:latest}"
+export TEMPORAL_SPLIT_ARTIFACT="${TEMPORAL_SPLIT_ARTIFACT:-wandb-healthcare/bioreason-pro/disease-temporal-split:production}"
+export DATASET_ARTIFACT="${DATASET_ARTIFACT:-wandb-healthcare/bioreason-pro/disease-temporal-reasoning:production}"
 export REASONING_PROMPT_STYLE="${REASONING_PROMPT_STYLE:-paper_native_tight}"
 export CHECKPOINT_ARTIFACT_NAME="${CHECKPOINT_ARTIFACT_NAME:-train-rl-paper-native-tight-2node}"
 export CHECKPOINT_ARTIFACT_ALIASES="${CHECKPOINT_ARTIFACT_ALIASES:-latest,paper-native-tight,2node}"
@@ -92,6 +95,9 @@ srun --nodes="${NNODES}" --ntasks="${NNODES}" --ntasks-per-node=1 bash -lc '
   export BASE_WANDB_PROJECT="'"$BASE_WANDB_PROJECT"'"
   export WEAVE_PROJECT="'"$WEAVE_PROJECT"'"
   export REGISTRY_ENV_FILE="'"$REGISTRY_ENV_FILE"'"
+  export BASE_CHECKPOINT="'"$BASE_CHECKPOINT"'"
+  export TEMPORAL_SPLIT_ARTIFACT="'"$TEMPORAL_SPLIT_ARTIFACT"'"
+  export DATASET_ARTIFACT="'"$DATASET_ARTIFACT"'"
   export REASONING_PROMPT_STYLE="'"$REASONING_PROMPT_STYLE"'"
   export CHECKPOINT_ARTIFACT_NAME="'"$CHECKPOINT_ARTIFACT_NAME"'"
   export CHECKPOINT_ARTIFACT_ALIASES="'"$CHECKPOINT_ARTIFACT_ALIASES"'"

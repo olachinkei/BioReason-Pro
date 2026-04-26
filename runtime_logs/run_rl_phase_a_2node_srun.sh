@@ -36,6 +36,11 @@ if [ -z "$ABLATION" ]; then
   exit 1
 fi
 
+_CALLER_WANDB_PROJECT="${WANDB_PROJECT:-}"
+_CALLER_WANDB_ENTITY="${WANDB_ENTITY:-}"
+_CALLER_BASE_WANDB_PROJECT="${BASE_WANDB_PROJECT:-}"
+_CALLER_WEAVE_PROJECT="${WEAVE_PROJECT:-}"
+
 if [ -f .env ]; then
   set -a
   source .env
@@ -50,11 +55,29 @@ fi
 
 source "$PROJECT_ROOT/.venv-gpu/bin/activate"
 
+if [ -n "$_CALLER_WANDB_PROJECT" ]; then
+  export WANDB_PROJECT="$_CALLER_WANDB_PROJECT"
+fi
+if [ -n "$_CALLER_WANDB_ENTITY" ]; then
+  export WANDB_ENTITY="$_CALLER_WANDB_ENTITY"
+fi
+if [ -n "$_CALLER_BASE_WANDB_PROJECT" ]; then
+  export BASE_WANDB_PROJECT="$_CALLER_BASE_WANDB_PROJECT"
+fi
+if [ -n "$_CALLER_WEAVE_PROJECT" ]; then
+  export WEAVE_PROJECT="$_CALLER_WEAVE_PROJECT"
+fi
+
 export WANDB_ENTITY="${WANDB_ENTITY:-wandb-healthcare}"
-export WANDB_PROJECT="${WANDB_PROJECT:-bioreason-pro-custom}"
+export WANDB_PROJECT="${WANDB_PROJECT:-bioreason-pro}"
+export BIOREASON_WANDB_RUN_ID="${BIOREASON_WANDB_RUN_ID:-}"
+export BIOREASON_WANDB_RESUME="${BIOREASON_WANDB_RESUME:-}"
 export BASE_WANDB_PROJECT="${BASE_WANDB_PROJECT:-$WANDB_PROJECT}"
 export WEAVE_PROJECT="${WEAVE_PROJECT:-${WANDB_ENTITY}/${WANDB_PROJECT}}"
 export REGISTRY_ENV_FILE="${REGISTRY_ENV_FILE:-configs/disease_benchmark/wandb_registry_paths.env}"
+export BASE_CHECKPOINT="${BASE_CHECKPOINT:-wandb-healthcare/bioreason-pro/bioreason-pro-rl:latest}"
+export TEMPORAL_SPLIT_ARTIFACT="${TEMPORAL_SPLIT_ARTIFACT:-wandb-healthcare/bioreason-pro/disease-temporal-split:production}"
+export DATASET_ARTIFACT="${DATASET_ARTIFACT:-wandb-healthcare/bioreason-pro/disease-temporal-reasoning:production}"
 export REASONING_PROMPT_STYLE="${REASONING_PROMPT_STYLE:-paper_native_tight}"
 export NNODES="${NNODES:-2}"
 export GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
@@ -70,26 +93,38 @@ export VLLM_SWAP_SPACE_GB="${VLLM_SWAP_SPACE_GB:-0}"
 export ROLLOUT_LOGPROB_MICROBATCH_SIZE="${ROLLOUT_LOGPROB_MICROBATCH_SIZE:-4}"
 export MAX_STEPS="${MAX_STEPS:-20}"
 export VALIDATION_EVERY_N_STEPS="${VALIDATION_EVERY_N_STEPS:-5}"
+export VALIDATION_NUM_PROTEINS="${VALIDATION_NUM_PROTEINS:-10}"
 export SAVE_EVERY_N_STEPS="${SAVE_EVERY_N_STEPS:-10}"
+export REWARD_WEIGHTS="${REWARD_WEIGHTS:-}"
+export DISEASE_WEIGHTING_MODE="${DISEASE_WEIGHTING_MODE:-uniform_fallback}"
 export TRACE_ROLLOUTS_TO_WEAVE="${TRACE_ROLLOUTS_TO_WEAVE:-true}"
 export WEAVE_TRACE_BUDGET="${WEAVE_TRACE_BUDGET:-64}"
 export WEAVE_TRACE_FULL_GROUP_COUNT="${WEAVE_TRACE_FULL_GROUP_COUNT:-4}"
 export WEAVE_TRACE_FULL_ROLLOUTS_PER_GROUP="${WEAVE_TRACE_FULL_ROLLOUTS_PER_GROUP:-24}"
+export ROLLOUT_GENERATE_TIMEOUT_SECONDS="${ROLLOUT_GENERATE_TIMEOUT_SECONDS:-1200}"
+export NCCL_TIMEOUT="${NCCL_TIMEOUT:-7200}"
+export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-7200}"
 export LIGHTWEIGHT_PROFILE="${LIGHTWEIGHT_PROFILE:-false}"
+export ALLOW_LIGHTWEIGHT_MULTI_NODE="${ALLOW_LIGHTWEIGHT_MULTI_NODE:-false}"
 export MASTER_ADDR="${MASTER_ADDR:-$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)}"
 export MASTER_PORT="${MASTER_PORT:-29511}"
 export ABLATION
 
 lightweight_flag="$(printf '%s' "$LIGHTWEIGHT_PROFILE" | tr '[:upper:]' '[:lower:]')"
+allow_lightweight_multi_node_flag="$(printf '%s' "$ALLOW_LIGHTWEIGHT_MULTI_NODE" | tr '[:upper:]' '[:lower:]')"
 if [ "$lightweight_flag" = "1" ] || [ "$lightweight_flag" = "true" ] || [ "$lightweight_flag" = "yes" ]; then
-  # Low-memory profile for one-node debugging/baselines: fewer generations,
-  # and a microbatch contract compatible with rollouts=5.
-  export ROLLOUTS_PER_QUERY="${LIGHTWEIGHT_ROLLOUTS_PER_QUERY:-5}"
-  export OPTIMIZER_MICRO_BATCH_SIZE_PER_GPU="${LIGHTWEIGHT_OPTIMIZER_MICRO_BATCH_SIZE_PER_GPU:-5}"
-  export GRADIENT_ACCUMULATION_STEPS="${LIGHTWEIGHT_GRADIENT_ACCUMULATION_STEPS:-1}"
-  export MAX_NEW_TOKENS="${LIGHTWEIGHT_MAX_NEW_TOKENS:-4096}"
-  export VLLM_MAX_NUM_SEQS="${LIGHTWEIGHT_VLLM_MAX_NUM_SEQS:-16}"
-  echo "Info: LIGHTWEIGHT_PROFILE enabled (rollouts=${ROLLOUTS_PER_QUERY}, micro_batch=${OPTIMIZER_MICRO_BATCH_SIZE_PER_GPU}, grad_accum=${GRADIENT_ACCUMULATION_STEPS})."
+  if [ "$NNODES" != "1" ] && [ "$allow_lightweight_multi_node_flag" != "1" ] && [ "$allow_lightweight_multi_node_flag" != "true" ] && [ "$allow_lightweight_multi_node_flag" != "yes" ]; then
+    echo "Warning: LIGHTWEIGHT_PROFILE requested with NNODES=$NNODES; ignoring unless ALLOW_LIGHTWEIGHT_MULTI_NODE=true."
+  else
+    # Low-memory profile for one-node debugging/baselines: fewer generations,
+    # and a microbatch contract compatible with rollouts=5.
+    export ROLLOUTS_PER_QUERY="${LIGHTWEIGHT_ROLLOUTS_PER_QUERY:-5}"
+    export OPTIMIZER_MICRO_BATCH_SIZE_PER_GPU="${LIGHTWEIGHT_OPTIMIZER_MICRO_BATCH_SIZE_PER_GPU:-5}"
+    export GRADIENT_ACCUMULATION_STEPS="${LIGHTWEIGHT_GRADIENT_ACCUMULATION_STEPS:-1}"
+    export MAX_NEW_TOKENS="${LIGHTWEIGHT_MAX_NEW_TOKENS:-4096}"
+    export VLLM_MAX_NUM_SEQS="${LIGHTWEIGHT_VLLM_MAX_NUM_SEQS:-16}"
+    echo "Info: LIGHTWEIGHT_PROFILE enabled (rollouts=${ROLLOUTS_PER_QUERY}, micro_batch=${OPTIMIZER_MICRO_BATCH_SIZE_PER_GPU}, grad_accum=${GRADIENT_ACCUMULATION_STEPS})."
+  fi
 fi
 
 srun --nodes="${NNODES}" --ntasks="${NNODES}" --ntasks-per-node=1 bash -lc '
@@ -98,9 +133,14 @@ srun --nodes="${NNODES}" --ntasks="${NNODES}" --ntasks-per-node=1 bash -lc '
   source "'"$PROJECT_ROOT"'"/.venv-gpu/bin/activate
   export WANDB_ENTITY="'"$WANDB_ENTITY"'"
   export WANDB_PROJECT="'"$WANDB_PROJECT"'"
+  export BIOREASON_WANDB_RUN_ID="'"$BIOREASON_WANDB_RUN_ID"'"
+  export BIOREASON_WANDB_RESUME="'"$BIOREASON_WANDB_RESUME"'"
   export BASE_WANDB_PROJECT="'"$BASE_WANDB_PROJECT"'"
   export WEAVE_PROJECT="'"$WEAVE_PROJECT"'"
   export REGISTRY_ENV_FILE="'"$REGISTRY_ENV_FILE"'"
+  export BASE_CHECKPOINT="'"$BASE_CHECKPOINT"'"
+  export TEMPORAL_SPLIT_ARTIFACT="'"$TEMPORAL_SPLIT_ARTIFACT"'"
+  export DATASET_ARTIFACT="'"$DATASET_ARTIFACT"'"
   export REASONING_PROMPT_STYLE="'"$REASONING_PROMPT_STYLE"'"
   export NNODES="'"$NNODES"'"
   export GPUS_PER_NODE="'"$GPUS_PER_NODE"'"
@@ -116,11 +156,17 @@ srun --nodes="${NNODES}" --ntasks="${NNODES}" --ntasks-per-node=1 bash -lc '
   export ROLLOUT_LOGPROB_MICROBATCH_SIZE="'"$ROLLOUT_LOGPROB_MICROBATCH_SIZE"'"
   export MAX_STEPS="'"$MAX_STEPS"'"
   export VALIDATION_EVERY_N_STEPS="'"$VALIDATION_EVERY_N_STEPS"'"
+  export VALIDATION_NUM_PROTEINS="'"$VALIDATION_NUM_PROTEINS"'"
   export SAVE_EVERY_N_STEPS="'"$SAVE_EVERY_N_STEPS"'"
+  export REWARD_WEIGHTS="'"$REWARD_WEIGHTS"'"
+  export DISEASE_WEIGHTING_MODE="'"$DISEASE_WEIGHTING_MODE"'"
   export TRACE_ROLLOUTS_TO_WEAVE="'"$TRACE_ROLLOUTS_TO_WEAVE"'"
   export WEAVE_TRACE_BUDGET="'"$WEAVE_TRACE_BUDGET"'"
   export WEAVE_TRACE_FULL_GROUP_COUNT="'"$WEAVE_TRACE_FULL_GROUP_COUNT"'"
   export WEAVE_TRACE_FULL_ROLLOUTS_PER_GROUP="'"$WEAVE_TRACE_FULL_ROLLOUTS_PER_GROUP"'"
+  export ROLLOUT_GENERATE_TIMEOUT_SECONDS="'"$ROLLOUT_GENERATE_TIMEOUT_SECONDS"'"
+  export NCCL_TIMEOUT="'"$NCCL_TIMEOUT"'"
+  export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="'"$TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"'"
   export MASTER_ADDR="'"$MASTER_ADDR"'"
   export MASTER_PORT="'"$MASTER_PORT"'"
   export ABLATION="'"$ABLATION"'"
@@ -133,5 +179,6 @@ srun --nodes="${NNODES}" --ntasks="${NNODES}" --ntasks-per-node=1 bash -lc '
     --weave_trace_full_rollouts_per_group "$WEAVE_TRACE_FULL_ROLLOUTS_PER_GROUP" \
     --max_steps "$MAX_STEPS" \
     --validation_every_n_steps "$VALIDATION_EVERY_N_STEPS" \
+    --validation_num_proteins "$VALIDATION_NUM_PROTEINS" \
     --save_every_n_steps "$SAVE_EVERY_N_STEPS"
 '

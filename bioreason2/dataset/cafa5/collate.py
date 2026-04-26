@@ -270,6 +270,9 @@ def qwen_protein_collate_fn(
     batch["go_bp_targets"] = [_stringify_metadata_value(example.get("go_bp")) for example in examples]
     batch["go_mf_targets"] = [_stringify_metadata_value(example.get("go_mf")) for example in examples]
     batch["go_cc_targets"] = [_stringify_metadata_value(example.get("go_cc")) for example in examples]
+    batch["is_disease_priority_targets"] = [
+        _stringify_metadata_value(example.get("is_disease_priority")) for example in examples
+    ]
     batch["reasoning_targets"] = [_stringify_metadata_value(example.get("reasoning")) for example in examples]
     batch["final_answers"] = [_stringify_metadata_value(example.get("final_answer")) for example in examples]
 

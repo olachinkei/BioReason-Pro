@@ -68,6 +68,11 @@ ABLATION_TIMESTAMP=${ABLATION_TIMESTAMP:-"$(date -u +%Y%m%dT%H%M%SZ)"}
 export WANDB_RUN_NAME=${WANDB_RUN_NAME:-"rl-phase-a-${ABLATION_UPPER}-${ABLATION_TIMESTAMP}"}
 
 ABLATION_LOWER=$(printf '%s' "$ABLATION_UPPER" | tr '[:upper:]' '[:lower:]')
+ABLATION_DISEASE_WEIGHTING_MODE=${DISEASE_WEIGHTING_MODE:-"uniform_fallback"}
+WANDB_TAGS=("$PHASE_A_GROUP_TAG" "$ABLATION_DESCRIPTION")
+if [ "$ABLATION_UPPER" = "A3" ]; then
+  WANDB_TAGS+=("a3-${ABLATION_DISEASE_WEIGHTING_MODE}")
+fi
 
 # Each ablation writes to its own checkpoint directory / artifact alias so
 # concurrent or back-to-back runs do not clobber each other.
@@ -79,10 +84,11 @@ export OUTPUT_DIR CHECKPOINT_ARTIFACT_NAME CHECKPOINT_ARTIFACT_ALIASES
 ABLATION_TRAIN_ARGS=(
   --reward_mode "$ABLATION_REWARD_MODE"
   --disease_loss_weight "$ABLATION_DISEASE_LOSS_WEIGHT"
+  --disease_weighting_mode "$ABLATION_DISEASE_WEIGHTING_MODE"
   --ablation_tag "$ABLATION_TAG"
-  --wandb_tags "$PHASE_A_GROUP_TAG" "$ABLATION_DESCRIPTION"
+  --wandb_tags "${WANDB_TAGS[@]}"
 )
 
-echo "[phase-a] ablation=$ABLATION_UPPER reward_mode=$ABLATION_REWARD_MODE disease_loss_weight=$ABLATION_DISEASE_LOSS_WEIGHT tag=$ABLATION_TAG run_name=$WANDB_RUN_NAME" >&2
+echo "[phase-a] ablation=$ABLATION_UPPER reward_mode=$ABLATION_REWARD_MODE disease_loss_weight=$ABLATION_DISEASE_LOSS_WEIGHT disease_weighting_mode=$ABLATION_DISEASE_WEIGHTING_MODE tag=$ABLATION_TAG run_name=$WANDB_RUN_NAME" >&2
 
 exec "$(dirname "$0")/sh_train_protein_grpo.sh" "${ABLATION_TRAIN_ARGS[@]}" "$@"

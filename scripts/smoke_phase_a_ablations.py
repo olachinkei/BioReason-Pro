@@ -142,15 +142,22 @@ def run_ablation_checks(
     spec: AblationSpec,
     GRPO,
     fixture: Mapping[str, object],
+    *,
+    disease_weighting_mode: str = "uniform_fallback",
+    reward_weights: str = "",
     verbose: bool = True,
 ) -> Dict[str, object]:
-    parsed = GRPO.parse_args(build_cli_args(spec))
+    extra_args: List[str] = ["--disease_weighting_mode", disease_weighting_mode]
+    if reward_weights:
+        extra_args.extend(["--reward_weights", reward_weights])
+    parsed = GRPO.parse_args(build_cli_args(spec, extra=extra_args))
 
     assert parsed.reward_mode == spec.reward_mode, (
         f"parser did not preserve --reward_mode for {spec.name}: "
         f"got {parsed.reward_mode!r} expected {spec.reward_mode!r}"
     )
     assert float(parsed.disease_loss_weight) == spec.disease_loss_weight
+    assert parsed.disease_weighting_mode == disease_weighting_mode
 
     tags = GRPO.resolve_wandb_tags(parsed)
     expected_primary_tag = f"phase-a-{spec.name}"
@@ -187,15 +194,30 @@ def run_ablation_checks(
 
     # Loss-scale resolver sanity.
     priority_scale = GRPO.resolve_disease_loss_scale(
-        {"is_disease_priority": True}, spec.disease_loss_weight
+        {"is_disease_priority": True}, spec.disease_loss_weight, disease_weighting_mode
     )
-    unflagged_scale = GRPO.resolve_disease_loss_scale({}, spec.disease_loss_weight)
+    unflagged_scale = GRPO.resolve_disease_loss_scale({}, spec.disease_loss_weight, disease_weighting_mode)
     non_priority_scale = GRPO.resolve_disease_loss_scale(
-        {"is_disease_priority": False}, spec.disease_loss_weight
+        {"is_disease_priority": False}, spec.disease_loss_weight, disease_weighting_mode
     )
+    audit_samples = [
+        {"is_disease_priority": "true"},
+        {"is_disease_priority": "false"},
+        {"is_disease_priority": ""},
+        {},
+    ]
+    parsed_audit_flags = [GRPO.parse_disease_priority_flag(item.get("is_disease_priority")) for item in audit_samples]
+    known_rate = sum(1.0 for value in parsed_audit_flags if value is not None) / float(len(parsed_audit_flags))
+    true_rate = (
+        sum(1.0 for value in parsed_audit_flags if value is True)
+        / float(sum(1 for value in parsed_audit_flags if value is not None))
+    )
+    assert abs(known_rate - 0.5) < 1e-9
+    assert abs(true_rate - 0.5) < 1e-9
 
     assert priority_scale == spec.disease_loss_weight
-    assert unflagged_scale == spec.disease_loss_weight
+    expected_unflagged_scale = spec.disease_loss_weight if disease_weighting_mode == "uniform_fallback" else 1.0
+    assert unflagged_scale == expected_unflagged_scale
     if spec.disease_loss_weight == 1.0:
         assert non_priority_scale == 1.0
     else:
@@ -208,12 +230,18 @@ def run_ablation_checks(
         "ablation": spec.name,
         "reward_mode": spec.reward_mode,
         "disease_loss_weight": spec.disease_loss_weight,
+        "disease_weighting_mode": disease_weighting_mode,
+        "reward_weights": reward_weights or "default",
         "wandb_tags": tags,
         "rewards": [round(float(reward), 4) for reward in rewards],
         "loss_scales": {
             "priority_true": priority_scale,
             "priority_absent": unflagged_scale,
             "priority_false": non_priority_scale,
+        },
+        "audit_stage_smoke": {
+            "known_rate": known_rate,
+            "true_rate": true_rate,
         },
     }
     if verbose:
@@ -228,6 +256,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=str,
         default=None,
         help="Optional ablation name (A0/A1/A2/A3) to restrict the smoke test to a single row.",
+    )
+    parser.add_argument(
+        "--disease-weighting-mode",
+        type=str,
+        default="uniform_fallback",
+        choices=["uniform_fallback", "selective"],
+        help="Loss-scaling behavior when is_disease_priority is absent.",
+    )
+    parser.add_argument(
+        "--reward-weights",
+        type=str,
+        default="",
+        help="Optional 4-component reward weights override.",
     )
     parser.add_argument("--quiet", action="store_true", help="Suppress per-ablation JSON summaries.")
     args = parser.parse_args(argv)
@@ -244,7 +285,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
 
     for spec in selected:
-        run_ablation_checks(spec, GRPO, fixture, verbose=not args.quiet)
+        run_ablation_checks(
+            spec,
+            GRPO,
+            fixture,
+            disease_weighting_mode=args.disease_weighting_mode,
+            reward_weights=args.reward_weights,
+            verbose=not args.quiet,
+        )
 
     print(f"ok: phase A smoke passed for {[spec.name for spec in selected]}")
     return 0
