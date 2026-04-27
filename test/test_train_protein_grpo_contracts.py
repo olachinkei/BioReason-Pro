@@ -2178,9 +2178,37 @@ class PhaseAAblationContractsTest(unittest.TestCase):
         scale = GRPO.resolve_disease_loss_scale({}, 1.5)
         self.assertEqual(scale, 1.5)
 
-    def test_resolve_disease_loss_scale_respects_false_flag(self):
-        scale = GRPO.resolve_disease_loss_scale({"is_disease_priority": False}, 1.5)
+    def test_resolve_disease_loss_scale_selective_defaults_to_no_scaling_when_flag_absent(self):
+        scale = GRPO.resolve_disease_loss_scale({}, 1.5, disease_weighting_mode="selective")
         self.assertEqual(scale, 1.0)
+
+    def test_resolve_disease_loss_scale_respects_false_flag(self):
+        scale = GRPO.resolve_disease_loss_scale({"is_disease_priority": "false"}, 1.5)
+        self.assertEqual(scale, 1.0)
+
+    def test_resolve_disease_loss_scale_respects_true_flag(self):
+        scale = GRPO.resolve_disease_loss_scale({"is_disease_priority": "true"}, 1.5)
+        self.assertEqual(scale, 1.5)
+
+    def test_parse_disease_priority_flag_handles_common_values(self):
+        self.assertIs(GRPO.parse_disease_priority_flag("true"), True)
+        self.assertIs(GRPO.parse_disease_priority_flag("false"), False)
+        self.assertIs(GRPO.parse_disease_priority_flag("1"), True)
+        self.assertIs(GRPO.parse_disease_priority_flag("0"), False)
+        self.assertIsNone(GRPO.parse_disease_priority_flag(""))
+
+    def test_build_query_sample_meta_includes_disease_priority(self):
+        sample_meta = GRPO.build_query_sample_meta(
+            {
+                "protein_ids": ["P12345"],
+                "sample_splits": ["train"],
+                "go_bp_targets": ["['GO:0000001']"],
+                "go_mf_targets": [""],
+                "go_cc_targets": [""],
+                "is_disease_priority_targets": ["true"],
+            }
+        )
+        self.assertEqual(sample_meta["is_disease_priority"], "true")
 
     def test_resolve_wandb_tags_dedupes_and_preserves_order(self):
         args = types.SimpleNamespace(
@@ -2200,6 +2228,7 @@ class PhaseAAblationContractsTest(unittest.TestCase):
                 "--text_model_name", "stub",
                 "--reward_mode", "per_aspect_lin",
                 "--disease_loss_weight", "1.5",
+                "--disease_weighting_mode", "selective",
                 "--ablation_tag", "phase-a-A3",
                 "--wandb_tags", "phase-a", "disease-pilot",
                 "--lin_partial_credit_cap", "0.25",
@@ -2207,6 +2236,7 @@ class PhaseAAblationContractsTest(unittest.TestCase):
         )
         self.assertEqual(parsed.reward_mode, "per_aspect_lin")
         self.assertEqual(parsed.disease_loss_weight, 1.5)
+        self.assertEqual(parsed.disease_weighting_mode, "selective")
         self.assertEqual(parsed.ablation_tag, "phase-a-A3")
         self.assertEqual(parsed.wandb_tags, ["phase-a", "disease-pilot"])
         self.assertEqual(parsed.lin_partial_credit_cap, 0.25)
@@ -2215,6 +2245,7 @@ class PhaseAAblationContractsTest(unittest.TestCase):
         parsed = GRPO.parse_args(["--text_model_name", "stub"])
         self.assertEqual(parsed.reward_mode, "ia_f1")
         self.assertEqual(parsed.disease_loss_weight, 1.0)
+        self.assertEqual(parsed.disease_weighting_mode, "uniform_fallback")
         self.assertIsNone(parsed.ablation_tag)
 
 

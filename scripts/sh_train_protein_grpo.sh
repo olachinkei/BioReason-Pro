@@ -4,18 +4,6 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-default_runtime_root() {
-  if [ -n "${BIOREASON_RUNTIME_ROOT:-}" ]; then
-    printf '%s\n' "$BIOREASON_RUNTIME_ROOT"
-    return 0
-  fi
-  if [ -d "/mnt/data" ] && [ -n "${USER:-}" ]; then
-    printf '/mnt/data/%s/BioReason-Pro\n' "$USER"
-    return 0
-  fi
-  pwd
-}
-
 source_env_file_without_overrides() {
   local env_file="$1"
   local raw_line line key existing_value
@@ -100,18 +88,6 @@ export PYTHONDONTWRITEBYTECODE=1
 export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
 export CUDA_DEVICE_ORDER="${CUDA_DEVICE_ORDER:-PCI_BUS_ID}"
 
-BIOREASON_RUNTIME_ROOT="$(default_runtime_root)"
-BIOREASON_ARTIFACTS_ROOT="${BIOREASON_ARTIFACTS_ROOT:-${BIOREASON_RUNTIME_ROOT}/data/artifacts}"
-BIOREASON_CACHE_ROOT="${BIOREASON_CACHE_ROOT:-${BIOREASON_RUNTIME_ROOT}/cache}"
-WANDB_DIR="${WANDB_DIR:-${BIOREASON_RUNTIME_ROOT}/wandb}"
-WEAVE_SERVER_CACHE_DIR="${WEAVE_SERVER_CACHE_DIR:-${WANDB_DIR}/weave_server_cache}"
-HF_HOME="${HF_HOME:-${BIOREASON_CACHE_ROOT}/huggingface}"
-TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}/transformers}"
-HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
-mkdir -p "$BIOREASON_ARTIFACTS_ROOT" "$BIOREASON_CACHE_ROOT" "$WANDB_DIR" "$WEAVE_SERVER_CACHE_DIR" "$TRANSFORMERS_CACHE" "$HF_DATASETS_CACHE"
-export BIOREASON_RUNTIME_ROOT BIOREASON_ARTIFACTS_ROOT BIOREASON_CACHE_ROOT
-export WANDB_DIR WEAVE_SERVER_CACHE_DIR HF_HOME TRANSFORMERS_CACHE HF_DATASETS_CACHE
-
 PYTHON_BIN=${PYTHON_BIN:-python}
 DEEPSPEED_BIN=${DEEPSPEED_BIN:-deepspeed}
 MODEL_SOURCE_RESOLVER=${MODEL_SOURCE_RESOLVER:-"scripts/materialize_model_source.py"}
@@ -122,6 +98,8 @@ DATA_BUNDLE=${DATA_BUNDLE:-"main_production"}
 WANDB_PROJECT=${WANDB_PROJECT:-"${BASE_WANDB_PROJECT:-bioreason-pro}"}
 BASE_WANDB_PROJECT=${BASE_WANDB_PROJECT:-"$WANDB_PROJECT"}
 WANDB_ENTITY=${WANDB_ENTITY:-""}
+BIOREASON_WANDB_RUN_ID=${BIOREASON_WANDB_RUN_ID:-""}
+BIOREASON_WANDB_RESUME=${BIOREASON_WANDB_RESUME:-""}
 WEAVE_PROJECT=${WEAVE_PROJECT:-""}
 if [ -z "$WEAVE_PROJECT" ] && [ -n "$WANDB_ENTITY" ]; then
   WEAVE_PROJECT="${WANDB_ENTITY}/${WANDB_PROJECT}"
@@ -134,7 +112,7 @@ DEV_END_RELEASE=${DEV_END_RELEASE:-225}
 TEST_END_RELEASE=${TEST_END_RELEASE:-228}
 
 BASE_CHECKPOINT=${BASE_CHECKPOINT:-"${BIOREASON_RL_PAPER_MODEL_REGISTRY_PATH:-}"}
-BASE_CHECKPOINT_DIR=${BASE_CHECKPOINT_DIR:-"${BIOREASON_ARTIFACTS_ROOT}/models/bioreason_pro_rl_paper"}
+BASE_CHECKPOINT_DIR=${BASE_CHECKPOINT_DIR:-"data/artifacts/models/bioreason_pro_rl_paper"}
 CAFA5_DATASET=${CAFA5_DATASET:-""}
 DATASET_NAME=${DATASET_NAME:-""}
 REASONING_DATASET_NAME=${REASONING_DATASET_NAME:-""}
@@ -144,30 +122,20 @@ IA_FILE_PATH=${IA_FILE_PATH:-""}
 GO_OBO_PATH=${GO_OBO_PATH:-"bioreason2/dataset/go-basic.obo"}
 CHECKPOINT_ARTIFACT_NAME=${CHECKPOINT_ARTIFACT_NAME:-"train-rl-output"}
 CHECKPOINT_ARTIFACT_ALIASES=${CHECKPOINT_ARTIFACT_ALIASES:-"latest"}
-CHECKPOINT_EXPORT_ONLY=${CHECKPOINT_EXPORT_ONLY:-false}
-EXECUTION_ID=${EXECUTION_ID:-"${SLURM_JOB_ID:-local}-$(date -u +%Y%m%d%H%M%S)"}
-SYNC_ROOT=${SYNC_ROOT:-""}
-RESUME_FROM_EXPORT_ARTIFACT=${RESUME_FROM_EXPORT_ARTIFACT:-""}
-RESUME_MODE=${RESUME_MODE:-warm}
-OUTPUT_DIR=${OUTPUT_DIR:-"${BIOREASON_ARTIFACTS_ROOT}/models/train_rl_output"}
+OUTPUT_DIR=${OUTPUT_DIR:-"data/artifacts/models/train_rl_output"}
+REWARD_WEIGHTS=${REWARD_WEIGHTS:-""}
+DISEASE_WEIGHTING_MODE=${DISEASE_WEIGHTING_MODE:-""}
 ROLLOUT_BACKEND=${ROLLOUT_BACKEND:-"subprocess"}
 ROLLOUT_WORKER_START_METHOD=${ROLLOUT_WORKER_START_METHOD:-"spawn"}
+ROLLOUT_GENERATE_TIMEOUT_SECONDS=${ROLLOUT_GENERATE_TIMEOUT_SECONDS:-""}
 QUERIES_PER_STEP=${QUERIES_PER_STEP:-8}
 ROLLOUTS_PER_QUERY=${ROLLOUTS_PER_QUERY:-24}
 OPTIMIZER_MICRO_BATCH_SIZE_PER_GPU=${OPTIMIZER_MICRO_BATCH_SIZE_PER_GPU:-6}
 GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-2}
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-10000}
-ROLLOUT_MAX_NEW_TOKENS=${ROLLOUT_MAX_NEW_TOKENS:-$MAX_NEW_TOKENS}
-ROLLOUT_WORKER_GENERATE_TIMEOUT_S=${ROLLOUT_WORKER_GENERATE_TIMEOUT_S:-1500}
-ROLLOUT_WORKER_STARTUP_RETRY_COUNT=${ROLLOUT_WORKER_STARTUP_RETRY_COUNT:-3}
-ROLLOUT_WORKER_STARTUP_RETRY_SLEEP_S=${ROLLOUT_WORKER_STARTUP_RETRY_SLEEP_S:-15}
-ROLLOUT_WORKER_VLLM_PORT_BASE=${ROLLOUT_WORKER_VLLM_PORT_BASE:-39000}
-ROLLOUT_WORKER_VLLM_PORT_STRIDE=${ROLLOUT_WORKER_VLLM_PORT_STRIDE:-32}
-ROLLOUT_WORKER_VLLM_HOST_IP=${ROLLOUT_WORKER_VLLM_HOST_IP:-127.0.0.1}
 REASONING_PROMPT_STYLE=${REASONING_PROMPT_STYLE:-paper_native_tight}
 ROLLOUT_LOGPROB_MICROBATCH_SIZE=${ROLLOUT_LOGPROB_MICROBATCH_SIZE:-4}
 MAX_LOSS_COMPLETION_TOKENS=${MAX_LOSS_COMPLETION_TOKENS:-0}
-VALIDATION_NUM_PROTEINS=${VALIDATION_NUM_PROTEINS:-200}
 VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION:-0.35}
 VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-32768}
 VLLM_MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:-256}
@@ -191,13 +159,19 @@ MASTER_ADDR=${MASTER_ADDR:-""}
 MASTER_PORT=${MASTER_PORT:-""}
 NODE_RANK=${NODE_RANK:-""}
 
-if [ "$NNODES" != "2" ]; then
-  echo "Error: exact production launch requires NNODES=2 (got $NNODES)."
+if [ "$NNODES" != "2" ] && [ "$NNODES" != "1" ]; then
+  echo "Error: launch requires NNODES in {1,2} (got $NNODES)."
   exit 1
 fi
-if [ "$GPUS_PER_NODE" != "8" ]; then
-  echo "Error: exact production launch requires GPUS_PER_NODE=8 (got $GPUS_PER_NODE)."
+if [ "$NNODES" = "1" ]; then
+  echo "Warning: running single-node mode (NNODES=1); this is a non-production baseline run."
+fi
+if [ "$GPUS_PER_NODE" != "8" ] && [ "$GPUS_PER_NODE" != "1" ]; then
+  echo "Error: launch requires GPUS_PER_NODE in {1,8} (got $GPUS_PER_NODE)."
   exit 1
+fi
+if [ "$GPUS_PER_NODE" = "1" ]; then
+  echo "Warning: running single-GPU mode (GPUS_PER_NODE=1); this is a non-production baseline run."
 fi
 
 if [ -z "$BASE_CHECKPOINT" ]; then
@@ -277,7 +251,6 @@ TRAIN_ARGS=(
   --dataset_config "$DATASET_NAME"
   --reasoning_dataset_config "$REASONING_DATASET_NAME"
   --reasoning_dataset_name "$REASONING_DATASET_NAME"
-  --validation_num_proteins "$VALIDATION_NUM_PROTEINS"
   --temporal_split_artifact "$TEMPORAL_SPLIT_ARTIFACT"
   --dataset_artifact "$DATASET_ARTIFACT"
   --go_obo_path "$GO_OBO_PATH"
@@ -296,13 +269,6 @@ TRAIN_ARGS=(
   --optimizer_micro_batch_size_per_gpu "$OPTIMIZER_MICRO_BATCH_SIZE_PER_GPU"
   --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS"
   --max_new_tokens "$MAX_NEW_TOKENS"
-  --rollout_max_new_tokens "$ROLLOUT_MAX_NEW_TOKENS"
-  --rollout_worker_generate_timeout_s "$ROLLOUT_WORKER_GENERATE_TIMEOUT_S"
-  --rollout_worker_startup_retry_count "$ROLLOUT_WORKER_STARTUP_RETRY_COUNT"
-  --rollout_worker_startup_retry_sleep_s "$ROLLOUT_WORKER_STARTUP_RETRY_SLEEP_S"
-  --rollout_worker_vllm_port_base "$ROLLOUT_WORKER_VLLM_PORT_BASE"
-  --rollout_worker_vllm_port_stride "$ROLLOUT_WORKER_VLLM_PORT_STRIDE"
-  --rollout_worker_vllm_host_ip "$ROLLOUT_WORKER_VLLM_HOST_IP"
   --reasoning_prompt_style "$REASONING_PROMPT_STYLE"
   --rollout_logprob_microbatch_size "$ROLLOUT_LOGPROB_MICROBATCH_SIZE"
   --max_loss_completion_tokens "$MAX_LOSS_COMPLETION_TOKENS"
@@ -320,13 +286,20 @@ TRAIN_ARGS=(
   --output_dir "$OUTPUT_DIR"
   --checkpoint_artifact_name "$CHECKPOINT_ARTIFACT_NAME"
   --checkpoint_artifact_aliases "$CHECKPOINT_ARTIFACT_ALIASES"
-  --checkpoint_export_only "$CHECKPOINT_EXPORT_ONLY"
-  --resume_mode "$RESUME_MODE"
   --wandb_project "$WANDB_PROJECT"
 )
 
 if [ -n "$WANDB_ENTITY" ]; then
   TRAIN_ARGS+=(--wandb_entity "$WANDB_ENTITY")
+fi
+if [ -n "$ROLLOUT_GENERATE_TIMEOUT_SECONDS" ]; then
+  TRAIN_ARGS+=(--rollout_generate_timeout_seconds "$ROLLOUT_GENERATE_TIMEOUT_SECONDS")
+fi
+if [ -n "$BIOREASON_WANDB_RUN_ID" ]; then
+  TRAIN_ARGS+=(--wandb_run_id "$BIOREASON_WANDB_RUN_ID")
+fi
+if [ -n "$BIOREASON_WANDB_RESUME" ]; then
+  TRAIN_ARGS+=(--wandb_resume "$BIOREASON_WANDB_RESUME")
 fi
 if [ -n "${WANDB_RUN_NAME:-}" ]; then
   TRAIN_ARGS+=(--run_name "$WANDB_RUN_NAME")
@@ -334,14 +307,18 @@ fi
 if [ -n "$WEAVE_PROJECT" ]; then
   TRAIN_ARGS+=(--weave_project "$WEAVE_PROJECT")
 fi
-if [ -n "$EXECUTION_ID" ]; then
-  TRAIN_ARGS+=(--execution_id "$EXECUTION_ID")
+if [ -n "$REWARD_WEIGHTS" ]; then
+  TRAIN_ARGS+=(--reward_weights "$REWARD_WEIGHTS")
 fi
-if [ -n "$SYNC_ROOT" ]; then
-  TRAIN_ARGS+=(--sync_root "$SYNC_ROOT")
+if [ -n "$DISEASE_WEIGHTING_MODE" ]; then
+  TRAIN_ARGS+=(--disease_weighting_mode "$DISEASE_WEIGHTING_MODE")
 fi
-if [ -n "$RESUME_FROM_EXPORT_ARTIFACT" ]; then
-  TRAIN_ARGS+=(--resume_from_export_artifact "$RESUME_FROM_EXPORT_ARTIFACT")
+
+AUTO_DEBUG_SINGLE_PROCESS=${AUTO_DEBUG_SINGLE_PROCESS:-true}
+
+# Single-rank launches require explicit debug_single_process mode in trainer.
+if [ "$NNODES" = "1" ] && [ "$GPUS_PER_NODE" = "1" ] && as_bool "$AUTO_DEBUG_SINGLE_PROCESS"; then
+  TRAIN_ARGS+=(--debug_single_process true)
 fi
 
 if has_preflight_only "$@"; then

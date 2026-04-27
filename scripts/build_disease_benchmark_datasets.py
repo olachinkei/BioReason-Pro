@@ -38,7 +38,7 @@ ASPECT_TO_COLUMN = {
 }
 
 UNIPROT_SEARCH_URL = "https://rest.uniprot.org/uniprotkb/search"
-UNIPROT_FIELDS = "accession,organism_name,protein_name,cc_function,sequence"
+UNIPROT_FIELDS = "accession,organism_name,protein_name,cc_function,sequence,xref_mim,xref_orphanet"
 REQUIRED_METADATA_COLUMNS = ("sequence", "organism", "protein_name", "protein_function")
 PAPER_CONTEXT_COLUMNS = ("go_pred", "interpro_formatted", "ppi_formatted")
 GO_ID_PATTERN = re.compile(r"GO:\d{7}")
@@ -124,6 +124,21 @@ def normalize_text(value: Any) -> str:
     if isinstance(value, str):
         return value.strip()
     return str(value).strip()
+
+
+def normalize_optional_bool(value: Any) -> Optional[bool]:
+    text = normalize_text(value).strip().lower()
+    if not text:
+        return None
+    if text in {"1", "true", "t", "yes", "y"}:
+        return True
+    if text in {"0", "false", "f", "no", "n"}:
+        return False
+    return None
+
+
+def stringify_bool(value: bool) -> str:
+    return "true" if bool(value) else "false"
 
 
 def parse_structured_value(value: Any) -> Any:
@@ -375,11 +390,40 @@ def extract_function_text(entry: Mapping[str, Any]) -> str:
     return "\n".join(texts)
 
 
+def extract_disease_xref_flags(entry: Mapping[str, Any]) -> Dict[str, str]:
+    cross_refs = entry.get("uniProtKBCrossReferences") or []
+    has_omim = False
+    has_orphanet = False
+    for reference in cross_refs:
+        database = normalize_text((reference or {}).get("database")).strip().upper()
+        if database == "MIM":
+            has_omim = True
+        elif database == "ORPHANET":
+            has_orphanet = True
+    return {
+        "has_omim_xref": stringify_bool(has_omim),
+        "has_orphanet_xref": stringify_bool(has_orphanet),
+    }
+
+
 def fetch_uniprot_metadata(accessions: Sequence[str], cache_path: Path, *, batch_size: int, sleep_seconds: float) -> pd.DataFrame:
-    existing = pd.DataFrame(columns=["protein_id", "sequence", "organism", "protein_name", "protein_function"])
+    existing = pd.DataFrame(
+        columns=[
+            "protein_id",
+            "sequence",
+            "organism",
+            "protein_name",
+            "protein_function",
+            "has_omim_xref",
+            "has_orphanet_xref",
+        ]
+    )
     if cache_path.exists():
         existing = pd.read_csv(cache_path, sep="\t")
         existing = existing.fillna("")
+    for column in ("has_omim_xref", "has_orphanet_xref"):
+        if column not in existing.columns:
+            existing[column] = "false"
 
     cached_ids = set(existing["protein_id"].astype(str).tolist()) if not existing.empty else set()
     missing_ids = [protein_id for protein_id in accessions if protein_id not in cached_ids]
@@ -408,6 +452,7 @@ def fetch_uniprot_metadata(accessions: Sequence[str], cache_path: Path, *, batch
             if not accession:
                 continue
             seen.add(accession)
+            disease_flags = extract_disease_xref_flags(entry)
             fetched_rows.append(
                 {
                     "protein_id": accession,
@@ -415,6 +460,8 @@ def fetch_uniprot_metadata(accessions: Sequence[str], cache_path: Path, *, batch
                     "organism": str((entry.get("organism") or {}).get("scientificName") or ""),
                     "protein_name": extract_protein_name(entry),
                     "protein_function": extract_function_text(entry),
+                    "has_omim_xref": disease_flags["has_omim_xref"],
+                    "has_orphanet_xref": disease_flags["has_orphanet_xref"],
                 }
             )
 
@@ -427,6 +474,8 @@ def fetch_uniprot_metadata(accessions: Sequence[str], cache_path: Path, *, batch
                     "organism": "",
                     "protein_name": "",
                     "protein_function": "",
+                    "has_omim_xref": "false",
+                    "has_orphanet_xref": "false",
                 }
             )
 
@@ -486,10 +535,35 @@ def attach_metadata(split_df: pd.DataFrame, metadata_df: pd.DataFrame, interpro_
     metadata = metadata_df.copy()
     metadata["protein_id"] = metadata["protein_id"].astype(str)
     merged = split_df.merge(metadata, on="protein_id", how="left")
-    for column in ("sequence", "organism", "protein_name", "protein_function", "go_pred", "interpro_formatted", "ppi_formatted", "interpro_ids", "interpro_location"):
+    for column in (
+        "sequence",
+        "organism",
+        "protein_name",
+        "protein_function",
+        "go_pred",
+        "interpro_formatted",
+        "ppi_formatted",
+        "interpro_ids",
+        "interpro_location",
+        "has_omim_xref",
+        "has_orphanet_xref",
+        "is_disease_priority",
+    ):
         if column not in merged.columns:
             merged[column] = ""
     merged = merged.fillna("")
+    resolved_priority: List[str] = []
+    for _, row in merged.iterrows():
+        explicit_priority = normalize_optional_bool(row.get("is_disease_priority"))
+        if explicit_priority is not None:
+            resolved_priority.append(stringify_bool(explicit_priority))
+            continue
+        has_omim = normalize_optional_bool(row.get("has_omim_xref")) is True
+        has_orphanet = normalize_optional_bool(row.get("has_orphanet_xref")) is True
+        resolved_priority.append(stringify_bool(has_omim or has_orphanet))
+    merged["is_disease_priority"] = resolved_priority
+    merged["has_omim_xref"] = [stringify_bool(normalize_optional_bool(value) is True) for value in merged["has_omim_xref"]]
+    merged["has_orphanet_xref"] = [stringify_bool(normalize_optional_bool(value) is True) for value in merged["has_orphanet_xref"]]
     return hydrate_context_columns(merged, interpro_metadata)
 
 
