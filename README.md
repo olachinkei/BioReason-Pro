@@ -152,47 +152,64 @@ After each DeepSpeed optimizer step, rank 0 exports a full inference checkpoint 
 
 ## Current Status & Known Issues
 
-The latest RL training run (20 steps, 2-node H100, DR-GRPO) completed successfully:
+The active Phase A check is a paper-exact A1 run on CoreWeave H100s. It uses the
+paper-scale rollout shape (`MAX_NEW_TOKENS=10000`, `ROLLOUTS_PER_QUERY=24`,
+`QUERIES_PER_STEP=8`) on 2 nodes x 8 GPUs with `reward_mode=per_aspect_ia_f1`.
 
-**W&B Run**: [rl-paper-native-tight-2node-srun-20260421-044513](https://wandb.ai/wandb-healthcare/bioreason-pro/runs/aldhlmrz)
+**W&B Run**: [rl-phase-a-A1-paper-2node-20260427T061638Z](https://wandb.ai/wandb-healthcare/bioreason-pro-custom/runs/s4snxgvy)
 
-### Training Metrics (20 Steps)
+**Slurm Job**: `3451` (`bioreason-a1-paper-2node`)
 
-| Step | Reward | Loss | Step | Reward | Loss |
-|------|--------|------|------|--------|------|
-| 1 | 0.1625 | -0.000010 | 11 | 0.1332 | -0.000019 |
-| 2 | 0.1338 | -0.000035 | 12 | 0.1256 | +0.000002 |
-| 3 | 0.1039 | -0.000020 | 13 | 0.1339 | +0.000017 |
-| 4 | 0.2232 | -0.000013 | 14 | 0.1781 | +0.000016 |
-| 5 | 0.2407 | -0.000014 | 15 | 0.0993 | +0.000026 |
-| 6 | 0.1772 | -0.000045 | 16 | 0.0860 | +0.000023 |
-| 7 | 0.1581 | -0.000028 | 17 | 0.1648 | +0.000013 |
-| 8 | 0.0714 | -0.000017 | 18 | 0.0833 | +0.000035 |
-| 9 | 0.1000 | -0.000017 | 19 | 0.1212 | +0.000019 |
-| 10 | 0.1260 | -0.000004 | 20 | 0.1235 | +0.000029 |
+**Status as of 2026-04-27 18:07 JST / 09:07 UTC**: running; step 5 training
+metrics are complete, and step 5 validation is still in progress.
 
-### Issues Identified via Weave Trace Analysis
+### A1 Paper-Exact Train Metrics
 
-1. **`<final_answer>` tag not generated**: The model fails to produce the expected `<final_answer>` tag in its completions. Since the reward function (`reward_prediction_source: final_answer_block`) extracts GO terms exclusively from this tag, missing tags result in reward = 0 regardless of reasoning quality. In some steps (15, 20), all 12 rollouts scored 0.
+| Step | Reward | Nonzero Rate | `<final_answer>` Rate | Format Valid | Valid Rollouts | Ratio Mean |
+|------|--------|--------------|-----------------------|--------------|----------------|------------|
+| 1 | 0.1859 | 61.46% | 96.35% | 76.04% | 192 | 0.5705 |
+| 2 | 0.1454 | 52.60% | 94.79% | 67.71% | 192 | 0.4666 |
+| 3 | 0.1410 | 53.12% | 96.35% | 77.60% | 192 | 0.3566 |
+| 4 | 0.2268 | 63.54% | 95.31% | 69.27% | 192 | 0.5276 |
+| 5 | 0.2514 | 58.33% | 96.35% | 75.00% | 192 | 0.4315 |
 
-2. **Tag format mismatch**: When the model does attempt a final answer block, it sometimes uses incorrect formats (e.g., `<|FINAL_ANSWER|>` instead of `<final_answer>`), which the reward parser does not recognize.
+### Current Interpretation
 
-3. **Repetition collapse**: In step 15 (protein Q9UKF6), the model generated 25,688 characters of repetitive, degraded text (e.g., `nuc leus`, `end onuclease`) indicating a decoding failure.
+The paper-exact A1 run is not reproducing the earlier all-zero A1 failure. Train
+rollouts are valid, reward is nonzero, `<final_answer>` generation is stable at
+roughly 95%, and there are no observed rollout failures, degraded responses, or
+noop fallbacks through step 5. This points away from `reward_mode=per_aspect_ia_f1`
+as the direct cause of the earlier broken run.
 
-4. **Loss sign flip**: Policy loss transitions from negative (steps 1-11, indicating reward-aligned updates) to positive (steps 12-20), suggesting the policy gradient signal has become ineffective or adversarial.
+The earlier A1 run (`z66vrc7a`) used lightweight/debug settings and showed
+immediate collapse: reward = 0, final-answer tag rate = 0, format-valid rate = 0,
+and unstable ratio metrics. The current evidence suggests that failure was more
+likely caused by the non-paper rollout configuration and runtime instability than
+by the A1 reward definition itself.
 
-5. **No reward improvement**: Mean reward fluctuates between 0.07-0.24 across all 20 steps with no upward trend. The learning signal is dominated by noise from tag-parsing failures rather than genuine function prediction quality.
+### Current Known Issue: Validation Bottleneck
 
-### Root Cause
+Validation starts at step 5, but it currently runs as a rank-0 serial section over
+200 validation proteins with `MAX_NEW_TOKENS=10000`. That makes validation much
+slower than the distributed training steps and leaves the other ranks waiting. At
+the last check, validation had started and the log was still advancing, but no
+`validation_done` marker or validation metrics had been written yet.
 
-The `paper_native_tight` prompt template likely does not match what the model has learned to output during SFT. The model generates reasoning text but wraps its final answer in a format the reward parser cannot extract from. This means the RL loop receives near-random reward signals and cannot learn effectively.
+Before using this validation cadence for routine experiments, the validation path
+should be changed to use a smaller validation generation budget, fewer samples, or
+parallelized validation. Otherwise, successful training steps can appear stuck for
+hours at validation boundaries.
 
-### Next Steps
+### Operational Notes
 
-- Investigate the `paper_native_tight` prompt template to verify the expected output tag format
-- Check what tag format the SFT checkpoint was trained to produce
-- Align the reward parser's `final_answer_block` extraction with the model's actual output format
-- Consider adding a format reward component that incentivizes correct tag usage
+- Runtime files, model output, and caches should stay under `/mnt/data`; `/mnt/home`
+  quota pressure previously caused repeated exit-code-122 crashes.
+- The 2-node paper-exact shape is the current working configuration. The earlier
+  1-node 8-GPU attempt used a larger local repeat count and timed out before
+  producing a stable comparison.
+- Tracking metadata now records Phase A fields such as `reward_mode`,
+  `disease_loss_weight`, `lin_partial_credit_cap`, and `ablation_tag` so W&B and
+  checkpoint metadata can be compared across A0/A1/A2/A3 runs.
 
 <br>
 

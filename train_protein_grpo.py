@@ -2006,12 +2006,16 @@ def build_tracking_config(
     )
     tracking_args.loss_type = "dr_grpo"
     tracking_args.num_generations = algorithm.rollouts_per_query
+    tracking_args.reward_mode = normalize_text(getattr(args, "reward_mode", "ia_f1")).strip() or "ia_f1"
     tracking_args.reward_funcs = "final_answer_tag,go_summary_block,task_reward,format_valid"
     tracking_args.reward_weights = normalize_text(getattr(args, "reward_weights", "")).strip() or "0.0,0.0,1.0,0.0"
     tracking_args.disease_weighting_mode = normalize_text(getattr(args, "disease_weighting_mode", "")).strip() or "uniform_fallback"
     tracking_args.reward_scaling = "batch"
     tracking_args.reward_final_answer_only = True
     tracking_args.reward_prediction_source = "final_answer_block"
+    tracking_args.disease_loss_weight = float(getattr(args, "disease_loss_weight", 1.0))
+    tracking_args.lin_partial_credit_cap = float(getattr(args, "lin_partial_credit_cap", 0.3))
+    tracking_args.ablation_tag = normalize_text(getattr(args, "ablation_tag", "")).strip()
     tracking_args.require_ia_file = False
     tracking_args.advantage_epsilon_std = algorithm.reward_std_epsilon
     tracking_args.importance_sampling_level = "sequence"
