@@ -922,6 +922,45 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertIn('--validation_every_n_steps "$VALIDATION_EVERY_N_STEPS"', source)
         self.assertIn('--save_every_n_steps "$SAVE_EVERY_N_STEPS"', source)
 
+    def test_phase_a_a1_paper_8gpu_script_forces_paper_values(self):
+        script_path = ROOT / "runtime_logs" / "run_rl_phase_a_a1_paper_8gpu_srun.sh"
+        source = script_path.read_text(encoding="utf-8")
+
+        self.assertIn("export ABLATION=A1", source)
+        self.assertIn("export NNODES=1", source)
+        self.assertIn("export GPUS_PER_NODE=8", source)
+        self.assertIn("export QUERIES_PER_STEP=8", source)
+        self.assertIn("export ROLLOUTS_PER_QUERY=24", source)
+        self.assertIn("export OPTIMIZER_MICRO_BATCH_SIZE_PER_GPU=12", source)
+        self.assertIn("export GRADIENT_ACCUMULATION_STEPS=2", source)
+        self.assertIn("export MAX_NEW_TOKENS=10000", source)
+        self.assertIn("export ROLLOUT_MAX_NEW_TOKENS=10000", source)
+        self.assertIn("export STEPS_PER_GENERATION=2", source)
+        self.assertIn("export NUM_ITERATIONS=1", source)
+        self.assertIn("--reward_mode per_aspect_ia_f1", source)
+        self.assertIn("--target_num_nodes \"$NNODES\"", source)
+        self.assertIn("--target_gpus_per_node \"$GPUS_PER_NODE\"", source)
+        self.assertIn("--rollout_max_new_tokens \"$ROLLOUT_MAX_NEW_TOKENS\"", source)
+        self.assertIn("paper-8gpu-exact", source)
+
+    def test_phase_a_a1_paper_2node_script_forces_paper_values(self):
+        script_path = ROOT / "runtime_logs" / "run_rl_phase_a_a1_paper_2node_srun.sh"
+        source = script_path.read_text(encoding="utf-8")
+
+        self.assertIn("export ABLATION=A1", source)
+        self.assertIn("export NNODES=2", source)
+        self.assertIn("export GPUS_PER_NODE=8", source)
+        self.assertIn("export QUERIES_PER_STEP=8", source)
+        self.assertIn("export ROLLOUTS_PER_QUERY=24", source)
+        self.assertIn("export OPTIMIZER_MICRO_BATCH_SIZE_PER_GPU=6", source)
+        self.assertIn("export GRADIENT_ACCUMULATION_STEPS=2", source)
+        self.assertIn("export MAX_NEW_TOKENS=10000", source)
+        self.assertIn("export ROLLOUT_MAX_NEW_TOKENS=10000", source)
+        self.assertIn("srun --nodes=\"$NNODES\"", source)
+        self.assertIn("bash scripts/sh_train_protein_grpo.sh", source)
+        self.assertIn("--reward_mode per_aspect_ia_f1", source)
+        self.assertIn("paper-2node-exact", source)
+
     def test_parse_args_accepts_checkpoint_export_only_flag(self):
         args = GRPO.parse_args(
             [
@@ -1157,6 +1196,34 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertEqual(config["local_rollouts_per_rank"], 12)
         self.assertEqual(config["wandb_project"], "bioreasoning-pro")
         self.assertEqual(config["reward_prediction_source"], "final_answer_block")
+        self.assertEqual(config["reward_mode"], "ia_f1")
+        self.assertEqual(config["reward_funcs"], "ia_f1")
+        self.assertEqual(config["disease_loss_weight"], 1.0)
+        self.assertEqual(config["lin_partial_credit_cap"], 0.3)
+
+    def test_build_tracking_config_surfaces_phase_a_fields(self):
+        args = GRPO.parse_args(
+            [
+                "--text_model_name",
+                "/tmp/demo-model",
+                "--reward_mode",
+                "per_aspect_ia_f1",
+                "--disease_loss_weight",
+                "1.0",
+                "--ablation_tag",
+                "phase-a-A1",
+            ]
+        )
+        algorithm = GRPO.build_algorithm_spec(args)
+        runtime_spec = GRPO.build_runtime_spec(args)
+        runtime = GRPO.DistributedRuntime(enabled=False, rank=0, world_size=1, local_rank=0, device="cpu")
+
+        config = GRPO.build_tracking_config(args, algorithm, runtime_spec, runtime, run_name="demo-a1")
+
+        self.assertEqual(config["reward_mode"], "per_aspect_ia_f1")
+        self.assertEqual(config["reward_funcs"], "per_aspect_ia_f1")
+        self.assertEqual(config["disease_loss_weight"], 1.0)
+        self.assertEqual(config["ablation_tag"], "phase-a-A1")
 
     def test_load_reasoning_datasets_uses_configured_reasoning_prompt_style(self):
         args = GRPO.parse_args(["--text_model_name", "/tmp/demo-model", "--reasoning_prompt_style", "paper_compact"])
