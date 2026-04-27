@@ -966,10 +966,14 @@ def initialize_runtime(args: argparse.Namespace) -> DistributedRuntime:
     )
     #endregion
 
+    from datetime import timedelta
+    _nccl_timeout_sec = env_int("NCCL_TIMEOUT", 1800)
+    _dist_timeout = timedelta(seconds=_nccl_timeout_sec)
+
     if enabled:
         import deepspeed
 
-        deepspeed.init_distributed(dist_backend="nccl")
+        deepspeed.init_distributed(dist_backend="nccl", timeout=_dist_timeout)
         torch.cuda.set_device(local_rank)
         device = torch.device("cuda", local_rank)
     else:
@@ -983,7 +987,7 @@ def initialize_runtime(args: argparse.Namespace) -> DistributedRuntime:
         os.environ.setdefault("LOCAL_RANK", "0")
         os.environ.setdefault("WORLD_SIZE", "1")
         if not is_distributed_initialized():
-            deepspeed.init_distributed(dist_backend="nccl")
+            deepspeed.init_distributed(dist_backend="nccl", timeout=_dist_timeout)
         torch.cuda.set_device(0)
         device = torch.device("cuda", 0)
 
@@ -4042,6 +4046,7 @@ def evaluate_validation_subset(
     )
     rewards: List[float] = []
     per_aspect_validation_rewards: Dict[str, List[float]] = {key: [] for key in GO_ASPECT_SHORT_KEYS.values()}
+    val_lin_partial_credits: List[float] = []
     validation_priority_flags: List[float] = []
     validation_priority_known_flags: List[float] = []
     for idx in range(limit):
@@ -4082,6 +4087,21 @@ def evaluate_validation_subset(
             for aspect_key, score in component_scores.items():
                 if score is not None:
                     per_aspect_validation_rewards[aspect_key].append(float(score))
+            if reward_mode == "per_aspect_lin":
+                base_f1 = compute_per_aspect_weighted_f1(
+                    list(propagated_pred), list(propagated_target), ia_weights, go_aspects or {}
+                )
+                if base_f1 == 0.0:
+                    if go_graph is not None:
+                        bonus = compute_pairwise_lin_partial_credit(
+                            list(predicted_go_ids), list(target_go_ids),
+                            go_graph=go_graph, go_aspects=go_aspects or {},
+                        )
+                    else:
+                        bonus = compute_ancestor_jaccard(list(propagated_pred), list(propagated_target))
+                    val_lin_partial_credits.append(min(float(lin_partial_credit_cap), bonus))
+                else:
+                    val_lin_partial_credits.append(0.0)
     return {
         "validation_reward_mean": mean_or_zero(rewards),
         "validation_reward_nonzero_rate": mean_or_zero([1.0 if reward > 0.0 else 0.0 for reward in rewards]),
@@ -4089,6 +4109,8 @@ def evaluate_validation_subset(
         "validation_reward_bp": mean_or_zero(per_aspect_validation_rewards["bp"]),
         "validation_reward_mf": mean_or_zero(per_aspect_validation_rewards["mf"]),
         "validation_reward_cc": mean_or_zero(per_aspect_validation_rewards["cc"]),
+        "validation_lin_partial_credit_mean": mean_or_zero(val_lin_partial_credits),
+        "validation_lin_partial_credit_rate": mean_or_zero([1.0 if v > 0.0 else 0.0 for v in val_lin_partial_credits]),
         "validation_disease_priority_known_rate": mean_or_zero(validation_priority_known_flags),
         "validation_disease_priority_true_rate": mean_or_zero(validation_priority_flags),
     }
@@ -4528,6 +4550,7 @@ def train(args: argparse.Namespace) -> None:
                 for completion in group.completions
             ]
             per_aspect_train_rewards: Dict[str, List[float]] = {key: [] for key in GO_ASPECT_SHORT_KEYS.values()}
+            lin_partial_credits: List[float] = []
             if go_aspects_map:
                 for group in local_groups:
                     target_go_ids = build_target_go_ids(group.query.sample_meta)
@@ -4546,6 +4569,21 @@ def train(args: argparse.Namespace) -> None:
                         for aspect_key, score in component_scores.items():
                             if score is not None:
                                 per_aspect_train_rewards[aspect_key].append(float(score))
+                        if reward_mode == "per_aspect_lin":
+                            base_f1 = compute_per_aspect_weighted_f1(
+                                list(propagated_pred), list(propagated_target), ia_weights, go_aspects_map
+                            )
+                            if base_f1 == 0.0:
+                                if go_graph is not None:
+                                    bonus = compute_pairwise_lin_partial_credit(
+                                        list(predicted_go_ids), list(target_go_ids),
+                                        go_graph=go_graph, go_aspects=go_aspects_map,
+                                    )
+                                else:
+                                    bonus = compute_ancestor_jaccard(list(propagated_pred), list(propagated_target))
+                                lin_partial_credits.append(min(float(lin_partial_credit_cap), bonus))
+                            else:
+                                lin_partial_credits.append(0.0)
             metrics = {
                 "reward_mean": mean_or_zero(local_rewards),
                 "reward_nonzero_rate": mean_or_zero([1.0 if reward > 0.0 else 0.0 for reward in local_rewards]),
@@ -4553,6 +4591,8 @@ def train(args: argparse.Namespace) -> None:
                 "reward_bp": mean_or_zero(per_aspect_train_rewards["bp"]),
                 "reward_mf": mean_or_zero(per_aspect_train_rewards["mf"]),
                 "reward_cc": mean_or_zero(per_aspect_train_rewards["cc"]),
+                "lin_partial_credit_mean": mean_or_zero(lin_partial_credits),
+                "lin_partial_credit_rate": mean_or_zero([1.0 if v > 0.0 else 0.0 for v in lin_partial_credits]),
                 "disease_priority_known_rate": mean_or_zero(local_priority_known_flags),
                 "disease_priority_true_rate": mean_or_zero(local_priority_true_flags),
                 "disease_weighting_selective_mode": 1.0 if disease_weighting_mode == "selective" else 0.0,
@@ -4605,6 +4645,8 @@ def train(args: argparse.Namespace) -> None:
                 "reward_bp": all_reduce_sum_scalar(metrics["reward_bp"], runtime) / float(runtime.world_size),
                 "reward_mf": all_reduce_sum_scalar(metrics["reward_mf"], runtime) / float(runtime.world_size),
                 "reward_cc": all_reduce_sum_scalar(metrics["reward_cc"], runtime) / float(runtime.world_size),
+                "lin_partial_credit_mean": all_reduce_sum_scalar(metrics["lin_partial_credit_mean"], runtime) / float(runtime.world_size),
+                "lin_partial_credit_rate": all_reduce_sum_scalar(metrics["lin_partial_credit_rate"], runtime) / float(runtime.world_size),
                 "disease_priority_known_rate": all_reduce_sum_scalar(metrics["disease_priority_known_rate"], runtime)
                 / float(runtime.world_size),
                 "disease_priority_true_rate": all_reduce_sum_scalar(metrics["disease_priority_true_rate"], runtime)
