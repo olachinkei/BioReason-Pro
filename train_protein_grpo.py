@@ -2815,7 +2815,9 @@ class RunTracker:
             yield None
             return
         weave_attributes = getattr(weave, "attributes", None)
-        attribute_context = weave_attributes(dict(attributes)) if callable(weave_attributes) and attributes else nullcontext()
+        attribute_context = (
+            weave_attributes(dict(attributes)) if callable(weave_attributes) and attributes else nullcontext()
+        )
         try:
             call = create_call(
                 op=op_name,
@@ -2827,20 +2829,6 @@ class RunTracker:
             print(f"⚠️  Weave span create_call({op_name}) failed: {exc}", flush=True)
             yield None
             return
-        _push_call = None
-        _pop_call = None
-        try:
-            from weave.trace.context import call_context
-            _push_call = getattr(call_context, "push_call", None)
-            _pop_call = getattr(call_context, "pop_call", None)
-        except Exception:
-            pass
-        if callable(_push_call):
-            try:
-                _push_call(call)
-            except Exception as push_exc:
-                print(f"⚠️  Weave push_call({op_name}) failed: {push_exc}", flush=True)
-                _pop_call = None
         try:
             with attribute_context:
                 yield call
@@ -2860,12 +2848,6 @@ class RunTracker:
                 except Exception as finish_exc:
                     print(f"⚠️  Weave span finish_call({op_name}) on error failed: {finish_exc}", flush=True)
             raise
-        finally:
-            if callable(_pop_call):
-                try:
-                    _pop_call(call)
-                except Exception as pop_exc:
-                    print(f"⚠️  Weave pop_call({op_name}) failed: {pop_exc}", flush=True)
 
     @contextmanager
     def weave_step_span(self, *, step: int, queries_per_step: int, rollouts_per_query: int):
