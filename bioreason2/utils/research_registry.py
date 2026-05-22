@@ -444,7 +444,7 @@ def materialize_first_available_source(
     for source in sources:
         try:
             resolved = materialize_source(source, required=not allow_missing)
-        except RegistryError as exc:
+        except Exception as exc:
             errors.append(str(exc))
             continue
         if resolved:

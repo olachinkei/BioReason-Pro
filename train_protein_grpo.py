@@ -26,6 +26,7 @@ import os
 import random
 import re
 import shutil
+import sys
 import time
 import traceback
 from contextlib import contextmanager, nullcontext
@@ -399,6 +400,9 @@ class EvalSpec:
     validation_num_proteins: int = 200
     validation_every_n_steps: int = 50
     save_every_n_steps: int = 50
+    validation_rank0_timeout_s: float = 14_400.0
+    checkpoint_rank0_timeout_s: float = 7_200.0
+    rank0_section_poll_interval_s: float = 5.0
 
 
 @dataclass
@@ -526,6 +530,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min_p", type=float, default=0.0)
     parser.add_argument("--repetition_penalty", type=float, default=1.0)
     parser.add_argument("--max_new_tokens", type=int, default=10_000)
+    parser.add_argument(
+        "--rollout_max_new_tokens",
+        type=int,
+        default=int(os.environ.get("ROLLOUT_MAX_NEW_TOKENS", "0") or 0),
+    )
     parser.add_argument("--max_loss_completion_tokens", type=int, default=0)
     parser.add_argument("--rollout_logprob_microbatch_size", type=int, default=4)
     parser.add_argument("--clip_epsilon_low", type=float, default=7e-4)
@@ -567,10 +576,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--validation_num_proteins", type=int, default=200)
     parser.add_argument("--validation_every_n_steps", type=int, default=50)
     parser.add_argument("--save_every_n_steps", type=int, default=50)
+    parser.add_argument(
+        "--validation_rank0_timeout_s",
+        type=float,
+        default=float(os.environ.get("VALIDATION_RANK0_TIMEOUT_S", "14400")),
+        help="Seconds nonzero ranks wait for rank0 validation before failing.",
+    )
+    parser.add_argument(
+        "--checkpoint_rank0_timeout_s",
+        type=float,
+        default=float(os.environ.get("CHECKPOINT_RANK0_TIMEOUT_S", "7200")),
+        help="Seconds nonzero ranks wait for rank0 checkpoint export/artifact work before failing.",
+    )
+    parser.add_argument(
+        "--rank0_section_poll_interval_s",
+        type=float,
+        default=float(os.environ.get("RANK0_SECTION_POLL_INTERVAL_S", "5")),
+        help="Polling interval for file-based rank0 section markers.",
+    )
 
     parser.add_argument("--output_dir", type=str, default="data/artifacts/models/train_rl_output")
     parser.add_argument("--checkpoint_artifact_name", type=str, default="train-rl-output")
     parser.add_argument("--checkpoint_artifact_aliases", type=str, default="latest")
+    parser.add_argument("--checkpoint_export_only", type=str, default=os.environ.get("CHECKPOINT_EXPORT_ONLY", "false"))
+    parser.add_argument("--execution_id", type=str, default=os.environ.get("EXECUTION_ID", ""))
+    parser.add_argument("--sync_root", type=str, default=os.environ.get("SYNC_ROOT", ""))
+    parser.add_argument("--resume_from_export_artifact", type=str, default=os.environ.get("RESUME_FROM_EXPORT_ARTIFACT", ""))
+    parser.add_argument("--resume_mode", type=str, default=os.environ.get("RESUME_MODE", "warm"), choices=["warm", "cold"])
 
     parser.add_argument("--wandb_project", type=str, default=os.environ.get("WANDB_PROJECT", "bioreasoning-pro"))
     parser.add_argument("--wandb_entity", type=str, default=None)
@@ -619,9 +651,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rollout_backend", type=str, default="subprocess", choices=["subprocess", "inprocess"])
     parser.add_argument("--rollout_worker_start_method", type=str, default="spawn", choices=["spawn", "forkserver", "fork"])
     parser.add_argument(
+        "--rollout_worker_startup_retry_count",
+        type=int,
+        default=int(os.environ.get("ROLLOUT_WORKER_STARTUP_RETRY_COUNT", "0")),
+    )
+    parser.add_argument(
+        "--rollout_worker_startup_retry_sleep_s",
+        type=float,
+        default=float(os.environ.get("ROLLOUT_WORKER_STARTUP_RETRY_SLEEP_S", "0")),
+    )
+    parser.add_argument(
         "--rollout_generate_timeout_seconds",
+        "--rollout_worker_generate_timeout_s",
+        dest="rollout_generate_timeout_seconds",
         type=float,
         default=float(os.environ.get("ROLLOUT_GENERATE_TIMEOUT_SECONDS", "1200")),
+    )
+    parser.add_argument(
+        "--rollout_worker_vllm_port_base",
+        type=int,
+        default=int(os.environ.get("ROLLOUT_WORKER_VLLM_PORT_BASE", "39000")),
+    )
+    parser.add_argument(
+        "--rollout_worker_vllm_port_stride",
+        type=int,
+        default=int(os.environ.get("ROLLOUT_WORKER_VLLM_PORT_STRIDE", "32")),
+    )
+    parser.add_argument(
+        "--rollout_worker_vllm_host_ip",
+        type=str,
+        default=os.environ.get("ROLLOUT_WORKER_VLLM_HOST_IP", "127.0.0.1"),
     )
 
     # DeepSpeed injects this flag into worker processes; accept it even though the
@@ -644,6 +703,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "vllm_use_v1",
         "debug_single_process",
         "preflight_only",
+        "checkpoint_export_only",
     ):
         setattr(args, name, parse_bool(getattr(args, name)))
     return args
@@ -676,13 +736,14 @@ def build_runtime_spec(args: argparse.Namespace) -> RuntimeSpec:
 
 
 def build_sampling_spec(args: argparse.Namespace) -> SamplingSpec:
+    rollout_max_new_tokens = int(getattr(args, "rollout_max_new_tokens", 0) or 0)
     return SamplingSpec(
         temperature=float(args.temperature),
         top_k=int(args.top_k),
         top_p=float(args.top_p),
         min_p=float(args.min_p),
         repetition_penalty=float(args.repetition_penalty),
-        max_new_tokens=int(args.max_new_tokens),
+        max_new_tokens=rollout_max_new_tokens if rollout_max_new_tokens > 0 else int(args.max_new_tokens),
     )
 
 
@@ -691,6 +752,9 @@ def build_eval_spec(args: argparse.Namespace) -> EvalSpec:
         validation_num_proteins=int(args.validation_num_proteins),
         validation_every_n_steps=int(args.validation_every_n_steps),
         save_every_n_steps=int(args.save_every_n_steps),
+        validation_rank0_timeout_s=float(args.validation_rank0_timeout_s),
+        checkpoint_rank0_timeout_s=float(args.checkpoint_rank0_timeout_s),
+        rank0_section_poll_interval_s=float(args.rank0_section_poll_interval_s),
     )
 
 
@@ -1208,6 +1272,130 @@ def all_reduce_max_scalar(value: float, runtime: DistributedRuntime, process_gro
 def barrier(runtime: DistributedRuntime) -> None:
     if runtime.enabled and is_distributed_initialized():
         torch.distributed.barrier()
+
+
+def resolve_execution_id(args: argparse.Namespace) -> str:
+    explicit = normalize_text(getattr(args, "execution_id", "")).strip()
+    if explicit:
+        return explicit
+    for env_key in ("EXECUTION_ID", "SLURM_JOB_ID", "BIOREASON_EXECUTION_ID"):
+        value = normalize_text(os.environ.get(env_key)).strip()
+        if value:
+            return value
+    return f"local-{os.getpid()}-{int(time.time())}"
+
+
+def resolve_sync_root(args: argparse.Namespace, output_dir: Path, execution_id: str) -> Path:
+    explicit = normalize_text(getattr(args, "sync_root", "")).strip()
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    safe_execution_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", normalize_text(execution_id).strip() or "local")
+    return output_dir.resolve() / "_run_sync" / safe_execution_id
+
+
+def resolve_rollout_worker_vllm_port(args: argparse.Namespace, rank: int) -> int:
+    base = int(getattr(args, "rollout_worker_vllm_port_base", 39000))
+    stride = int(getattr(args, "rollout_worker_vllm_port_stride", 32))
+    return base + int(rank) * stride
+
+
+def build_rank0_section_marker_paths(output_dir: Path, section_name: str, step: int) -> Tuple[Path, Path]:
+    safe_section = re.sub(r"[^A-Za-z0-9_.-]+", "_", normalize_text(section_name).strip() or "rank0_section")
+    marker_dir = Path(output_dir).resolve() / "_rank0_sections" / safe_section
+    stem = f"step-{int(step):06d}"
+    return marker_dir / f"{stem}.done.json", marker_dir / f"{stem}.error.json"
+
+
+def build_scalar_collective_paths(
+    *,
+    output_dir: Path,
+    sync_root: Optional[Path],
+    reduction_name: str,
+    step: int,
+    group_name: str,
+    rank: int,
+) -> Tuple[Path, Path, Path]:
+    root = Path(sync_root if sync_root is not None else output_dir).expanduser().resolve()
+    safe_reduction = re.sub(r"[^A-Za-z0-9_.-]+", "_", normalize_text(reduction_name).strip() or "scalar")
+    safe_group = re.sub(r"[^A-Za-z0-9_.-]+", "_", normalize_text(group_name).strip() or "world")
+    step_dir = root / "_scalar_collectives" / safe_reduction / safe_group / f"step-{int(step):06d}"
+    payload_path = step_dir / f"rank-{int(rank):05d}.json"
+    return payload_path, step_dir / "done.json", step_dir / "error.json"
+
+
+def write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + f".tmp-{os.getpid()}-{int(time.time() * 1000)}")
+    tmp_path.write_text(json.dumps(dict(payload), sort_keys=True), encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def run_rank0_serial_section(
+    *,
+    runtime: DistributedRuntime,
+    output_dir: Path,
+    section_name: str,
+    step: int,
+    action: Any,
+    timeout_s: float = 14_400.0,
+    poll_interval_s: float = 5.0,
+) -> Any:
+    if (not runtime.enabled) or runtime.world_size <= 1:
+        return action()
+
+    done_path, error_path = build_rank0_section_marker_paths(Path(output_dir), section_name, int(step))
+    if runtime.rank == 0:
+        done_path.parent.mkdir(parents=True, exist_ok=True)
+        for marker_path in (done_path, error_path):
+            try:
+                marker_path.unlink()
+            except FileNotFoundError:
+                pass
+        try:
+            result = action()
+        except BaseException as exc:
+            write_json_atomic(
+                error_path,
+                {
+                    "status": "error",
+                    "step": int(step),
+                    "section": section_name,
+                    "error_type": type(exc).__name__,
+                    "message": normalize_text(exc),
+                },
+            )
+            raise
+        write_json_atomic(done_path, {"status": "ok", "step": int(step), "section": section_name})
+        return result
+
+    started_at = time.monotonic()
+    resolved_timeout_s = max(float(timeout_s), 0.0)
+    resolved_poll_interval_s = max(float(poll_interval_s), 0.05)
+    while True:
+        if error_path.exists():
+            try:
+                payload = json.loads(error_path.read_text(encoding="utf-8"))
+            except Exception:
+                payload = {}
+            message = normalize_text(payload.get("message")).strip() or f"rank0 {section_name} failed"
+            error_type = normalize_text(payload.get("error_type")).strip() or "RuntimeError"
+            raise RuntimeError(f"{error_type}: {message}")
+        if done_path.exists():
+            return None
+        elapsed_s = time.monotonic() - started_at
+        if resolved_timeout_s > 0.0 and elapsed_s >= resolved_timeout_s:
+            raise TimeoutError(
+                f"Timed out waiting for rank 0 to finish {section_name} for step {int(step)} "
+                f"after {resolved_timeout_s:.1f}s."
+            )
+        time.sleep(resolved_poll_interval_s)
+
+
+def resolve_validation_wait_timeout_s(eval_spec: EvalSpec, *, checkpoint_will_run: bool) -> float:
+    validation_timeout = max(float(eval_spec.validation_rank0_timeout_s), 0.0)
+    if checkpoint_will_run:
+        return validation_timeout + max(float(eval_spec.checkpoint_rank0_timeout_s), 0.0)
+    return validation_timeout
 
 
 def broadcast_indices(indices: List[int], runtime: DistributedRuntime) -> List[int]:
@@ -1919,7 +2107,76 @@ def parse_reward_component_weights(raw: Any) -> Tuple[float, float, float, float
     return (float(parts[0]), float(parts[1]), float(parts[2]), float(parts[3]))
 
 
-def compute_global_reward_std(local_group_rewards: Sequence[Sequence[float]], runtime: DistributedRuntime, epsilon: float) -> float:
+def aggregate_global_reward_std_payloads(payloads: Sequence[Mapping[str, Any]], epsilon: float = 1e-6) -> float:
+    total_sum = sum(float(payload.get("sum", 0.0) or 0.0) for payload in payloads)
+    total_sq_sum = sum(float(payload.get("sq_sum", 0.0) or 0.0) for payload in payloads)
+    total_count = sum(float(payload.get("count", 0.0) or 0.0) for payload in payloads)
+    if total_count <= 0.0:
+        return float(epsilon)
+    mean = total_sum / total_count
+    variance = max((total_sq_sum / total_count) - (mean * mean), 0.0)
+    return math.sqrt(variance) + float(epsilon)
+
+
+def aggregate_query_group_mean_payloads(payloads: Sequence[Mapping[str, Any]]) -> float:
+    total_sum = sum(float(payload.get("sum", 0.0) or 0.0) for payload in payloads)
+    total_count = sum(float(payload.get("count", 0.0) or 0.0) for payload in payloads)
+    if total_count <= 0.0:
+        return 0.0
+    return total_sum / total_count
+
+
+def aggregate_step_metric_payloads(
+    payloads: Sequence[Mapping[str, Any]],
+    *,
+    mean_keys: Sequence[str] = (),
+    sum_keys: Sequence[str] = (),
+    max_keys: Sequence[str] = (),
+    passthrough_keys: Sequence[str] = (),
+) -> Dict[str, float]:
+    result: Dict[str, float] = {}
+    for key in mean_keys:
+        values = [float(payload[key]) for payload in payloads if key in payload and payload[key] is not None]
+        if values:
+            result[str(key)] = sum(values) / float(len(values))
+    for key in sum_keys:
+        result[str(key)] = sum(float(payload.get(key, 0.0) or 0.0) for payload in payloads)
+    for key in max_keys:
+        values = [float(payload[key]) for payload in payloads if key in payload and payload[key] is not None]
+        if values:
+            result[str(key)] = max(values)
+    for key in passthrough_keys:
+        for payload in payloads:
+            if key in payload and payload[key] is not None:
+                result[str(key)] = float(payload[key])
+                break
+    return result
+
+
+def aggregate_policy_update_plan_payloads(payloads: Sequence[Mapping[str, Any]]) -> Dict[str, float]:
+    chunk_counts = [float(payload.get("chunk_count", 0.0) or 0.0) for payload in payloads]
+    if not chunk_counts:
+        return {
+            "chunk_count_min": 0.0,
+            "chunk_count_max": 0.0,
+            "chunk_count_mean": 0.0,
+            "chunk_count_sum": 0.0,
+        }
+    return {
+        "chunk_count_min": min(chunk_counts),
+        "chunk_count_max": max(chunk_counts),
+        "chunk_count_mean": sum(chunk_counts) / float(len(chunk_counts)),
+        "chunk_count_sum": sum(chunk_counts),
+    }
+
+
+def compute_global_reward_std(
+    local_group_rewards: Sequence[Sequence[float]],
+    runtime: DistributedRuntime,
+    epsilon: float,
+    output_dir: Optional[Path] = None,
+    step: Optional[int] = None,
+) -> float:
     flat_rewards = [float(reward) for group in local_group_rewards for reward in group]
     local_sum = sum(flat_rewards)
     local_sq_sum = sum(reward * reward for reward in flat_rewards)
@@ -2007,7 +2264,7 @@ def build_tracking_config(
     tracking_args.loss_type = "dr_grpo"
     tracking_args.num_generations = algorithm.rollouts_per_query
     tracking_args.reward_mode = normalize_text(getattr(args, "reward_mode", "ia_f1")).strip() or "ia_f1"
-    tracking_args.reward_funcs = "final_answer_tag,go_summary_block,task_reward,format_valid"
+    tracking_args.reward_funcs = tracking_args.reward_mode
     tracking_args.reward_weights = normalize_text(getattr(args, "reward_weights", "")).strip() or "0.0,0.0,1.0,0.0"
     tracking_args.disease_weighting_mode = normalize_text(getattr(args, "disease_weighting_mode", "")).strip() or "uniform_fallback"
     tracking_args.reward_scaling = "batch"
@@ -2026,6 +2283,12 @@ def build_tracking_config(
     tracking_args.multimodal_cache_enabled = True
     tracking_args.ref_logprob_cache_enabled = True
     tracking_args.max_steps = args.max_steps
+    tracking_args.validation_rank0_timeout_s = float(args.validation_rank0_timeout_s)
+    tracking_args.checkpoint_rank0_timeout_s = float(args.checkpoint_rank0_timeout_s)
+    tracking_args.rank0_section_poll_interval_s = float(args.rank0_section_poll_interval_s)
+    tracking_args.execution_id = normalize_text(getattr(args, "execution_id", "")).strip()
+    tracking_args.sync_root = normalize_text(getattr(args, "sync_root", "")).strip()
+    tracking_args.checkpoint_export_only = bool(getattr(args, "checkpoint_export_only", False))
     tracking_args.rollout_backend = args.rollout_backend
     tracking_args.rollout_logprob_microbatch_size = int(args.rollout_logprob_microbatch_size)
     tracking_args.max_loss_completion_tokens = int(args.max_loss_completion_tokens)
@@ -2940,7 +3203,7 @@ class RunTracker:
         artifact.add_dir(str(checkpoint_dir))
         self.wandb_run.log_artifact(artifact, aliases=list(aliases))
 
-    def finish(self) -> None:
+    def finish(self, exit_code: int = 0) -> None:
         if self.weave_client is not None:
             flush = getattr(self.weave_client, "flush", None)
             if callable(flush):
@@ -2949,7 +3212,10 @@ class RunTracker:
                 except Exception:
                     pass
         if self.runtime.rank == 0 and self.wandb_run is not None:
-            self.wandb_run.finish()
+            try:
+                self.wandb_run.finish(exit_code=int(exit_code))
+            except TypeError:
+                self.wandb_run.finish()
 
 
 def load_reasoning_datasets(args: argparse.Namespace, runtime: DistributedRuntime) -> Tuple[Any, Any]:
@@ -3102,6 +3368,73 @@ class PolicyStack:
 def resolve_checkpoint_dir(value: Any) -> Path:
     checkpoint_dir = Path(normalize_text(value).strip()).expanduser()
     return checkpoint_dir.resolve()
+
+
+def resolve_checkpoint_source_dir(value: Any, fallback_dir: Optional[Path] = None) -> Path:
+    text = normalize_text(value).strip()
+    if text and is_probably_local_path(text):
+        candidate = Path(text).expanduser()
+        if candidate.exists():
+            return candidate.resolve()
+    if fallback_dir is not None:
+        return Path(fallback_dir).expanduser().resolve()
+    return resolve_checkpoint_dir(text)
+
+
+def load_checkpoint_metadata(checkpoint_root: Path) -> Dict[str, Any]:
+    metadata_path = Path(checkpoint_root) / "training_metadata.json"
+    if not metadata_path.exists():
+        return {}
+    try:
+        loaded = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return dict(loaded) if isinstance(loaded, Mapping) else {}
+
+
+def resolve_warm_resume_state(args: argparse.Namespace) -> Dict[str, Any]:
+    text_model_path = Path(normalize_text(args.text_model_name).strip()).expanduser()
+    local_text_model = text_model_path if text_model_path.exists() else None
+    base_checkpoint = normalize_text(getattr(args, "base_checkpoint", "")).strip()
+
+    if local_text_model is not None and base_checkpoint and not is_probably_local_path(base_checkpoint):
+        reference_source = local_text_model
+    else:
+        reference_source = resolve_checkpoint_source_dir(
+            base_checkpoint or args.text_model_name,
+            fallback_dir=local_text_model,
+        )
+    args.reference_checkpoint_source = str(reference_source)
+    args.initial_rollout_checkpoint_source = str(reference_source)
+    args.resume_parent_execution_id = ""
+    args.resume_start_step = 0
+
+    resume_root_text = normalize_text(getattr(args, "resume_from_export_artifact", "")).strip()
+    if not resume_root_text:
+        return {}
+
+    resume_root = Path(resume_root_text).expanduser().resolve()
+    metadata = load_checkpoint_metadata(resume_root)
+    export_dir = resume_root / "inference_export"
+    if export_dir.exists():
+        resolved_export = str(export_dir.resolve())
+        args.text_model_name = resolved_export
+        args.initial_rollout_checkpoint_source = resolved_export
+        if base_checkpoint and is_probably_local_path(base_checkpoint) and not Path(base_checkpoint).expanduser().exists():
+            args.base_checkpoint = resolved_export
+
+    metadata_reference = normalize_text(metadata.get("reference_checkpoint_source")).strip()
+    if metadata_reference:
+        args.reference_checkpoint_source = metadata_reference
+
+    parent_execution_id = normalize_text(metadata.get("execution_id")).strip()
+    if parent_execution_id:
+        args.resume_parent_execution_id = parent_execution_id
+    try:
+        args.resume_start_step = int(metadata.get("global_step", 0) or 0)
+    except (TypeError, ValueError):
+        args.resume_start_step = 0
+    return metadata
 
 
 def initialize_policy_stack(
@@ -3626,6 +3959,38 @@ def export_inference_checkpoint(model: Any, export_dir: Path) -> None:
     gc.collect()
 
 
+def export_lora_adapter_checkpoint(model: Any, adapter_dir: Path) -> None:
+    adapter_dir = adapter_dir.resolve()
+    if adapter_dir.exists():
+        shutil.rmtree(adapter_dir)
+    adapter_dir.mkdir(parents=True, exist_ok=False)
+
+    base_model = unwrap_model(model)
+    text_model = getattr(base_model, "text_model", None)
+    if text_model is None or not hasattr(text_model, "peft_config") or not hasattr(text_model, "save_pretrained"):
+        raise RuntimeError("Expected a PEFT LoRA text_model when exporting the train checkpoint adapter.")
+
+    save_kwargs = {"safe_serialization": True, "save_embedding_layers": True}
+    try:
+        text_model.save_pretrained(adapter_dir, **save_kwargs)
+    except TypeError:
+        save_kwargs.pop("save_embedding_layers", None)
+        text_model.save_pretrained(adapter_dir, **save_kwargs)
+
+    tokenizer = getattr(base_model, "text_tokenizer", None)
+    if tokenizer is not None and hasattr(tokenizer, "save_pretrained"):
+        tokenizer.save_pretrained(adapter_dir)
+    save_json(
+        adapter_dir / "adapter_metadata.json",
+        {
+            "format": "peft_lora_adapter",
+            "contains_merged_text_model": False,
+            "safe_serialization": bool(save_kwargs.get("safe_serialization", False)),
+            "save_embedding_layers": bool(save_kwargs.get("save_embedding_layers", False)),
+        },
+    )
+
+
 def build_rollout_query_payload(query: PreparedQuery) -> Dict[str, Any]:
     structure_coords = query.structure_coords
     if isinstance(structure_coords, torch.Tensor):
@@ -3812,12 +4177,34 @@ class VLLMRolloutWorker:
         self._connection = None
         self._process = None
         self._generation_counter = 0
+        self._last_generation_timed_out = False
+        self._last_generation_failed = False
+        self._last_generation_failure_reason = ""
         if self.backend != "subprocess":
             self._load(checkpoint_dir)
 
-    def _recv_response(self, expected_status: str = "ok", timeout_seconds: Optional[float] = None) -> Mapping[str, Any]:
+    @property
+    def last_generation_timed_out(self) -> bool:
+        return bool(getattr(self, "_last_generation_timed_out", False))
+
+    @property
+    def last_generation_failed(self) -> bool:
+        return bool(getattr(self, "_last_generation_failed", False))
+
+    @property
+    def last_generation_failure_reason(self) -> str:
+        return normalize_text(getattr(self, "_last_generation_failure_reason", ""))
+
+    def _recv_response(
+        self,
+        expected_status: str = "ok",
+        timeout_seconds: Optional[float] = None,
+        timeout_s: Optional[float] = None,
+    ) -> Mapping[str, Any]:
         if self._connection is None:
             raise RuntimeError("Rollout worker subprocess is not initialized.")
+        if timeout_seconds is None and timeout_s is not None:
+            timeout_seconds = timeout_s
         if timeout_seconds is not None and timeout_seconds > 0:
             if not self._connection.poll(float(timeout_seconds)):
                 raise TimeoutError(
@@ -3898,12 +4285,43 @@ class VLLMRolloutWorker:
             return
         self._load(checkpoint_dir)
 
+    def _ensure_subprocess_started(self) -> Optional[BaseException]:
+        retry_count = max(int(getattr(self.args, "rollout_worker_startup_retry_count", 0) or 0), 0)
+        retry_sleep_s = max(float(getattr(self.args, "rollout_worker_startup_retry_sleep_s", 0.0) or 0.0), 0.0)
+        last_error: Optional[BaseException] = None
+        for attempt_idx in range(retry_count + 1):
+            try:
+                self._start_subprocess(self.checkpoint_dir)
+                return None
+            except BaseException as exc:
+                last_error = exc
+                try:
+                    self._stop_subprocess()
+                except Exception:
+                    pass
+                if attempt_idx < retry_count:
+                    print(
+                        (
+                            f"[rank {self.runtime.rank}] rollout worker startup failed "
+                            f"(attempt {attempt_idx + 1}/{retry_count + 1}): {exc}; retrying."
+                        ),
+                        flush=True,
+                    )
+                    if retry_sleep_s > 0.0:
+                        time.sleep(retry_sleep_s)
+        return last_error
+
     def generate_group(self, query: PreparedQuery, repeat_count: int, sampling: SamplingSpec) -> List[str]:
         generation_seed = int(self.args.seed) + (int(self.runtime.rank) * 100003) + self._generation_counter
         self._generation_counter += 1
         if self.backend == "subprocess":
             if self._connection is None:
-                self._start_subprocess(self.checkpoint_dir)
+                startup_error = self._ensure_subprocess_started()
+                if startup_error is not None:
+                    self._last_generation_timed_out = False
+                    self._last_generation_failed = True
+                    self._last_generation_failure_reason = normalize_text(startup_error).strip()
+                    return ["" for _ in range(int(repeat_count))]
             self._connection.send(
                 {
                     "cmd": "generate",
@@ -3913,12 +4331,22 @@ class VLLMRolloutWorker:
                     "seed": generation_seed,
                 }
             )
-            timeout_seconds = float(getattr(self.args, "rollout_generate_timeout_seconds", 0.0) or 0.0)
+            timeout_seconds = float(
+                getattr(
+                    self.args,
+                    "rollout_generate_timeout_seconds",
+                    getattr(self.args, "rollout_worker_generate_timeout_s", 0.0),
+                )
+                or 0.0
+            )
             try:
                 response = self._recv_response(
                     timeout_seconds=timeout_seconds if timeout_seconds > 0 else None
                 )
             except TimeoutError as exc:
+                self._last_generation_timed_out = True
+                self._last_generation_failed = True
+                self._last_generation_failure_reason = f"generate timed out after {timeout_seconds:.1f}s: {exc}"
                 print(
                     (
                         f"[rank {self.runtime.rank}] rollout generate timeout after "
@@ -3928,6 +4356,9 @@ class VLLMRolloutWorker:
                 )
                 self._stop_subprocess()
                 return ["" for _ in range(int(repeat_count))]
+            self._last_generation_timed_out = False
+            self._last_generation_failed = False
+            self._last_generation_failure_reason = ""
             return [normalize_text(output).strip() for output in response.get("outputs", [])]
         if self.model is None:
             self._load(self.checkpoint_dir)
@@ -4110,12 +4541,15 @@ def save_training_checkpoint(
     runtime: DistributedRuntime,
 ) -> None:
     checkpoint_root = Path(args.output_dir) / "checkpoints" / f"step-{step:06d}"
-    checkpoint_root.mkdir(parents=True, exist_ok=True)
-    policy_stack.engine.save_checkpoint(str(checkpoint_root / "deepspeed"))
-    barrier(runtime)
-    if runtime.rank == 0:
-        export_dir = checkpoint_root / "inference_export"
-        export_inference_checkpoint(policy_stack.engine.module, export_dir)
+    sync_root = Path(normalize_text(getattr(args, "sync_root", "")).strip() or args.output_dir)
+    timeout_s = float(getattr(args, "checkpoint_rank0_timeout_s", 7200.0))
+    poll_interval_s = float(getattr(args, "rank0_section_poll_interval_s", 5.0))
+    checkpoint_export_only = bool(getattr(args, "checkpoint_export_only", False))
+
+    def export_checkpoint_artifact() -> None:
+        checkpoint_root.mkdir(parents=True, exist_ok=True)
+        adapter_dir = checkpoint_root / "lora_adapter"
+        export_lora_adapter_checkpoint(policy_stack.engine.module, adapter_dir)
         metadata = {
             "global_step": step,
             "checkpoint_artifact_name": args.checkpoint_artifact_name,
@@ -4123,11 +4557,45 @@ def save_training_checkpoint(
             "benchmark_version": args.benchmark_version,
             "dataset_artifact": args.dataset_artifact,
             "runtime_stack": args.runtime_stack,
+            "execution_id": normalize_text(getattr(args, "execution_id", "")).strip(),
+            "checkpoint_export_only": checkpoint_export_only,
+            "checkpoint_rank0_timeout_s": timeout_s,
+            "checkpoint_format": "peft_lora_adapter",
+            "lora_adapter_path": "lora_adapter",
         }
+        export_dir = checkpoint_root / "inference_export"
+        export_inference_checkpoint(policy_stack.engine.module, export_dir)
+        metadata["inference_export_path"] = "inference_export"
+        metadata["inference_export_format"] = "merged_text_model_for_vllm_rollout_compat"
         save_json(checkpoint_root / "training_metadata.json", metadata)
         aliases = [item.strip() for item in normalize_text(args.checkpoint_artifact_aliases).split(",") if item.strip()]
         tracker.log_checkpoint_artifact(checkpoint_root, aliases=aliases or ["latest"], metadata=metadata)
+
+    if checkpoint_export_only:
+        rank0_print(runtime, f"Saving export-only checkpoint artifact for step {step}.")
+        run_rank0_serial_section(
+            runtime=runtime,
+            output_dir=sync_root,
+            section_name="checkpoint_artifact",
+            step=step,
+            action=export_checkpoint_artifact,
+            timeout_s=timeout_s,
+            poll_interval_s=poll_interval_s,
+        )
+        return
+
+    checkpoint_root.mkdir(parents=True, exist_ok=True)
+    policy_stack.engine.save_checkpoint(str(checkpoint_root / "deepspeed"))
     barrier(runtime)
+    run_rank0_serial_section(
+        runtime=runtime,
+        output_dir=sync_root,
+        section_name="checkpoint_artifact",
+        step=step,
+        action=export_checkpoint_artifact,
+        timeout_s=timeout_s,
+        poll_interval_s=poll_interval_s,
+    )
 
 
 def refresh_old_policy_and_rollout_worker(
@@ -4150,6 +4618,8 @@ def train(args: argparse.Namespace) -> None:
     args.run_name = run_name
     if not normalize_text(args.base_checkpoint).strip():
         args.base_checkpoint = args.text_model_name
+    if normalize_text(getattr(args, "resume_mode", "warm")).strip() == "warm":
+        resolve_warm_resume_state(args)
     validate_spec_inputs(args)
 
     algorithm = build_algorithm_spec(args)
@@ -4162,6 +4632,9 @@ def train(args: argparse.Namespace) -> None:
 
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    args.execution_id = resolve_execution_id(args)
+    args.sync_root = str(resolve_sync_root(args, output_dir, args.execution_id))
+    Path(args.sync_root).mkdir(parents=True, exist_ok=True)
 
     rank0_print(runtime, "Loading train / validation datasets for spec-first DR-GRPO.")
     train_dataset, validation_dataset = load_reasoning_datasets(args, runtime)
@@ -4189,7 +4662,12 @@ def train(args: argparse.Namespace) -> None:
     )
 
     rank0_print(runtime, "Initializing the vLLM rollout worker from the canonical base checkpoint.")
-    rollout_worker = VLLMRolloutWorker(args, policy_stack.rollout_checkpoint_dir, runtime)
+    try:
+        rollout_worker = VLLMRolloutWorker(args, policy_stack.rollout_checkpoint_dir, runtime)
+    except BaseException:
+        tracker.finish(exit_code=1)
+        shutdown_runtime(runtime)
+        raise
 
     def _iterate_steps_with_weave_span() -> Iterable[int]:
         for _step in range(int(args.max_steps)):
@@ -4211,6 +4689,7 @@ def train(args: argparse.Namespace) -> None:
             ):
                 yield _query
 
+    train_exit_code = 0
     try:
         for step in _iterate_steps_with_weave_span():
             step_started_at = time.perf_counter()
@@ -4681,28 +5160,13 @@ def train(args: argparse.Namespace) -> None:
                 ),
             )
 
-            if eval_spec.validation_every_n_steps > 0 and (step + 1) % eval_spec.validation_every_n_steps == 0:
-                validation_started_at = time.perf_counter()
-                validation_metrics = evaluate_validation_subset(
-                    validation_dataset=validation_dataset,
-                    policy_worker=rollout_worker,
-                    policy_model=policy_stack.engine.module,
-                    ia_weights=ia_weights,
-                    go_graph=go_graph,
-                    eval_spec=eval_spec,
-                    runtime=runtime,
-                    max_new_tokens=int(args.max_new_tokens),
-                    reward_mode=reward_mode,
-                    go_aspects=go_aspects_map,
-                    lin_partial_credit_cap=lin_partial_credit_cap,
-                    reward_component_weights=reward_component_weights,
-                )
-                validation_seconds = time.perf_counter() - validation_started_at
-                if validation_metrics:
-                    validation_metrics["timing_validation_seconds"] = validation_seconds
-                    tracker.log_metrics(validation_metrics, step=step + 1)
+            should_save_checkpoint = eval_spec.save_every_n_steps > 0 and (step + 1) % eval_spec.save_every_n_steps == 0
+            should_validate = (
+                eval_spec.validation_every_n_steps > 0
+                and (step + 1) % eval_spec.validation_every_n_steps == 0
+            )
 
-            if eval_spec.save_every_n_steps > 0 and (step + 1) % eval_spec.save_every_n_steps == 0:
+            if should_save_checkpoint:
                 checkpoint_started_at = time.perf_counter()
                 save_training_checkpoint(
                     policy_stack=policy_stack,
@@ -4719,16 +5183,63 @@ def train(args: argparse.Namespace) -> None:
                     step=step + 1,
                 )
 
+            if should_validate:
+                validation_started_at = time.perf_counter()
+
+                def run_validation() -> Dict[str, float]:
+                    return evaluate_validation_subset(
+                        validation_dataset=validation_dataset,
+                        policy_worker=rollout_worker,
+                        policy_model=policy_stack.engine.module,
+                        ia_weights=ia_weights,
+                        go_graph=go_graph,
+                        eval_spec=eval_spec,
+                        runtime=runtime,
+                        max_new_tokens=int(args.max_new_tokens),
+                        reward_mode=reward_mode,
+                        go_aspects=go_aspects_map,
+                        lin_partial_credit_cap=lin_partial_credit_cap,
+                        reward_component_weights=reward_component_weights,
+                    )
+
+                validation_metrics = run_rank0_serial_section(
+                    runtime=runtime,
+                    output_dir=Path(args.sync_root),
+                    section_name="validation",
+                    step=step + 1,
+                    action=run_validation,
+                    timeout_s=resolve_validation_wait_timeout_s(
+                        eval_spec,
+                        checkpoint_will_run=should_save_checkpoint,
+                    ),
+                    poll_interval_s=eval_spec.rank0_section_poll_interval_s,
+                )
+                validation_seconds = time.perf_counter() - validation_started_at
+                if validation_metrics:
+                    validation_metrics["timing_validation_seconds"] = validation_seconds
+                    tracker.log_metrics(validation_metrics, step=step + 1)
+
             tracker.log_metrics(
                 {
                     "timing_step_seconds": all_reduce_max_scalar(time.perf_counter() - step_started_at, runtime),
                 },
                 step=step + 1,
             )
+    except BaseException:
+        train_exit_code = 1
+        raise
     finally:
-        rollout_worker.close()
-        tracker.finish()
+        active_exception = sys.exc_info()[0] is not None
+        close_error: Optional[BaseException] = None
+        try:
+            rollout_worker.close()
+        except BaseException as exc:
+            train_exit_code = 1
+            close_error = exc
+        tracker.finish(exit_code=train_exit_code)
         shutdown_runtime(runtime)
+        if close_error is not None and not active_exception:
+            raise close_error
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:

@@ -66,7 +66,7 @@ export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 export WANDB_ENTITY="${WANDB_ENTITY:-wandb-healthcare}"
-export WANDB_PROJECT="${WANDB_PROJECT:-bioreason-pro-custom}"
+export WANDB_PROJECT="${WANDB_PROJECT:-bioreason-pro}"
 export BASE_WANDB_PROJECT="${BASE_WANDB_PROJECT:-$WANDB_PROJECT}"
 export WEAVE_PROJECT="${WEAVE_PROJECT:-${WANDB_ENTITY}/${WANDB_PROJECT}}"
 export DATA_BUNDLE="${DATA_BUNDLE:-main_production}"
@@ -110,7 +110,10 @@ export VLLM_DO_NOT_TRACK=1
 export MAX_STEPS=20
 export VALIDATION_NUM_PROTEINS=200
 export VALIDATION_EVERY_N_STEPS=5
-export SAVE_EVERY_N_STEPS=10
+export SAVE_EVERY_N_STEPS=1
+export CHECKPOINT_RANK0_TIMEOUT_S="${CHECKPOINT_RANK0_TIMEOUT_S:-7200}"
+export VALIDATION_RANK0_TIMEOUT_S="${VALIDATION_RANK0_TIMEOUT_S:-14400}"
+export RANK0_SECTION_POLL_INTERVAL_S="${RANK0_SECTION_POLL_INTERVAL_S:-5}"
 
 export WANDB_RUN_NAME="${WANDB_RUN_NAME:-rl-phase-a-A1-paper-8gpu-${TS}}"
 export OUTPUT_DIR="${BIOREASON_ARTIFACTS_ROOT}/models/train_rl_output_phase_a_a1_paper_8gpu_${TS}"
@@ -215,12 +218,16 @@ exec "$DEEPSPEED_BIN" \
   --checkpoint_artifact_name "$CHECKPOINT_ARTIFACT_NAME" \
   --checkpoint_artifact_aliases "$CHECKPOINT_ARTIFACT_ALIASES" \
   --checkpoint_export_only "$CHECKPOINT_EXPORT_ONLY" \
+  --checkpoint_rank0_timeout_s "$CHECKPOINT_RANK0_TIMEOUT_S" \
+  --validation_rank0_timeout_s "$VALIDATION_RANK0_TIMEOUT_S" \
+  --rank0_section_poll_interval_s "$RANK0_SECTION_POLL_INTERVAL_S" \
   --resume_mode warm \
   --wandb_project "$WANDB_PROJECT" \
   --wandb_entity "$WANDB_ENTITY" \
   --run_name "$WANDB_RUN_NAME" \
   --weave_project "$WEAVE_PROJECT" \
   --execution_id "$EXECUTION_ID" \
+  --sync_root "$SYNC_ROOT" \
   --reward_mode per_aspect_ia_f1 \
   --disease_loss_weight 1.0 \
   --ablation_tag phase-a-A1 \

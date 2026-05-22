@@ -106,6 +106,7 @@ class FakeWandbRun:
         self.finished = False
         self.used_artifacts: list[tuple[str, object]] = []
         self.config = FakeWandbConfig()
+        self.finish_exit_code = None
 
     def log(self, payload, step=None):
         self.logged.append({"payload": dict(payload), "step": step})
@@ -113,8 +114,9 @@ class FakeWandbRun:
     def define_metric(self, name, **kwargs):
         self.define_metric_calls.append({"name": name, "kwargs": dict(kwargs)})
 
-    def finish(self):
+    def finish(self, exit_code=None):
         self.finished = True
+        self.finish_exit_code = exit_code
 
     def use_artifact(self, artifact_ref, type=None):
         self.used_artifacts.append((artifact_ref, type))
@@ -973,6 +975,53 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
 
         self.assertTrue(args.checkpoint_export_only)
 
+    def test_parse_args_accepts_rank0_section_timeout_flags(self):
+        args = GRPO.parse_args(
+            [
+                "--text_model_name",
+                "/tmp/demo-model",
+                "--checkpoint_rank0_timeout_s",
+                "7200",
+                "--validation_rank0_timeout_s",
+                "14400",
+                "--rank0_section_poll_interval_s",
+                "2",
+                "--rollout_worker_startup_retry_count",
+                "3",
+                "--rollout_worker_startup_retry_sleep_s",
+                "15",
+            ]
+        )
+
+        self.assertEqual(args.checkpoint_rank0_timeout_s, 7200)
+        self.assertEqual(args.validation_rank0_timeout_s, 14400)
+        self.assertEqual(args.rank0_section_poll_interval_s, 2)
+        self.assertEqual(args.rollout_worker_startup_retry_count, 3)
+        self.assertEqual(args.rollout_worker_startup_retry_sleep_s, 15)
+
+    def test_validation_wait_timeout_adds_checkpoint_budget_when_both_run(self):
+        eval_spec = GRPO.EvalSpec(
+            validation_rank0_timeout_s=14400,
+            checkpoint_rank0_timeout_s=7200,
+        )
+
+        self.assertEqual(
+            GRPO.resolve_validation_wait_timeout_s(eval_spec, checkpoint_will_run=True),
+            21600,
+        )
+        self.assertEqual(
+            GRPO.resolve_validation_wait_timeout_s(eval_spec, checkpoint_will_run=False),
+            14400,
+        )
+
+    def test_training_loop_saves_checkpoint_before_validation(self):
+        source = SCRIPT_PATH.read_text(encoding="utf-8")
+
+        self.assertLess(
+            source.index("if should_save_checkpoint:"),
+            source.index("if should_validate:"),
+        )
+
     def test_parse_args_accepts_execution_and_resume_flags(self):
         args = GRPO.parse_args(
             [
@@ -1091,6 +1140,46 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
         self.assertNotEqual(payload_a, payload_b)
         self.assertNotEqual(done_a, done_b)
 
+    def test_export_lora_adapter_checkpoint_saves_adapter_without_merging(self):
+        class FakeLoraTextModel:
+            peft_config = {"default": object()}
+
+            def __init__(self) -> None:
+                self.save_calls: list[dict[str, object]] = []
+                self.merge_called = False
+
+            def save_pretrained(self, destination, **kwargs):
+                self.save_calls.append(dict(kwargs))
+                destination = Path(destination)
+                destination.mkdir(parents=True, exist_ok=True)
+                (destination / "adapter_config.json").write_text("{}", encoding="utf-8")
+                (destination / "adapter_model.safetensors").write_text("adapter", encoding="utf-8")
+
+            def merge_and_unload(self):
+                self.merge_called = True
+                raise AssertionError("adapter checkpoint export must not merge LoRA weights")
+
+        class FakeTokenizer:
+            def save_pretrained(self, destination):
+                Path(destination, "tokenizer_config.json").write_text("{}", encoding="utf-8")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            text_model = FakeLoraTextModel()
+            model = types.SimpleNamespace(text_model=text_model, text_tokenizer=FakeTokenizer())
+            adapter_dir = Path(tmpdir) / "lora_adapter"
+
+            GRPO.export_lora_adapter_checkpoint(model, adapter_dir)
+
+            self.assertFalse(text_model.merge_called)
+            self.assertTrue((adapter_dir / "adapter_config.json").exists())
+            self.assertTrue((adapter_dir / "adapter_model.safetensors").exists())
+            self.assertTrue((adapter_dir / "tokenizer_config.json").exists())
+            metadata = json.loads((adapter_dir / "adapter_metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["format"], "peft_lora_adapter")
+            self.assertFalse(metadata["contains_merged_text_model"])
+            self.assertTrue(text_model.save_calls[0]["safe_serialization"])
+            self.assertTrue(text_model.save_calls[0]["save_embedding_layers"])
+
     def test_save_training_checkpoint_export_only_skips_deepspeed_save(self):
         runtime = GRPO.DistributedRuntime(enabled=False, rank=0, world_size=1, local_rank=0, device="cpu")
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1121,14 +1210,59 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
             )
             tracker = types.SimpleNamespace(log_checkpoint_artifact=mock.Mock())
 
-            with mock.patch.object(GRPO, "export_inference_checkpoint") as export_mock:
+            with (
+                mock.patch.object(GRPO, "export_lora_adapter_checkpoint") as adapter_mock,
+                mock.patch.object(GRPO, "export_inference_checkpoint") as export_mock,
+            ):
                 GRPO.save_training_checkpoint(policy_stack, args, 1, tracker, runtime)
 
         policy_stack.engine.save_checkpoint.assert_not_called()
-        export_mock.assert_called_once()
+        adapter_mock.assert_called_once()
+        export_mock.assert_not_called()
         tracker.log_checkpoint_artifact.assert_called_once()
         metadata = tracker.log_checkpoint_artifact.call_args.kwargs["metadata"]
         self.assertTrue(metadata["checkpoint_export_only"])
+        self.assertEqual(metadata["checkpoint_format"], "peft_lora_adapter")
+        self.assertEqual(metadata["lora_adapter_path"], "lora_adapter")
+        self.assertNotIn("inference_export_path", metadata)
+
+    def test_save_training_checkpoint_full_checkpoint_exports_inference_bundle(self):
+        runtime = GRPO.DistributedRuntime(enabled=False, rank=0, world_size=1, local_rank=0, device="cpu")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = GRPO.parse_args(
+                [
+                    "--text_model_name",
+                    "/tmp/demo-model",
+                    "--output_dir",
+                    tmpdir,
+                    "--checkpoint_export_only",
+                    "false",
+                ]
+            )
+            policy_stack = types.SimpleNamespace(
+                engine=types.SimpleNamespace(
+                    module=object(),
+                    save_checkpoint=mock.Mock(),
+                ),
+                reference_checkpoint_dir=Path("/tmp/reference"),
+                rollout_checkpoint_dir=Path("/tmp/rollout"),
+            )
+            tracker = types.SimpleNamespace(log_checkpoint_artifact=mock.Mock())
+
+            with (
+                mock.patch.object(GRPO, "export_lora_adapter_checkpoint") as adapter_mock,
+                mock.patch.object(GRPO, "export_inference_checkpoint") as export_mock,
+                mock.patch.object(GRPO, "barrier"),
+            ):
+                GRPO.save_training_checkpoint(policy_stack, args, 1, tracker, runtime)
+
+        policy_stack.engine.save_checkpoint.assert_called_once()
+        adapter_mock.assert_called_once()
+        export_mock.assert_called_once()
+        metadata = tracker.log_checkpoint_artifact.call_args.kwargs["metadata"]
+        self.assertFalse(metadata["checkpoint_export_only"])
+        self.assertEqual(metadata["lora_adapter_path"], "lora_adapter")
+        self.assertEqual(metadata["inference_export_path"], "inference_export")
 
     def test_save_training_checkpoint_export_only_skips_barrier(self):
         runtime = GRPO.DistributedRuntime(enabled=True, rank=0, world_size=16, local_rank=0, device="cpu")
@@ -1154,6 +1288,7 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
             tracker = types.SimpleNamespace(log_checkpoint_artifact=mock.Mock())
 
             with (
+                mock.patch.object(GRPO, "export_lora_adapter_checkpoint"),
                 mock.patch.object(GRPO, "export_inference_checkpoint"),
                 mock.patch.object(GRPO, "barrier") as barrier_mock,
                 mock.patch.object(GRPO, "run_rank0_serial_section", side_effect=lambda **kwargs: kwargs["action"]()),
@@ -1315,7 +1450,17 @@ class TrainProteinGrpoContractsTest(unittest.TestCase):
                 ]
             )
             stdout = io.StringIO()
-            with redirect_stdout(stdout):
+            with mock.patch.object(
+                GRPO,
+                "collect_runtime_dependency_statuses",
+                return_value={
+                    "torch": True,
+                    "deepspeed": False,
+                    "peft": True,
+                    "transformers": True,
+                    "vllm": False,
+                },
+            ), redirect_stdout(stdout):
                 ok = GRPO.run_preflight(args)
             self.assertFalse(ok)
             self.assertIn("Missing runtime dependencies", stdout.getvalue())
@@ -2012,6 +2157,32 @@ relationship: part_of GO:0000002 ! child
                 tracker.finish()
 
             self.assertTrue(fake_weave.client.flush_called)
+
+    def test_finish_passes_nonzero_exit_code_to_wandb(self):
+        fake_wandb = FakeWandbModule()
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.dict(os.environ, {}, clear=True):
+            output_dir = Path(tmpdir) / "train-output"
+            args = GRPO.parse_args(
+                [
+                    "--text_model_name",
+                    "/tmp/demo-model",
+                    "--output_dir",
+                    str(output_dir),
+                    "--wandb_entity",
+                    "demo-entity",
+                    "--wandb_project",
+                    "demo-project",
+                ]
+            )
+            args.run_name = "demo-run"
+            runtime = GRPO.DistributedRuntime(enabled=False, rank=0, world_size=1, local_rank=0, device="cpu")
+
+            with mock.patch.dict(sys.modules, {"wandb": fake_wandb}):
+                tracker = GRPO.RunTracker(args=args, config={}, output_dir=output_dir, runtime=runtime)
+                tracker.finish(exit_code=1)
+
+        self.assertTrue(fake_wandb.runs[0].finished)
+        self.assertEqual(fake_wandb.runs[0].finish_exit_code, 1)
 
 
 class PhaseAAblationContractsTest(unittest.TestCase):

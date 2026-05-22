@@ -19,10 +19,10 @@ source .venv-gpu/bin/activate
 mkdir -p runtime_logs
 
 export WANDB_ENTITY=wandb-healthcare
-export BASE_WANDB_PROJECT=bioreason-pro-custom
+export BASE_WANDB_PROJECT=bioreason-pro
 export WANDB_PROJECT="$BASE_WANDB_PROJECT"
 export EXPECTED_WANDB_ENTITY=wandb-healthcare
-export EXPECTED_WANDB_PROJECT=bioreason-pro-custom
+export EXPECTED_WANDB_PROJECT=bioreason-pro
 export WEAVE_PROJECT="${WEAVE_PROJECT:-${WANDB_ENTITY}/${BASE_WANDB_PROJECT}}"
 export VERIFY_TAG="${VERIFY_TAG:-verify40}"
 export DATA_BUNDLE=main_production

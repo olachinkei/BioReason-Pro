@@ -10,7 +10,7 @@ Usage (from repo root):
 
     export WANDB_API_KEY=...          # must be authenticated
     python scripts/smoke_weave_tracing.py \
-        --weave_project wandb-healthcare/bioreason-pro-custom
+        --weave_project wandb-healthcare/bioreason-pro
 
 The script fabricates a couple of proteins, a few fake completions per
 rollout, and a trivial reward function (1.0 if the target GO id appears in the
@@ -48,7 +48,7 @@ def parse_smoke_args(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--weave_project",
         required=True,
-        help="Weave/W&B project, e.g. 'wandb-healthcare/bioreason-pro-custom'.",
+        help="Weave/W&B project, e.g. 'wandb-healthcare/bioreason-pro'.",
     )
     parser.add_argument(
         "--run_name",

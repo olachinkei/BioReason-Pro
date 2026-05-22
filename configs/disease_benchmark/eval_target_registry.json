@@ -11,6 +11,15 @@
       "bioreason-pro-rl-paper",
       "train-sft-output",
       "train-rl-output"
+    ],
+    "holdout-phase-b": [
+      "bioreason-pro-rl-paper",
+      "phase-b-B2-dynamic-sampling"
+    ],
+    "holdout-available": [
+      "bioreason-pro-rl-paper",
+      "paper-native-tight-step10",
+      "paper-native-tight-step20"
     ]
   },
   "targets": {
@@ -18,6 +27,17 @@
       "display_name": "bioreason-pro-rl-paper",
       "runner": "protein_llm",
       "model_sources": [
+        {
+          "type": "local_dir",
+          "local_dir": "${BIOREASON_RL_PAPER_LOCAL_DIR}",
+          "required_paths": [
+            "config.json",
+            "go_embedding.pt",
+            "go_projection.pt",
+            "protein_projection.pt",
+            "protein_model/pytorch_model.bin"
+          ]
+        },
         {
           "type": "wandb_artifact",
           "wandb_registry_path": "${BIOREASON_RL_PAPER_MODEL_REGISTRY_PATH}",
@@ -60,6 +80,142 @@
           "type": "wandb_artifact",
           "wandb_registry_path": "${BIOREASON_TRAIN_RL_MODEL_REGISTRY_PATH}",
           "local_dir": "data/artifacts/models/train_rl_output",
+          "required_paths": [
+            "config.json",
+            "go_embedding.pt",
+            "go_projection.pt",
+            "protein_projection.pt",
+            "protein_model/pytorch_model.bin"
+          ]
+        }
+      ]
+    },
+    "phase-b-B2-dynamic-sampling": {
+      "display_name": "phase-b-B2-dynamic-sampling-step20",
+      "runner": "protein_llm",
+      "model_sources": [
+        {
+          "type": "local_dir",
+          "local_dir": "${BIOREASON_PHASE_B_B2_MODEL_DIR}",
+          "required_paths": [
+            "config.json",
+            "go_embedding.pt",
+            "go_projection.pt",
+            "protein_projection.pt",
+            "protein_model/pytorch_model.bin"
+          ]
+        }
+      ]
+    },
+    "paper-native-tight-step10": {
+      "display_name": "paper-native-tight-2node-step10",
+      "runner": "protein_llm",
+      "model_sources": [
+        {
+          "type": "local_dir",
+          "local_dir": "${BIOREASON_PAPER_TIGHT_STEP10_DIR}",
+          "required_paths": [
+            "config.json",
+            "go_embedding.pt",
+            "go_projection.pt",
+            "protein_projection.pt",
+            "protein_model/pytorch_model.bin"
+          ]
+        }
+      ]
+    },
+    "paper-native-tight-step20": {
+      "display_name": "paper-native-tight-2node-step20",
+      "runner": "protein_llm",
+      "model_sources": [
+        {
+          "type": "local_dir",
+          "local_dir": "${BIOREASON_PAPER_TIGHT_STEP20_DIR}",
+          "required_paths": [
+            "config.json",
+            "go_embedding.pt",
+            "go_projection.pt",
+            "protein_projection.pt",
+            "protein_model/pytorch_model.bin"
+          ]
+        }
+      ]
+    },
+    "phase-a-a1-paper-8gpu-step5": {
+      "display_name": "phase-a-a1-paper-8gpu-step5",
+      "runner": "protein_llm",
+      "model_sources": [
+        {
+          "type": "local_dir",
+          "local_dir": "${BIOREASON_PHASE_A_A1_8GPU_STEP5_DIR}",
+          "required_paths": [
+            "config.json",
+            "go_embedding.pt",
+            "go_projection.pt",
+            "protein_projection.pt",
+            "protein_model/pytorch_model.bin"
+          ]
+        }
+      ]
+    },
+    "weekend-best-b2-nomix-step15": {
+      "display_name": "weekend-best-b2-nomix-2node-step15",
+      "runner": "protein_llm",
+      "model_sources": [
+        {
+          "type": "local_dir",
+          "local_dir": "${BIOREASON_WEEKEND_BEST_STEP15_DIR}",
+          "required_paths": [
+            "config.json",
+            "go_embedding.pt",
+            "go_projection.pt",
+            "protein_projection.pt",
+            "protein_model/pytorch_model.bin"
+          ]
+        }
+      ]
+    },
+    "conservative-a2-rmix-step25": {
+      "display_name": "conservative-a2-rmix-2node-step25",
+      "runner": "protein_llm",
+      "model_sources": [
+        {
+          "type": "local_dir",
+          "local_dir": "${BIOREASON_CONSERVATIVE_A2_STEP25_DIR}",
+          "required_paths": [
+            "config.json",
+            "go_embedding.pt",
+            "go_projection.pt",
+            "protein_projection.pt",
+            "protein_model/pytorch_model.bin"
+          ]
+        }
+      ]
+    },
+    "gen5-a1-rmix": {
+      "display_name": "gen5-a1-rmix-2node",
+      "runner": "protein_llm",
+      "model_sources": [
+        {
+          "type": "local_dir",
+          "local_dir": "${BIOREASON_GEN5_A1_RMIX_DIR}",
+          "required_paths": [
+            "config.json",
+            "go_embedding.pt",
+            "go_projection.pt",
+            "protein_projection.pt",
+            "protein_model/pytorch_model.bin"
+          ]
+        }
+      ]
+    },
+    "rerun-nftu3zl2-a3-rmix-selective": {
+      "display_name": "rerun-nftu3zl2-a3-rmix-selective-step20",
+      "runner": "protein_llm",
+      "model_sources": [
+        {
+          "type": "local_dir",
+          "local_dir": "${BIOREASON_RERUN_NFTU3ZL2_DIR}",
           "required_paths": [
             "config.json",
             "go_embedding.pt",
