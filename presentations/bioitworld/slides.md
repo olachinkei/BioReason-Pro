@@ -11,8 +11,8 @@ drawings:
 transition: slide-left
 mdc: true
 fonts:
-  sans: "Source Sans Pro"
-  serif: "Source Sans Pro"
+  sans: "Inter"
+  serif: "Inter"
   mono: "Fira Code"
 ---
 
@@ -24,9 +24,23 @@ fonts:
 .slidev-layout {
   background: #1a1d24;
   color: #ffffff;
+  font-size: 0.96rem;
+  line-height: 1.45;
 }
 h1, h2, h3 {
   color: #ffffff !important;
+}
+h1 {
+  font-size: 2.25rem !important;
+  line-height: 1.12 !important;
+}
+h2 {
+  font-size: 1.72rem !important;
+  line-height: 1.18 !important;
+}
+h3 {
+  font-size: 1.24rem !important;
+  line-height: 1.22 !important;
 }
 pre {
   background: #2a2f3a !important;
@@ -49,11 +63,11 @@ p code, li code {
 Governing Models, Agents, and Evaluation
 </div>
 
-<div style="padding-top: 2rem; max-width: 42rem; margin: 0 auto; color: #cccccc; font-size: 0.95rem; text-align: left;">
+<div style="padding-top: 2rem; max-width: 42rem; margin: 0 auto; color: #cccccc; font-size: 0.91rem; text-align: left;">
 Foundation models and AI agents are transforming drug discovery, but real-world deployment demands strong MLOps and LLMOps. Using Weights & Biases Models and Weave, we demonstrate a reproducible workflow for fine-tuning, agent tracing, evaluation, and RL that improves reliability, speeds iteration, and supports compliance.
 </div>
 
-<div style="padding-top: 2.5rem; color: #888888; font-size: 0.9rem;">
+<div style="padding-top: 2.5rem; color: #888888; font-size: 0.86rem;">
 BioIT World • 22-minute talk
 </div>
 
@@ -67,7 +81,7 @@ layout: center
 
 # Talk Structure (22 min)
 
-<div style="padding-top: 1.5rem; text-align: left; max-width: 44rem; margin: 0 auto; color: #cccccc; font-size: 1.02rem;">
+<div style="padding-top: 1.5rem; text-align: left; max-width: 44rem; margin: 0 auto; color: #cccccc; font-size: 0.98rem;">
 
 1. **Case for a systematic improvement loop** (6 min)
 2. **W&B tools and what they unlock** (5 min)
@@ -323,19 +337,19 @@ layout: center
 <div style="padding-top: 1.25rem; display: grid; grid-template-columns: repeat(2, 1fr); gap: 1rem;">
   <div style="padding: 1rem; background: #2a2f3a; border-radius: 0.5rem; text-align: left;">
     <div style="color: #58d3db; font-weight: bold;">Baseline</div>
-    <div style="color: #cccccc; font-size: 0.9rem; padding-top: 0.4rem;">Current BioReason-Pro, no tuning.</div>
+    <div style="color: #cccccc; font-size: 0.86rem; padding-top: 0.4rem;">Current BioReason-Pro, no tuning.</div>
   </div>
   <div style="padding: 1rem; background: #2a2f3a; border-radius: 0.5rem; text-align: left;">
     <div style="color: #58d3db; font-weight: bold;">SFT</div>
-    <div style="color: #cccccc; font-size: 0.9rem; padding-top: 0.4rem;">Supervised fine-tuning on curated disease-protein examples.</div>
+    <div style="color: #cccccc; font-size: 0.86rem; padding-top: 0.4rem;">Supervised fine-tuning on curated disease-protein examples.</div>
   </div>
   <div style="padding: 1rem; background: #2a2f3a; border-radius: 0.5rem; text-align: left;">
     <div style="color: #58d3db; font-weight: bold;">RL Variant A</div>
-    <div style="color: #cccccc; font-size: 0.9rem; padding-top: 0.4rem;">Reward prioritizes GO correctness + calibration.</div>
+    <div style="color: #cccccc; font-size: 0.86rem; padding-top: 0.4rem;">Reward prioritizes GO correctness + calibration.</div>
   </div>
   <div style="padding: 1rem; background: #2a2f3a; border-radius: 0.5rem; text-align: left;">
     <div style="color: #58d3db; font-weight: bold;">RL Variant B</div>
-    <div style="color: #cccccc; font-size: 0.9rem; padding-top: 0.4rem;">Reward adds robustness penalties for known failure modes.</div>
+    <div style="color: #cccccc; font-size: 0.86rem; padding-top: 0.4rem;">Reward adds robustness penalties for known failure modes.</div>
   </div>
 </div>
 

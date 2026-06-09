@@ -91,6 +91,7 @@ GO_EMBEDDINGS_PATH=${GO_EMBEDDINGS_PATH:-""}       # e.g., /data/bioreason/go_em
 DATASET_CACHE_DIR=${DATASET_CACHE_DIR:-"${BIOREASON_ARTIFACTS_ROOT}/hf_cache"}
 STRUCTURE_DIR=${STRUCTURE_DIR:-"${BIOREASON_RUNTIME_ROOT}/data/structures"}
 KEEP_LOCAL_EVAL_OUTPUTS=${KEEP_LOCAL_EVAL_OUTPUTS:-0}
+ALLOW_MISSING_EVAL_TRACKING=${ALLOW_MISSING_EVAL_TRACKING:-0}
 
 EVAL_SCRIPT="eval.py"
 EVALS_PATH=${EVALS_PATH:-"$EVALS_DIR/results"}
@@ -311,6 +312,11 @@ fi
 case "${KEEP_LOCAL_EVAL_OUTPUTS,,}" in
     1|true|yes)
         TRACKING_ARGS+=(--keep_local_eval_outputs)
+        ;;
+esac
+case "${ALLOW_MISSING_EVAL_TRACKING,,}" in
+    1|true|yes)
+        TRACKING_ARGS+=(--allow_missing_eval_tracking)
         ;;
 esac
 

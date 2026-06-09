@@ -1281,7 +1281,7 @@ def maybe_log_eval_to_weave(
 
 
 def enforce_required_eval_outputs(args, tracking_status: Dict[str, Any]) -> None:
-    """Fail the eval run when required tracking outputs are missing."""
+    """Fail the eval run when required non-recoverable outputs are missing."""
     missing = []
     if not tracking_status.get("wandb_logged"):
         missing.append("W&B logging")
@@ -1293,6 +1293,12 @@ def enforce_required_eval_outputs(args, tracking_status: Dict[str, Any]) -> None
         missing.append("Fmax metrics")
     if should_run_weave_evaluation(args) and not tracking_status.get("weave_logged"):
         missing.append("Weave evaluation")
+    if missing and bool(getattr(args, "allow_missing_eval_tracking", False)) and tracking_status.get("metrics_loaded"):
+        print(
+            "⚠️  Required eval tracking outputs missing, but metrics were saved; "
+            f"continuing because --allow_missing_eval_tracking is set: {', '.join(missing)}"
+        )
+        return
     if missing:
         raise RuntimeError(f"Required eval outputs missing: {', '.join(missing)}")
 
@@ -1995,6 +2001,11 @@ def setup_argument_parser() -> argparse.ArgumentParser:
         "--keep_local_eval_outputs",
         action="store_true",
         help="Keep local eval scratch after W&B logging instead of cleaning it up.",
+    )
+    output_group.add_argument(
+        "--allow_missing_eval_tracking",
+        action="store_true",
+        help="Exit successfully when metrics are saved even if W&B/Weave tracking is transiently unavailable.",
     )
 
     tracking_group = parser.add_argument_group("Tracking Configuration")
