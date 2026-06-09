@@ -16,4 +16,4 @@ python train.py --wandb_name "$STUDENT_NAME/<hypothesis-slug>"
 4. stop if the 5-step model does not beat baseline,
 5. continue to 20 total steps only if the 5-step gate improves.
 
-Read `program.md` before assigning or running experiments. CoreWeave operating steps live in `docs/coreweave-implementation.md`. Architecture notes are intentionally omitted; agents should infer code structure from the code.
+Read `program.md` before assigning or running experiments. CoreWeave operating steps live in `docs/coreweave-implementation.md`. Data-generation steps live in `docs/data-generation.md`. Architecture notes are intentionally omitted; agents should infer code structure from the code.
