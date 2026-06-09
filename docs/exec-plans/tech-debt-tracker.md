@@ -4,7 +4,7 @@
 
 | Item | Why It Matters | Owner |
 | --- | --- | --- |
-| Confirm online W&B credentials on CoreWeave | Offline smoke works, but real Senpai runs should log to W&B. | Human/Codex |
+| Confirm online W&B credentials on CoreWeave | Senpai runs must not launch unless online W&B preflight succeeds. | Human/Codex |
 | Run full data-generation pipeline once from cached sources | The scripts are contract-tested, but the large network-heavy build should be verified before public release. | Codex on CoreWeave |
 | Audit explicit structure/localization prompt fields before claiming paper reproduction | The Senpai prompt path centers organism, InterPro, PPI, and GO-GPT context. Paper-faithful reproduction may require explicit structure/localization fields depending on the artifact. | Human/Codex |
 | Keep CoreWeave runbook fresh | Slurm partitions, mount behavior, and auth can drift. | Human/Codex |

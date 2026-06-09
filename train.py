@@ -123,6 +123,19 @@ def normalize_path_value(value: Any) -> str:
     return normalize_text(value)
 
 
+DISALLOWED_WANDB_MODES = {"offline", "dryrun", "disabled"}
+
+
+def require_online_wandb_mode(mode: Any) -> None:
+    normalized = normalize_text(mode).strip().lower()
+    if normalized in DISALLOWED_WANDB_MODES:
+        raise RuntimeError(
+            "Senpai runs require online W&B tracking. Do not use "
+            f"WANDB_MODE={normalized!r} or --wandb_mode {normalized!r}; "
+            "fix W&B credentials or upgrade/verify wandb and weave in the target runtime first."
+        )
+
+
 def normalize_structured_response_text(text: Any) -> str:
     normalized = normalize_text(text)
     if not normalized:
@@ -656,7 +669,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--vllm_use_v1",
         type=str,
-        default=os.environ.get("BIOREASON_VLLM_USE_V1", os.environ.get("VLLM_USE_V1", "false")),
+        default=os.environ.get("BIOREASON_VLLM_USE_V1", os.environ.get("VLLM_USE_V1", "0")),
     )
     parser.add_argument("--rollout_backend", type=str, default="subprocess", choices=["subprocess", "inprocess"])
     parser.add_argument("--rollout_worker_start_method", type=str, default="spawn", choices=["spawn", "forkserver", "fork"])
@@ -2440,8 +2453,8 @@ class RunTracker:
     def _maybe_init_wandb(self, config: Mapping[str, Any]) -> Any:
         try:
             import wandb
-        except ImportError:
-            return None
+        except ImportError as exc:
+            raise RuntimeError("wandb is required for Senpai training; install or upgrade wandb in the target runtime.") from exc
 
         resolved_entity, resolved_project = resolve_wandb_identity(self.args, config)
         if resolved_entity:
@@ -2463,8 +2476,10 @@ class RunTracker:
             init_kwargs["tags"] = resolved_tags
         if self.wandb_entity:
             init_kwargs["entity"] = self.wandb_entity
-        if normalize_text(self.args.wandb_mode).strip():
-            init_kwargs["mode"] = self.args.wandb_mode
+        wandb_mode = normalize_text(self.args.wandb_mode).strip()
+        require_online_wandb_mode(wandb_mode)
+        if wandb_mode:
+            init_kwargs["mode"] = wandb_mode
         explicit_wandb_run_id = normalize_text(getattr(self.args, "wandb_run_id", "")).strip()
         if explicit_wandb_run_id:
             init_kwargs["id"] = explicit_wandb_run_id
@@ -5491,7 +5506,7 @@ def run_eval_phase(
             "WEAVE_PROJECT": normalize_text(args.weave_project).strip(),
             "WEAVE_EVAL_NAME": run_name,
             "KEEP_LOCAL_EVAL_OUTPUTS": "1",
-            "ALLOW_MISSING_EVAL_TRACKING": "1",
+            "ALLOW_MISSING_EVAL_TRACKING": "0",
             "ALLOW_WANDB_PROJECT_MISMATCH": "1",
             "VLLM_GPU_MEMORY_UTILIZATION": "0.25",
             "VLLM_MAX_NUM_SEQS": "8",
@@ -5694,6 +5709,7 @@ def emit_senpai_result(
 
 def senpai_main(argv: Optional[Sequence[str]] = None) -> None:
     args = parse_senpai_args(argv)
+    require_online_wandb_mode(args.wandb_mode)
     if int(args.nnodes) != 1 or int(args.gpus_per_node) != 8:
         raise RuntimeError("Senpai BioReason target is fixed to 1 node x 8 GPU.")
 

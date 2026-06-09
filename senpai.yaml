@@ -1,8 +1,18 @@
-# BioReason-Pro Senpai / CoreWeave CKS launch configuration.
+# BioReason-Pro direct training launcher configuration.
+#
+# This file is for this repository's training-only CKS/SUNK helper
+# (`k8s/launch.py`). It does not launch the upstream wandb/senpai advisor and
+# student control plane. For the real GitHub PR-based Senpai loop, use:
+#
+#   scripts/launch_wandb_senpai_control_plane.sh <research-tag>
+#
+# That wrapper launches the upstream `wandb/senpai` advisor + student
+# Deployments and points them at this repository as the target repo.
+#
 # All scalar fields can be overridden with:
 #   python k8s/launch.py --tag <tag> --field value
 
-# Problem package repository. Advisor/student PRs land here.
+# Problem package repository metadata for training-only manifest context.
 target_repo_url: https://github.com/olachinkei/BioReason-Pro.git
 target_repo_branch: main
 advisor_branch: senpai-bioreason

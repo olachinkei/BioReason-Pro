@@ -16,12 +16,18 @@ python train.py --wandb_name "$STUDENT_NAME/<hypothesis-slug>"
 4. stop if the 5-step model does not beat baseline,
 5. continue to 20 total steps only if the 5-step gate improves.
 
-Read `docs/index.md` first. The experiment contract lives in `program.md`, CoreWeave operating steps live in `docs/runbooks/coreweave-implementation.md`, and data-generation steps live in `docs/design-docs/data-generation.md`.
+Read `docs/index.md` first. The experiment contract lives in `program.md`, the upstream Senpai teacher/student control-plane launch lives in `docs/runbooks/wandb-senpai-control-plane.md`, CoreWeave SSH/Slurm GPU operating steps live in `docs/runbooks/coreweave-implementation.md`, and data-generation steps live in `docs/design-docs/data-generation.md`.
 
-For CoreWeave CKS/SUNK launches, render the Kubernetes Job manifests with:
+For the real GitHub PR-based Senpai loop, launch upstream `wandb/senpai` through:
+
+```bash
+scripts/launch_wandb_senpai_control_plane.sh bioreason-r1
+```
+
+For manual CoreWeave GPU runs, use the SSH/Slurm workflow in `docs/runbooks/coreweave-implementation.md`. If you specifically want a direct Kubernetes training Job on CoreWeave CKS with SUNK scheduling, render the manifests with:
 
 ```bash
 python k8s/launch.py --tag smoke-r1 --gate_steps 1 --continue_steps 0 --max_val_samples 2 --dry_run
 ```
 
-See `docs/runbooks/coreweave-sunk-senpai.md` before applying them to the cluster.
+See `docs/runbooks/coreweave-sunk-senpai.md` before applying direct training manifests to the cluster.

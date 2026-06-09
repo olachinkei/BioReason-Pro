@@ -18,7 +18,7 @@ This map is the starting point for humans and coding agents.
 | --- | --- | --- |
 | Design docs | `docs/design-docs/` | Target principles, data-generation design, and benchmark contracts. |
 | Execution plans | `docs/exec-plans/` | Active/completed implementation plans and tech debt. |
-| Runbooks | `docs/runbooks/` | Operational procedures such as CoreWeave usage, CKS/SUNK launches, and Docker runtime setup. |
+| Runbooks | `docs/runbooks/` | Operational procedures for the upstream Senpai control plane, default CoreWeave SSH/Slurm path, optional direct CKS/SUNK launches, and Docker runtime setup. |
 | References | `docs/references/` | External papers, upstream repositories, and algorithm-to-code mapping. |
 | ADRs | `docs/adr/` | Accepted architectural and process decisions. |
 | Generated docs | `docs/generated/` | Reserved for generated docs. No DB schema is needed today. |
@@ -35,8 +35,10 @@ This map is the starting point for humans and coding agents.
 - Assign or run experiments: `program.md`.
 - Understand the fixed baseline: `BASELINE.md`.
 - Rebuild data artifacts: `docs/design-docs/data-generation.md`.
+- Confirm the next real Senpai launch: `docs/adr/0005-upstream-senpai-control-plane.md`.
+- Launch upstream Senpai teacher/student loop: `docs/runbooks/wandb-senpai-control-plane.md`.
 - Work on CoreWeave: `docs/runbooks/coreweave-implementation.md`.
-- Launch CKS/SUNK jobs: `docs/runbooks/coreweave-sunk-senpai.md`.
+- Launch optional direct CKS/SUNK training jobs: `docs/runbooks/coreweave-sunk-senpai.md`.
 - Handle Senpai OOMs: `docs/runbooks/senpai-oom-handling.md`.
 - Build the Docker image: `docs/runbooks/senpai-docker.md`.
 - Find paper/upstream reference mapping: `docs/references/algorithm-map.md`.

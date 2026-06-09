@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Render or apply CoreWeave CKS/SUNK jobs for BioReason-Pro Senpai runs.
+"""Render or apply direct CoreWeave CKS/SUNK training jobs.
 
-This is intentionally smaller than the upstream wandb/senpai launcher: this
-repository is the problem package, so the Kubernetes surface here launches the
-actual BioReason training jobs on CKS while Slurm places the Pods through SUNK.
+This helper is training-only: it launches BioReason train.py jobs on CKS while
+Slurm places the Pods through SUNK. It does not run the upstream wandb/senpai
+advisor/student GitHub PR control plane. Use
+scripts/launch_wandb_senpai_control_plane.sh for the real Senpai loop.
 """
 
 from __future__ import annotations
@@ -178,7 +179,7 @@ def render_configmap(name: str, tag: str, config: LaunchConfig) -> str:
         "TORCHINDUCTOR_COMPILE_THREADS": "4",
         "TMPDIR": f"{runtime_root}/tmp",
         "VLLM_ATTENTION_BACKEND": "XFORMERS",
-        "VLLM_USE_V1": "false",
+        "VLLM_USE_V1": "0",
         "BIOREASON_VLLM_WORKER_MULTIPROC_METHOD": "spawn",
         "SENPAI_MAX_NEW_TOKENS": str(config.senpai_max_new_tokens),
         "SENPAI_VLLM_MAX_MODEL_LEN": str(config.senpai_vllm_max_model_len),
@@ -285,6 +286,8 @@ def main(argv: list[str] | None = None) -> int:
         sys.exit("ERROR: --memory_request_gi must be <= --memory_limit_gi")
     if min(config.senpai_max_new_tokens, config.senpai_vllm_max_model_len, config.senpai_vllm_max_num_seqs) < 1:
         sys.exit("ERROR: Senpai token and vLLM sequence settings must all be at least 1")
+    if str(config.wandb_mode).strip().lower() in {"offline", "dryrun", "disabled"}:
+        sys.exit("ERROR: Senpai runs require online W&B; fix wandb/weave or credentials instead of using offline mode.")
 
     names = student_names(config, args.names)
     manifest = render_manifests(config, k8s_name(args.tag), names)

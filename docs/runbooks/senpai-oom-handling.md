@@ -47,7 +47,17 @@ SENPAI_VLLM_MAX_NUM_SEQS=2
 This reduces active vLLM concurrency while preserving `SENPAI_MAX_NEW_TOKENS`.
 It will usually slow generation down, but it keeps the paper token length.
 
-Example CKS/SUNK retry:
+For the default SSH/Slurm path, add the lower sequence count to the training
+command or job script:
+
+```bash
+python train.py \
+  --vllm_max_num_seqs 2 \
+  --max_new_tokens 10000 \
+  --vllm_max_model_len 32768
+```
+
+Optional CKS/SUNK retry:
 
 ```bash
 SENPAI_VLLM_MAX_NUM_SEQS=2 python k8s/launch.py \

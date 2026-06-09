@@ -1,4 +1,6 @@
-# CoreWeave Implementation Notes
+# CoreWeave SSH/Slurm Implementation Notes
+
+Use this runbook for normal CoreWeave GPU work on the SUNK/Slurm login node. This is the default path when someone asks to run Senpai on CoreWeave GPUs. Use the CKS/SUNK Kubernetes runbook only when the request specifically calls for CKS or Kubernetes Jobs.
 
 Use the global Codex skill `coreweave-gpu-implementation` for live cluster work. Do not add that skill to this repository.
 
@@ -41,10 +43,39 @@ export TRITON_CACHE_DIR=$BIOREASON_CACHE_ROOT/triton
 export TORCHINDUCTOR_CACHE_DIR=$BIOREASON_CACHE_ROOT/torch_inductor
 export TORCHINDUCTOR_COMPILE_THREADS=4
 export TMPDIR=$BIOREASON_RUNTIME_ROOT/tmp
+export VLLM_USE_V1=0
 mkdir -p "$BIOREASON_ARTIFACTS_ROOT" "$BIOREASON_CACHE_ROOT" "$WANDB_DIR" \
   "$WEAVE_SERVER_CACHE_DIR" "$HF_HOME" "$TRITON_CACHE_DIR" \
   "$TORCHINDUCTOR_CACHE_DIR" "$TMPDIR"
 ```
+
+## W&B Online Preflight
+
+W&B online tracking is mandatory for Senpai smoke, gate, and full runs. Do not
+set `WANDB_MODE=offline`, `WANDB_MODE=dryrun`, `WANDB_MODE=disabled`, or pass
+`--wandb_mode offline` to work around auth or SDK failures.
+
+After entering a GPU allocation, but before launching a long training run,
+verify W&B from the exact Python environment that will run Senpai:
+
+```bash
+python -m pip install --upgrade wandb weave
+python - <<'PY'
+import wandb
+import weave
+
+print("wandb", getattr(wandb, "__version__", "unknown"))
+print("weave", getattr(weave, "__version__", "unknown"))
+api = wandb.Api(timeout=30)
+viewer = getattr(api, "viewer", None)
+viewer = viewer() if callable(viewer) else viewer
+print("wandb viewer", getattr(viewer, "username", viewer))
+PY
+```
+
+If this preflight returns 401, fails to import, or cannot resolve the viewer,
+stop. Fix the W&B key or upgrade the `wandb`/`weave` libraries in the target
+runtime, then rerun the preflight. Do not launch Senpai until this passes.
 
 ## GPU Allocation
 

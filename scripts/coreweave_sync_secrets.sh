@@ -17,7 +17,7 @@ if [[ "$(stat -f %Lp "$LOCAL_SECRET_ENV" 2>/dev/null || stat -c %a "$LOCAL_SECRE
   exit 1
 fi
 
-required_keys=(ANTHROPIC_API_KEY WANDB_API_KEY)
+required_keys=(GITHUB_TOKEN ANTHROPIC_API_KEY EXA_API_KEY WANDB_API_KEY)
 for key in "${required_keys[@]}"; do
   if ! grep -qE "^${key}=" "$LOCAL_SECRET_ENV"; then
     echo "Missing required key in $LOCAL_SECRET_ENV: $key" >&2

@@ -29,6 +29,12 @@ The W&B key must have read access to the configured artifact refs and write
 access to the target run project, normally `wandb-healthcare/bioreasoning-pro-senpai`.
 The Hugging Face token only needs read access.
 
+W&B online tracking is mandatory for Senpai smoke, gate, and full runs. Do not
+pass `WANDB_MODE=offline`, `WANDB_MODE=dryrun`, `WANDB_MODE=disabled`, or
+`--wandb_mode offline` to work around auth or SDK failures. If W&B returns 401
+or fails to initialize, upgrade/verify `wandb` and `weave` in the target runtime,
+fix credentials, and relaunch only after online W&B preflight passes.
+
 Do not bake `ANTHROPIC_API_KEY`, `WANDB_API_KEY`, or `HF_TOKEN` into the Docker
 image. Pass them through the job environment or your cluster secret manager.
 
@@ -53,6 +59,7 @@ export TMPDIR=$BIOREASON_RUNTIME_ROOT/tmp
 export SENPAI_MAX_NEW_TOKENS=10000
 export SENPAI_VLLM_MAX_MODEL_LEN=32768
 export SENPAI_VLLM_MAX_NUM_SEQS=4
+export VLLM_USE_V1=0
 mkdir -p "$BIOREASON_ARTIFACTS_ROOT" "$BIOREASON_CACHE_ROOT" "$WANDB_DIR" \
   "$WEAVE_SERVER_CACHE_DIR" "$HF_HOME" "$TRITON_CACHE_DIR" \
   "$TORCHINDUCTOR_CACHE_DIR" "$TMPDIR"
@@ -126,6 +133,7 @@ docker run --rm --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=6710886
   -e SENPAI_MAX_NEW_TOKENS=10000 \
   -e SENPAI_VLLM_MAX_MODEL_LEN=32768 \
   -e SENPAI_VLLM_MAX_NUM_SEQS=4 \
+  -e VLLM_USE_V1=0 \
   -e BIOREASON_RUNTIME_ROOT=/mnt/data/$USER/BioReason-Pro \
   -v /mnt/data/$USER/BioReason-Pro:/mnt/data/$USER/BioReason-Pro \
   bioreason-pro-senpai:cuda12.6 \
@@ -148,6 +156,7 @@ docker run --rm --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=6710886
   -e SENPAI_MAX_NEW_TOKENS=10000 \
   -e SENPAI_VLLM_MAX_MODEL_LEN=32768 \
   -e SENPAI_VLLM_MAX_NUM_SEQS=4 \
+  -e VLLM_USE_V1=0 \
   -e BIOREASON_RUNTIME_ROOT=/mnt/data/$USER/BioReason-Pro \
   -v /mnt/data/$USER/BioReason-Pro:/mnt/data/$USER/BioReason-Pro \
   bioreason-pro-senpai:cuda12.6 \

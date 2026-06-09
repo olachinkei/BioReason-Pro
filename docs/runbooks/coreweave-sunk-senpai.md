@@ -1,22 +1,32 @@
-# CoreWeave CKS/SUNK Senpai Launch
+# Optional Direct CoreWeave CKS/SUNK Training Launch
 
-This runbook launches BioReason-Pro Senpai training jobs as Kubernetes Jobs on
-CoreWeave Kubernetes Service while the SUNK scheduler asks Slurm to place and
-account for the Pods. It complements the SSH/Slurm workflow in
-`docs/runbooks/coreweave-implementation.md`.
+This runbook is only for the optional direct Kubernetes training path. It
+launches BioReason-Pro `train.py` jobs as Kubernetes Jobs on CoreWeave
+Kubernetes Service while the SUNK scheduler asks Slurm to place and account for
+the Pods.
+
+For the common request "run Senpai on CoreWeave GPUs", use the SSH/Slurm
+workflow in `docs/runbooks/coreweave-implementation.md` instead. Do not assume
+CKS is required unless the task explicitly asks for Kubernetes Jobs or CKS.
+
+For the real upstream Senpai teacher/advisor + student GitHub PR workflow, use
+`docs/runbooks/wandb-senpai-control-plane.md` instead. This runbook does not
+launch the advisor pod, poll GitHub issues, create PRs, or run student Claude
+Code agents.
 
 ## Shape
 
-- `senpai.yaml` holds the launch defaults.
-- `k8s/launch.py` renders or applies Kubernetes manifests.
+- `senpai.yaml` holds the direct training launch defaults.
+- `k8s/launch.py` renders or applies direct training Kubernetes manifests.
 - `k8s/student-job.yaml` is the SUNK-scheduled student Job template.
 - Each student Job runs root `train.py`; training behavior stays in `train.py`.
 - Mutable state, W&B files, Hugging Face cache, temporary files, and
   checkpoints stay under `BIOREASON_RUNTIME_ROOT` on the mounted runtime PVC.
 
 This repository is the Senpai problem package. It does not vendor the full
-`wandb/senpai` control-plane repository. Use upstream `wandb/senpai` for the
-advisor/student PR loop, and use this repo's `k8s/launch.py` when you want the
+`wandb/senpai` control-plane repository. Use
+`scripts/launch_wandb_senpai_control_plane.sh` for the advisor/student PR loop,
+and use this repo's `k8s/launch.py` only when you explicitly want direct
 BioReason training work itself to run as CKS/SUNK Jobs.
 
 ## Prerequisites
@@ -39,7 +49,13 @@ HF_TOKEN=...
 SENPAI_MAX_NEW_TOKENS=10000
 SENPAI_VLLM_MAX_MODEL_LEN=32768
 SENPAI_VLLM_MAX_NUM_SEQS=4
+VLLM_USE_V1=0
 ```
+
+W&B online tracking is mandatory here too. Do not set `WANDB_MODE=offline`,
+`WANDB_MODE=dryrun`, `WANDB_MODE=disabled`, or use `--wandb_mode offline`.
+If W&B returns 401 or fails to initialize, upgrade/verify `wandb` and `weave`,
+fix credentials, and relaunch only after online W&B preflight passes.
 
 If you also run the upstream `wandb/senpai` advisor/student control plane from
 the same local environment, include the control-plane keys there too:
