@@ -26,7 +26,7 @@ npm install @anthropic-ai/claude-agent-sdk
 ```
 
 The W&B key must have read access to the configured artifact refs and write
-access to the target run project, normally `wandb-healthcare/bioreasoning-pro`.
+access to the target run project, normally `wandb-healthcare/bioreasoning-pro-senpai`.
 The Hugging Face token only needs read access.
 
 Do not bake `ANTHROPIC_API_KEY`, `WANDB_API_KEY`, or `HF_TOKEN` into the Docker
@@ -50,6 +50,9 @@ export TRITON_CACHE_DIR=$BIOREASON_CACHE_ROOT/triton
 export TORCHINDUCTOR_CACHE_DIR=$BIOREASON_CACHE_ROOT/torch_inductor
 export TORCHINDUCTOR_COMPILE_THREADS=4
 export TMPDIR=$BIOREASON_RUNTIME_ROOT/tmp
+export SENPAI_MAX_NEW_TOKENS=10000
+export SENPAI_VLLM_MAX_MODEL_LEN=32768
+export SENPAI_VLLM_MAX_NUM_SEQS=4
 mkdir -p "$BIOREASON_ARTIFACTS_ROOT" "$BIOREASON_CACHE_ROOT" "$WANDB_DIR" \
   "$WEAVE_SERVER_CACHE_DIR" "$HF_HOME" "$TRITON_CACHE_DIR" \
   "$TORCHINDUCTOR_CACHE_DIR" "$TMPDIR"
@@ -120,6 +123,9 @@ docker build \
 docker run --rm --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
   -e WANDB_API_KEY \
   -e HF_TOKEN \
+  -e SENPAI_MAX_NEW_TOKENS=10000 \
+  -e SENPAI_VLLM_MAX_MODEL_LEN=32768 \
+  -e SENPAI_VLLM_MAX_NUM_SEQS=4 \
   -e BIOREASON_RUNTIME_ROOT=/mnt/data/$USER/BioReason-Pro \
   -v /mnt/data/$USER/BioReason-Pro:/mnt/data/$USER/BioReason-Pro \
   bioreason-pro-senpai:cuda12.6 \
@@ -138,7 +144,10 @@ Run on the target 1 node x 8 GPU allocation:
 docker run --rm --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
   -e WANDB_API_KEY \
   -e HF_TOKEN \
-  -e WANDB_PROJECT=bioreasoning-pro \
+  -e WANDB_PROJECT=bioreasoning-pro-senpai \
+  -e SENPAI_MAX_NEW_TOKENS=10000 \
+  -e SENPAI_VLLM_MAX_MODEL_LEN=32768 \
+  -e SENPAI_VLLM_MAX_NUM_SEQS=4 \
   -e BIOREASON_RUNTIME_ROOT=/mnt/data/$USER/BioReason-Pro \
   -v /mnt/data/$USER/BioReason-Pro:/mnt/data/$USER/BioReason-Pro \
   bioreason-pro-senpai:cuda12.6 \

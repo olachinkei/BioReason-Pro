@@ -103,8 +103,8 @@ it is not naturally a per-protein decomposable quantity.
 
 No fatal algorithmic contradiction was found in the branch's core RL path. The
 important caveat is that this branch is a Senpai screening target, not a
-full paper-reproduction target. The Senpai wrapper now keeps the paper rollout
-shape, while using a slightly shorter completion budget for memory headroom.
+full paper-reproduction target. The Senpai wrapper keeps the paper rollout
+shape and paper rollout completion budget.
 
 ### Looks Correct
 
@@ -115,7 +115,7 @@ shape, while using a slightly shorter completion budget for memory headroom.
   8 queries, 24 rollouts per query, 6 optimizer microbatch, and 4 accumulation
   steps.
 - The 24 rollouts are generated through a smaller active vLLM window by default:
-  `SENPAI_VLLM_MAX_NUM_SEQS=8`. The trainer submits rollout chunks
+  `SENPAI_VLLM_MAX_NUM_SEQS=4`. The trainer submits rollout chunks
   sequentially, waiting for a chunk to finish before using the freed slots for
   the next chunk.
 - The local prompt path includes the paper's main biological context slots:
@@ -130,10 +130,10 @@ shape, while using a slightly shorter completion budget for memory headroom.
 
 ### Intentional Senpai Deviations
 
-- Senpai mode defaults `SENPAI_MAX_NEW_TOKENS=8192`,
-  `SENPAI_VLLM_MAX_MODEL_LEN=12288`, and active vLLM slots of 8. The completion
-  budget is below the paper's 10,000-token setting but near enough to preserve
-  long reasoning while reducing OOM risk.
+- Senpai mode defaults `SENPAI_MAX_NEW_TOKENS=10000`,
+  `SENPAI_VLLM_MAX_MODEL_LEN=32768`, and active vLLM slots of 4. This preserves
+  the paper completion budget while reducing OOM risk through lower vLLM
+  concurrency.
 - The branch is fixed to 1 node x 8 GPU. The paper reports 8 H100 GPUs across 2
   nodes; the algorithmic world size is still 8 ranks, but the hardware topology
   differs.
@@ -161,14 +161,12 @@ shape, while using a slightly shorter completion budget for memory headroom.
 
 For Senpai PRs, keep the current single-node defaults and judge candidates only
 against the frozen local baseline using `overall_mean_fmax`. The defaults keep
-the paper rollout shape and use an approximately 8k-token completion budget. To
-push completion length all the way to the paper's 10k setting, override:
+the paper rollout shape and paper 10k-token completion budget. If vLLM OOMs,
+reduce active sequence concurrency before reducing token length:
 
 ```bash
-SENPAI_MAX_NEW_TOKENS=10000 \
-SENPAI_VLLM_MAX_MODEL_LEN=12288 \
+SENPAI_VLLM_MAX_NUM_SEQS=2 \
 python train.py --wandb_name "<name>" --wandb_group "<group>"
 ```
 
-The 10k completion setting is expected to require more memory headroom than the
-default Senpai gate and may need further CoreWeave tuning.
+See `docs/runbooks/senpai-oom-handling.md` for the OOM escalation order.

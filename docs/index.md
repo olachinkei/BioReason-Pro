@@ -37,5 +37,6 @@ This map is the starting point for humans and coding agents.
 - Rebuild data artifacts: `docs/design-docs/data-generation.md`.
 - Work on CoreWeave: `docs/runbooks/coreweave-implementation.md`.
 - Launch CKS/SUNK jobs: `docs/runbooks/coreweave-sunk-senpai.md`.
+- Handle Senpai OOMs: `docs/runbooks/senpai-oom-handling.md`.
 - Build the Docker image: `docs/runbooks/senpai-docker.md`.
 - Find paper/upstream reference mapping: `docs/references/algorithm-map.md`.

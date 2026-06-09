@@ -613,7 +613,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume_from_export_artifact", type=str, default=os.environ.get("RESUME_FROM_EXPORT_ARTIFACT", ""))
     parser.add_argument("--resume_mode", type=str, default=os.environ.get("RESUME_MODE", "warm"), choices=["warm", "cold"])
 
-    parser.add_argument("--wandb_project", type=str, default=os.environ.get("WANDB_PROJECT", "bioreasoning-pro"))
+    parser.add_argument("--wandb_project", type=str, default=os.environ.get("WANDB_PROJECT", "bioreasoning-pro-senpai"))
     parser.add_argument("--wandb_entity", type=str, default=None)
     parser.add_argument("--wandb_mode", type=str, default=None)
     parser.add_argument("--wandb_run_id", type=str, default=os.environ.get("BIOREASON_WANDB_RUN_ID", ""))
@@ -5233,7 +5233,7 @@ def build_senpai_arg_parser() -> argparse.ArgumentParser:
         "--wandb-project",
         dest="wandb_project",
         type=str,
-        default=os.environ.get("WANDB_PROJECT", "bioreasoning-pro"),
+        default=os.environ.get("WANDB_PROJECT", "bioreasoning-pro-senpai"),
     )
     parser.add_argument("--wandb_mode", "--wandb-mode", dest="wandb_mode", type=str, default=os.environ.get("WANDB_MODE", ""))
     parser.add_argument("--weave_project", "--weave-project", dest="weave_project", type=str, default=os.environ.get("WEAVE_PROJECT", ""))
@@ -5604,15 +5604,15 @@ def build_backend_train_command(
         "--gradient_accumulation_steps",
         os.environ.get("SENPAI_GRADIENT_ACCUMULATION_STEPS", "4"),
         "--max_new_tokens",
-        os.environ.get("SENPAI_MAX_NEW_TOKENS", "8192"),
+        os.environ.get("SENPAI_MAX_NEW_TOKENS", "10000"),
         "--rollout_logprob_microbatch_size",
         os.environ.get("SENPAI_ROLLOUT_LOGPROB_MICROBATCH_SIZE", "1"),
         "--vllm_gpu_memory_utilization",
         os.environ.get("SENPAI_VLLM_GPU_MEMORY_UTILIZATION", "0.25"),
         "--vllm_max_model_len",
-        os.environ.get("SENPAI_VLLM_MAX_MODEL_LEN", "12288"),
+        os.environ.get("SENPAI_VLLM_MAX_MODEL_LEN", "32768"),
         "--vllm_max_num_seqs",
-        os.environ.get("SENPAI_VLLM_MAX_NUM_SEQS", "8"),
+        os.environ.get("SENPAI_VLLM_MAX_NUM_SEQS", "4"),
         "--vllm_swap_space_gb",
         os.environ.get("SENPAI_VLLM_SWAP_SPACE_GB", "16"),
         "--weave_trace_budget",

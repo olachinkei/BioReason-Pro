@@ -9,6 +9,7 @@ actual BioReason training jobs on CKS while Slurm places the Pods through SUNK.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -59,12 +60,15 @@ class LaunchConfig:
     runtime_root: str = "/mnt/data/bioreason/BioReason-Pro"
     secret_name: str = "senpai-secrets"
     wandb_entity: str = "wandb-healthcare"
-    wandb_project: str = "bioreasoning-pro"
+    wandb_project: str = "bioreasoning-pro-senpai"
     wandb_mode: str = "online"
     mode: str = "gate"
     gate_steps: int = 5
     continue_steps: int = 15
     max_val_samples: int = 100
+    senpai_max_new_tokens: int = 10000
+    senpai_vllm_max_model_len: int = 32768
+    senpai_vllm_max_num_seqs: int = 4
     extra_train_args: str = ""
 
 
@@ -176,6 +180,9 @@ def render_configmap(name: str, tag: str, config: LaunchConfig) -> str:
         "VLLM_ATTENTION_BACKEND": "XFORMERS",
         "VLLM_USE_V1": "false",
         "BIOREASON_VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+        "SENPAI_MAX_NEW_TOKENS": str(config.senpai_max_new_tokens),
+        "SENPAI_VLLM_MAX_MODEL_LEN": str(config.senpai_vllm_max_model_len),
+        "SENPAI_VLLM_MAX_NUM_SEQS": str(config.senpai_vllm_max_num_seqs),
     }
     lines = [
         "apiVersion: v1",
@@ -240,8 +247,24 @@ def apply_manifest(manifest: str) -> None:
     subprocess.run(["kubectl", "apply", "-f", "-"], input=manifest, text=True, check=True)
 
 
+def apply_env_defaults(config: LaunchConfig) -> None:
+    wandb_project = os.environ.get("WANDB_PROJECT", "").strip()
+    if wandb_project:
+        config.wandb_project = wandb_project
+    int_env_fields = {
+        "SENPAI_MAX_NEW_TOKENS": "senpai_max_new_tokens",
+        "SENPAI_VLLM_MAX_MODEL_LEN": "senpai_vllm_max_model_len",
+        "SENPAI_VLLM_MAX_NUM_SEQS": "senpai_vllm_max_num_seqs",
+    }
+    for env_name, field_name in int_env_fields.items():
+        raw_value = os.environ.get(env_name, "").strip()
+        if raw_value:
+            setattr(config, field_name, int(raw_value))
+
+
 def main(argv: list[str] | None = None) -> int:
     config = load_config(CONFIG_PATH)
+    apply_env_defaults(config)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tag", required=True, help="Research tag used in names, labels, and W&B groups.")
     parser.add_argument("--names", default="", help="Comma-separated student names; overrides student_names.")
@@ -260,6 +283,8 @@ def main(argv: list[str] | None = None) -> int:
         sys.exit("ERROR: --termination_grace_period_seconds must normally be below SUNK kill-wait minus 5s; use <25.")
     if config.memory_request_gi > config.memory_limit_gi:
         sys.exit("ERROR: --memory_request_gi must be <= --memory_limit_gi")
+    if min(config.senpai_max_new_tokens, config.senpai_vllm_max_model_len, config.senpai_vllm_max_num_seqs) < 1:
+        sys.exit("ERROR: Senpai token and vLLM sequence settings must all be at least 1")
 
     names = student_names(config, args.names)
     manifest = render_manifests(config, k8s_name(args.tag), names)

@@ -41,7 +41,7 @@ runtime_root: /mnt/data/bioreason/BioReason-Pro
 # Kubernetes Secret that contains wandb-api-key and, optionally, hf-token.
 secret_name: senpai-secrets
 wandb_entity: wandb-healthcare
-wandb_project: bioreasoning-pro
+wandb_project: bioreasoning-pro-senpai
 wandb_mode: online
 
 # Train command defaults. "gate" runs the Senpai baseline + 5-step gate +
@@ -50,4 +50,7 @@ mode: gate
 gate_steps: 5
 continue_steps: 15
 max_val_samples: 100
+senpai_max_new_tokens: 10000
+senpai_vllm_max_model_len: 32768
+senpai_vllm_max_num_seqs: 4
 extra_train_args:

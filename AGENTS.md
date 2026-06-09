@@ -9,6 +9,10 @@ This branch is a compact Senpai target for BioReason-Pro RL experiments.
 3. `BASELINE.md` for the frozen baseline and metric.
 4. `docs/runbooks/coreweave-implementation.md` before CoreWeave work.
 
+## Error Handling References
+
+- For Senpai CUDA OOM, vLLM KV cache OOM, or DeepSpeed memory pressure, read `docs/runbooks/senpai-oom-handling.md`.
+
 ## Working Rules
 
 - Keep training behavior in root `train.py`.

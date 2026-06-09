@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -6,10 +7,24 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def run_launch(*args: str) -> str:
+def run_launch(
+    *args: str,
+    wandb_project: str | None = None,
+    senpai_vllm_max_num_seqs: str | None = None,
+) -> str:
+    env = os.environ.copy()
+    if wandb_project is None:
+        env.pop("WANDB_PROJECT", None)
+    else:
+        env["WANDB_PROJECT"] = wandb_project
+    for key in ("SENPAI_MAX_NEW_TOKENS", "SENPAI_VLLM_MAX_MODEL_LEN", "SENPAI_VLLM_MAX_NUM_SEQS"):
+        env.pop(key, None)
+    if senpai_vllm_max_num_seqs is not None:
+        env["SENPAI_VLLM_MAX_NUM_SEQS"] = senpai_vllm_max_num_seqs
     result = subprocess.run(
         [sys.executable, "k8s/launch.py", "--tag", "contract-r1", "--dry_run", *args],
         cwd=ROOT,
+        env=env,
         check=True,
         capture_output=True,
         text=True,
@@ -31,6 +46,11 @@ def test_sunk_student_job_contract() -> None:
     assert "--gate_steps 1" in rendered
     assert "--continue_steps 0" in rendered
     assert "--max_val_samples 2" in rendered
+    assert "WANDB_PROJECT: 'bioreasoning-pro-senpai'" in rendered
+    assert "--wandb_project 'bioreasoning-pro-senpai'" in rendered
+    assert "SENPAI_MAX_NEW_TOKENS: '10000'" in rendered
+    assert "SENPAI_VLLM_MAX_MODEL_LEN: '32768'" in rendered
+    assert "SENPAI_VLLM_MAX_NUM_SEQS: '4'" in rendered
 
 
 def test_multiple_students_render_distinct_jobs() -> None:
@@ -40,3 +60,16 @@ def test_multiple_students_render_distinct_jobs() -> None:
     assert "name: bioreason-contract-r1-fern" in rendered
     assert "student: frieren" in rendered
     assert "student: fern" in rendered
+
+
+def test_wandb_project_resolves_from_env() -> None:
+    rendered = run_launch(wandb_project="env-project")
+
+    assert "WANDB_PROJECT: 'env-project'" in rendered
+    assert "--wandb_project 'env-project'" in rendered
+
+
+def test_vllm_max_num_seqs_resolves_from_env() -> None:
+    rendered = run_launch(senpai_vllm_max_num_seqs="2")
+
+    assert "SENPAI_VLLM_MAX_NUM_SEQS: '2'" in rendered

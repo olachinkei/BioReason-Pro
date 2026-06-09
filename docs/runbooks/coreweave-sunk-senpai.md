@@ -28,6 +28,36 @@ docker build -t <registry>/bioreason-pro-senpai:cuda12.6 .
 docker push <registry>/bioreason-pro-senpai:cuda12.6
 ```
 
+Keep deployment secrets in a local `.env` file at the repository root or in a
+private path such as `~/.secrets/bioreason-senpai.env`. The repository ignores
+`.env`; do not commit it. A local `.env` used for deployment should contain:
+
+```bash
+WANDB_API_KEY=...
+WANDB_PROJECT=bioreasoning-pro-senpai
+HF_TOKEN=...
+SENPAI_MAX_NEW_TOKENS=10000
+SENPAI_VLLM_MAX_MODEL_LEN=32768
+SENPAI_VLLM_MAX_NUM_SEQS=4
+```
+
+If you also run the upstream `wandb/senpai` advisor/student control plane from
+the same local environment, include the control-plane keys there too:
+
+```bash
+GITHUB_TOKEN=...
+ANTHROPIC_API_KEY=...
+EXA_API_KEY=...
+```
+
+Load the local file before creating Kubernetes Secrets:
+
+```bash
+set -a
+source .env
+set +a
+```
+
 Create or rotate the shared Kubernetes Secret:
 
 ```bash
@@ -73,6 +103,10 @@ Check for these fields before applying:
 - `terminationGracePeriodSeconds` is below the scheduler kill-wait threshold.
 - CPU is request-only; the template intentionally avoids a CPU limit to reduce
   the risk of SUNK static CPU allocation conflicts.
+- Senpai keeps the paper rollout token length by default:
+  `SENPAI_MAX_NEW_TOKENS=10000`. If vLLM OOMs, reduce
+  `SENPAI_VLLM_MAX_NUM_SEQS` from `4` to `2` before reducing token length. See
+  `docs/runbooks/senpai-oom-handling.md`.
 
 ## Launch
 

@@ -95,7 +95,7 @@ class TrainSenpaiContractsTest(unittest.TestCase):
         self.assertEqual(args.nnodes, 1)
         self.assertEqual(args.gpus_per_node, 8)
 
-    def test_backend_train_command_defaults_are_paper_rollout_shape_with_8k_generation(self):
+    def test_backend_train_command_defaults_are_paper_rollout_shape_with_paper_generation_length(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             args = TRAIN.parse_senpai_args(["--output_dir", tmpdir, "--wandb_name", "unit/seed"])
             command = TRAIN.build_backend_train_command(
@@ -114,9 +114,9 @@ class TrainSenpaiContractsTest(unittest.TestCase):
         self.assertEqual(value_after("--rollouts_per_query"), "24")
         self.assertEqual(value_after("--optimizer_micro_batch_size_per_gpu"), "6")
         self.assertEqual(value_after("--gradient_accumulation_steps"), "4")
-        self.assertEqual(value_after("--max_new_tokens"), "8192")
-        self.assertEqual(value_after("--vllm_max_model_len"), "12288")
-        self.assertEqual(value_after("--vllm_max_num_seqs"), "8")
+        self.assertEqual(value_after("--max_new_tokens"), "10000")
+        self.assertEqual(value_after("--vllm_max_model_len"), "32768")
+        self.assertEqual(value_after("--vllm_max_num_seqs"), "4")
 
     def test_vllm_max_num_seqs_is_not_upscaled_to_rollout_count(self):
         args = TRAIN.parse_args(
