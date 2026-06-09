@@ -6,7 +6,8 @@ This map is the starting point for humans and coding agents.
 
 | Document | Purpose |
 | --- | --- |
-| `AGENTS.md` | Agent operating rules and doc placement rules. |
+| `AGENTS.md` | Codex operating rules, no-context startup steps, and doc placement rules. |
+| `CLAUDE.md` | Claude Code startup guide mirroring the critical agent rules. |
 | `ARCHITECTURE.md` | Thin source map for runtime surfaces. |
 | `program.md` | Senpai target contract and experiment loop. |
 | `BASELINE.md` | Baseline model, data bundle, metric, and comparison rule. |

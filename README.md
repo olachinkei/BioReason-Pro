@@ -2,6 +2,11 @@
 
 This branch is the compact Senpai target for BioReason-Pro reinforcement-learning experiments.
 
+Fresh agent threads should start with `AGENTS.md`. Claude Code should also read
+`CLAUDE.md`. Those files contain the no-context startup checklist and the
+critical distinction between this target repo and the upstream `wandb/senpai`
+control-plane runner.
+
 The only training entrypoint is:
 
 ```bash
