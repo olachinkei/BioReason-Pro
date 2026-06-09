@@ -17,3 +17,11 @@ python train.py --wandb_name "$STUDENT_NAME/<hypothesis-slug>"
 5. continue to 20 total steps only if the 5-step gate improves.
 
 Read `docs/index.md` first. The experiment contract lives in `program.md`, CoreWeave operating steps live in `docs/runbooks/coreweave-implementation.md`, and data-generation steps live in `docs/design-docs/data-generation.md`.
+
+For CoreWeave CKS/SUNK launches, render the Kubernetes Job manifests with:
+
+```bash
+python k8s/launch.py --tag smoke-r1 --gate_steps 1 --continue_steps 0 --max_val_samples 2 --dry_run
+```
+
+See `docs/runbooks/coreweave-sunk-senpai.md` before applying them to the cluster.

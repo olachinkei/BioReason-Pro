@@ -1,0 +1,93 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{JOB_NAME}}
+  labels:
+    app: bioreason-senpai
+    role: student
+    student: {{STUDENT_NAME}}
+    research-tag: {{RESEARCH_TAG}}
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: bioreason-senpai
+        role: student
+        student: {{STUDENT_NAME}}
+        research-tag: {{RESEARCH_TAG}}
+      annotations:
+        sunk.coreweave.com/account: "{{SUNK_ACCOUNT}}"
+        sunk.coreweave.com/comment: "BioReason-Pro Senpai student {{STUDENT_NAME}} / {{RESEARCH_TAG}}"
+        sunk.coreweave.com/current-working-dir: "/workspace/BioReason-Pro"
+        sunk.coreweave.com/exclusive: "{{SUNK_EXCLUSIVE}}"
+        sunk.coreweave.com/partition: "{{SUNK_PARTITION}}"
+        sunk.coreweave.com/timeout: "{{SUNK_TIMEOUT_MINUTES}}"
+    spec:
+      schedulerName: {{SUNK_SCHEDULER_NAME}}
+      restartPolicy: Never
+      terminationGracePeriodSeconds: {{TERMINATION_GRACE_PERIOD_SECONDS}}
+      containers:
+      - name: student
+        image: {{IMAGE}}
+        imagePullPolicy: {{IMAGE_PULL_POLICY}}
+        command: ["/bin/bash", "-lc"]
+        args:
+        - |
+          set -euo pipefail
+          echo "=== BioReason-Pro Senpai student: ${STUDENT_NAME} / ${RESEARCH_TAG} ==="
+          hostname
+          nvidia-smi
+          python train.py {{TRAIN_ARGS}}
+        envFrom:
+        - configMapRef:
+            name: {{CONFIGMAP_NAME}}
+        env:
+        - name: WANDB_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: {{SECRET_NAME}}
+              key: wandb-api-key
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: {{SECRET_NAME}}
+              key: hf-token
+              optional: true
+        - name: HUGGING_FACE_HUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: {{SECRET_NAME}}
+              key: hf-token
+              optional: true
+        resources:
+          requests:
+            cpu: "{{CPU_PER_STUDENT}}"
+            memory: "{{MEMORY_REQUEST_GI}}Gi"
+            nvidia.com/gpu: "{{GPUS_PER_STUDENT}}"
+          limits:
+            memory: "{{MEMORY_LIMIT_GI}}Gi"
+            nvidia.com/gpu: "{{GPUS_PER_STUDENT}}"
+            rdma/ib: "{{RDMA_PER_STUDENT}}"
+        volumeMounts:
+        - name: runtime
+          mountPath: {{RUNTIME_MOUNT_PATH}}
+        - name: dshm
+          mountPath: /dev/shm
+      volumes:
+      - name: runtime
+        persistentVolumeClaim:
+          claimName: {{PVC_CLAIM_NAME}}
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 64Gi
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: gpu.nvidia.com/model
+                operator: In
+                values:
+                - {{GPU_MODEL}}

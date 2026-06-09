@@ -1,0 +1,53 @@
+# BioReason-Pro Senpai / CoreWeave CKS launch configuration.
+# All scalar fields can be overridden with:
+#   python k8s/launch.py --tag <tag> --field value
+
+# Problem package repository. Advisor/student PRs land here.
+target_repo_url: https://github.com/olachinkei/BioReason-Pro.git
+target_repo_branch: main
+advisor_branch: senpai-bioreason
+
+# Direct BioReason training image. Build from this repo's Dockerfile and push
+# to a registry reachable from the CoreWeave Kubernetes Service namespace.
+image: bioreason-pro-senpai:cuda12.6
+image_pull_policy: IfNotPresent
+
+# Student jobs. The default target is one full H100 node per student.
+n_students: 1
+student_names: frieren
+gpus_per_student: 8
+cpu_per_student: 64
+memory_request_gi: 900
+memory_limit_gi: 960
+rdma_per_student: 1
+gpu_model: H100_NVLINK_80GB
+
+# CoreWeave SUNK scheduler. Find the scheduler name with:
+#   kubectl get pods -l app.kubernetes.io/name=sunk-scheduler -oyaml \
+#     | yq '.items[0].spec.containers[] | select(.name == "scheduler").args'
+sunk_scheduler_name: tenant-slurm-staging-slurm-scheduler
+sunk_account: root
+sunk_partition: h100
+sunk_exclusive: none
+sunk_timeout_minutes: 720
+termination_grace_period_seconds: 10
+
+# Shared storage. This PVC is mounted at runtime_mount_path; mutable state stays
+# below BIOREASON_RUNTIME_ROOT and out of the repository checkout.
+pvc_claim_name: bioreason-runtime-pvc
+runtime_mount_path: /mnt/data
+runtime_root: /mnt/data/bioreason/BioReason-Pro
+
+# Kubernetes Secret that contains wandb-api-key and, optionally, hf-token.
+secret_name: senpai-secrets
+wandb_entity: wandb-healthcare
+wandb_project: bioreasoning-pro
+wandb_mode: online
+
+# Train command defaults. "gate" runs the Senpai baseline + 5-step gate +
+# conditional continuation flow from train.py.
+mode: gate
+gate_steps: 5
+continue_steps: 15
+max_val_samples: 100
+extra_train_args:

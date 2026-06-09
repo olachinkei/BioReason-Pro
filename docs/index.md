@@ -18,7 +18,7 @@ This map is the starting point for humans and coding agents.
 | --- | --- | --- |
 | Design docs | `docs/design-docs/` | Target principles, data-generation design, and benchmark contracts. |
 | Execution plans | `docs/exec-plans/` | Active/completed implementation plans and tech debt. |
-| Runbooks | `docs/runbooks/` | Operational procedures such as CoreWeave usage. |
+| Runbooks | `docs/runbooks/` | Operational procedures such as CoreWeave usage, CKS/SUNK launches, and Docker runtime setup. |
 | References | `docs/references/` | External papers, upstream repositories, and algorithm-to-code mapping. |
 | ADRs | `docs/adr/` | Accepted architectural and process decisions. |
 | Generated docs | `docs/generated/` | Reserved for generated docs. No DB schema is needed today. |
@@ -36,4 +36,6 @@ This map is the starting point for humans and coding agents.
 - Understand the fixed baseline: `BASELINE.md`.
 - Rebuild data artifacts: `docs/design-docs/data-generation.md`.
 - Work on CoreWeave: `docs/runbooks/coreweave-implementation.md`.
+- Launch CKS/SUNK jobs: `docs/runbooks/coreweave-sunk-senpai.md`.
+- Build the Docker image: `docs/runbooks/senpai-docker.md`.
 - Find paper/upstream reference mapping: `docs/references/algorithm-map.md`.
