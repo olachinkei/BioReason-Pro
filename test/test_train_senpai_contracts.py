@@ -91,8 +91,32 @@ class TrainSenpaiContractsTest(unittest.TestCase):
         self.assertEqual(args.continue_steps, 15)
         self.assertEqual(args.primary_metric, "overall_mean_fmax")
         self.assertEqual(args.max_val_samples, 100)
+        self.assertEqual(args.eval_max_new_tokens, 8192)
         self.assertEqual(args.nnodes, 1)
         self.assertEqual(args.gpus_per_node, 8)
+
+    def test_backend_train_command_defaults_are_paper_rollout_shape_with_8k_generation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = TRAIN.parse_senpai_args(["--output_dir", tmpdir, "--wandb_name", "unit/seed"])
+            command = TRAIN.build_backend_train_command(
+                args=args,
+                assets=self.assets(tmpdir),
+                phase="gate",
+                max_steps=5,
+                save_every_n_steps=5,
+                output_dir=Path(tmpdir) / "train-gate",
+            )
+
+        def value_after(flag: str) -> str:
+            return command[command.index(flag) + 1]
+
+        self.assertEqual(value_after("--queries_per_step"), "8")
+        self.assertEqual(value_after("--rollouts_per_query"), "24")
+        self.assertEqual(value_after("--optimizer_micro_batch_size_per_gpu"), "6")
+        self.assertEqual(value_after("--gradient_accumulation_steps"), "4")
+        self.assertEqual(value_after("--max_new_tokens"), "8192")
+        self.assertEqual(value_after("--vllm_max_model_len"), "12288")
+        self.assertEqual(value_after("--vllm_max_num_seqs"), "24")
 
     def test_baseline_mode_emits_baseline_result(self):
         result = self.run_senpai(

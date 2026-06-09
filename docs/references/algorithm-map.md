@@ -22,9 +22,9 @@ branch, read the local files.
 ## Paper Audit Summary
 
 Use `paper-algorithm-details.md` for the section-level algorithm notes. The
-current finding is that the backend RL path matches the paper's DR-GRPO knobs,
-while the Senpai wrapper intentionally reduces rollout count, generated length,
-and microbatching to fit the 1 node x 8 GPU screening target.
+current finding is that the backend RL path and Senpai wrapper match the paper's
+DR-GRPO rollout shape, while the Senpai wrapper uses an approximately 8k-token
+completion budget instead of the paper's 10k budget.
 
 ## Local To External
 

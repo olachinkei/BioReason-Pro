@@ -5231,7 +5231,7 @@ def build_senpai_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gate_steps", "--gate-steps", dest="gate_steps", type=int, default=5)
     parser.add_argument("--continue_steps", "--continue-steps", dest="continue_steps", type=int, default=15)
     parser.add_argument("--max_val_samples", "--max-val-samples", dest="max_val_samples", type=int, default=100)
-    parser.add_argument("--eval_max_new_tokens", "--eval-max-new-tokens", dest="eval_max_new_tokens", type=int, default=4096)
+    parser.add_argument("--eval_max_new_tokens", "--eval-max-new-tokens", dest="eval_max_new_tokens", type=int, default=8192)
     parser.add_argument("--registry_env_file", "--registry-env-file", dest="registry_env_file", type=str, default="configs/disease_benchmark/wandb_registry_paths.env")
     parser.add_argument("--data_manifest_path", "--data-manifest-path", dest="data_manifest_path", type=str, default="configs/disease_benchmark/data_registry.json")
     parser.add_argument("--data_bundle", "--data-bundle", dest="data_bundle", type=str, default="main_production")
@@ -5588,21 +5588,21 @@ def build_backend_train_command(
         "--queries_per_step",
         os.environ.get("SENPAI_QUERIES_PER_STEP", "8"),
         "--rollouts_per_query",
-        os.environ.get("SENPAI_ROLLOUTS_PER_QUERY", "8"),
+        os.environ.get("SENPAI_ROLLOUTS_PER_QUERY", "24"),
         "--optimizer_micro_batch_size_per_gpu",
-        os.environ.get("SENPAI_OPTIMIZER_MICRO_BATCH_SIZE_PER_GPU", "1"),
+        os.environ.get("SENPAI_OPTIMIZER_MICRO_BATCH_SIZE_PER_GPU", "6"),
         "--gradient_accumulation_steps",
-        os.environ.get("SENPAI_GRADIENT_ACCUMULATION_STEPS", "8"),
+        os.environ.get("SENPAI_GRADIENT_ACCUMULATION_STEPS", "4"),
         "--max_new_tokens",
-        os.environ.get("SENPAI_MAX_NEW_TOKENS", "4096"),
+        os.environ.get("SENPAI_MAX_NEW_TOKENS", "8192"),
         "--rollout_logprob_microbatch_size",
         os.environ.get("SENPAI_ROLLOUT_LOGPROB_MICROBATCH_SIZE", "1"),
         "--vllm_gpu_memory_utilization",
         os.environ.get("SENPAI_VLLM_GPU_MEMORY_UTILIZATION", "0.25"),
         "--vllm_max_model_len",
-        os.environ.get("SENPAI_VLLM_MAX_MODEL_LEN", "8192"),
+        os.environ.get("SENPAI_VLLM_MAX_MODEL_LEN", "12288"),
         "--vllm_max_num_seqs",
-        os.environ.get("SENPAI_VLLM_MAX_NUM_SEQS", "8"),
+        os.environ.get("SENPAI_VLLM_MAX_NUM_SEQS", "24"),
         "--vllm_swap_space_gb",
         os.environ.get("SENPAI_VLLM_SWAP_SPACE_GB", "16"),
         "--weave_trace_budget",

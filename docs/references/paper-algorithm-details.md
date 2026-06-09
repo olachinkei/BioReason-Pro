@@ -103,14 +103,17 @@ it is not naturally a per-protein decomposable quantity.
 
 No fatal algorithmic contradiction was found in the branch's core RL path. The
 important caveat is that this branch is a Senpai screening target, not a
-paper-reproduction target. Several defaults are intentionally changed in the
-Senpai wrapper to fit a single 8-GPU node and reduce OOM risk.
+full paper-reproduction target. The Senpai wrapper now keeps the paper rollout
+shape, while using a slightly shorter completion budget for memory headroom.
 
 ### Looks Correct
 
 - The backend RL defaults preserve the paper's DR-GRPO constants: 8 queries,
   24 rollouts, 192 trajectories, clipping values, KL beta, LoRA rank/alpha, and
   completion length.
+- The Senpai wrapper launches the backend with the paper rollout shape:
+  8 queries, 24 rollouts per query, 6 optimizer microbatch, and 4 accumulation
+  steps.
 - The local prompt path includes the paper's main biological context slots:
   organism, InterPro, PPI, and GO-GPT predictions.
 - GO IDs are extracted from the final-answer region and propagated through the
@@ -123,16 +126,9 @@ Senpai wrapper to fit a single 8-GPU node and reduce OOM risk.
 
 ### Intentional Senpai Deviations
 
-- `python train.py` in Senpai mode launches backend training with
-  `SENPAI_ROLLOUTS_PER_QUERY=8` by default, not the paper's 24. This reduces the
-  per-step trajectory count from 192 to 64.
-- Senpai mode defaults `SENPAI_MAX_NEW_TOKENS=4096` and
-  `SENPAI_VLLM_MAX_MODEL_LEN=8192`, below the paper's 10,000-token completion
-  setting. This is an OOM control.
-- Senpai mode uses `optimizer_micro_batch_size_per_gpu=1` and
-  `gradient_accumulation_steps=8`, while the paper RL table reports per-device
-  batch 6 and accumulation 4. This keeps the local trajectory contract valid for
-  the reduced rollout count.
+- Senpai mode defaults `SENPAI_MAX_NEW_TOKENS=8192` and
+  `SENPAI_VLLM_MAX_MODEL_LEN=12288`, below the paper's 10,000-token completion
+  setting but near enough to preserve long reasoning while reducing OOM risk.
 - The branch is fixed to 1 node x 8 GPU. The paper reports 8 H100 GPUs across 2
   nodes; the algorithmic world size is still 8 ranks, but the hardware topology
   differs.
@@ -147,9 +143,8 @@ Senpai wrapper to fit a single 8-GPU node and reduce OOM risk.
   the GO evaluation objective, but Fmax is global-thresholded and not directly
   decomposable per rollout. The local surrogate is reasonable for RL, but it is
   not identical to paper-level Fmax.
-- Senpai's reduced rollout count can make group-relative advantages noisier than
-  the paper setting. A 5-step gate is useful for cheap screening but should not
-  be treated as a final training result.
+- The 5-step gate is useful for cheap screening but should not be treated as a
+  final training result.
 - This branch consumes GO-GPT predictions but does not regenerate them. If the
   `go_pred` source changes, the experiment changes even if `train.py` does not.
 - The paper mentions broader evidence sources such as structure and subcellular
@@ -160,16 +155,15 @@ Senpai wrapper to fit a single 8-GPU node and reduce OOM risk.
 ## Practical Recommendation
 
 For Senpai PRs, keep the current single-node defaults and judge candidates only
-against the frozen local baseline using `overall_mean_fmax`. For paper-faithful
-reproduction, run backend training with the paper-equivalent settings:
+against the frozen local baseline using `overall_mean_fmax`. The defaults keep
+the paper rollout shape and use an approximately 8k-token completion budget. To
+push completion length all the way to the paper's 10k setting, override:
 
 ```bash
-SENPAI_ROLLOUTS_PER_QUERY=24 \
-SENPAI_OPTIMIZER_MICRO_BATCH_SIZE_PER_GPU=6 \
-SENPAI_GRADIENT_ACCUMULATION_STEPS=4 \
 SENPAI_MAX_NEW_TOKENS=10000 \
+SENPAI_VLLM_MAX_MODEL_LEN=12288 \
 python train.py --wandb_name "<name>" --wandb_group "<group>"
 ```
 
-That reproduction-style command is expected to require more memory headroom than
-the default Senpai gate and may need the paper hardware topology.
+The 10k completion setting is expected to require more memory headroom than the
+default Senpai gate and may need further CoreWeave tuning.
