@@ -23,8 +23,9 @@ branch, read the local files.
 
 Use `paper-algorithm-details.md` for the section-level algorithm notes. The
 current finding is that the backend RL path and Senpai wrapper match the paper's
-DR-GRPO rollout shape, while the Senpai wrapper uses an approximately 8k-token
-completion budget instead of the paper's 10k budget.
+DR-GRPO rollout shape. The Senpai wrapper uses an approximately 8k-token
+completion budget instead of the paper's 10k budget, and runs the 24 rollouts
+through a smaller active vLLM window that waits for freed slots.
 
 ## Local To External
 

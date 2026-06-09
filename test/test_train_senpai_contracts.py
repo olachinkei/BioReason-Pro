@@ -116,7 +116,29 @@ class TrainSenpaiContractsTest(unittest.TestCase):
         self.assertEqual(value_after("--gradient_accumulation_steps"), "4")
         self.assertEqual(value_after("--max_new_tokens"), "8192")
         self.assertEqual(value_after("--vllm_max_model_len"), "12288")
-        self.assertEqual(value_after("--vllm_max_num_seqs"), "24")
+        self.assertEqual(value_after("--vllm_max_num_seqs"), "8")
+
+    def test_vllm_max_num_seqs_is_not_upscaled_to_rollout_count(self):
+        args = TRAIN.parse_args(
+            [
+                "--backend_train",
+                "--text_model_name",
+                "/tmp/model",
+                "--target_num_nodes",
+                "1",
+                "--target_gpus_per_node",
+                "8",
+                "--queries_per_step",
+                "8",
+                "--rollouts_per_query",
+                "24",
+                "--vllm_max_num_seqs",
+                "8",
+            ]
+        )
+
+        self.assertEqual(TRAIN.resolve_effective_vllm_max_num_seqs(args), 8)
+        self.assertEqual(TRAIN.resolve_rollout_generation_batch_size(args, 24), 8)
 
     def test_baseline_mode_emits_baseline_result(self):
         result = self.run_senpai(

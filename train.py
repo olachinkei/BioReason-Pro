@@ -1113,20 +1113,18 @@ def resolve_local_rollouts_per_rank(algorithm: AlgorithmSpec, world_size: int) -
 
 
 def resolve_effective_vllm_max_num_seqs(args: argparse.Namespace) -> int:
-    configured = max(int(args.vllm_max_num_seqs), 1)
-    target_world_size = max(int(args.target_num_nodes) * int(args.target_gpus_per_node), 1)
-    queries_per_step = max(int(args.queries_per_step), 1)
-    rollouts_per_query = max(int(args.rollouts_per_query), 1)
-    query_parallel_degree = resolve_query_parallel_degree(target_world_size, queries_per_step)
-    if rollouts_per_query % query_parallel_degree != 0:
-        raise ValueError(
-            "rollouts_per_query must be divisible by query_parallel_degree when resolving "
-            "the effective vLLM max_num_seqs. "
-            f"Got rollouts_per_query={rollouts_per_query}, "
-            f"query_parallel_degree={query_parallel_degree}."
-        )
-    local_rollouts = max(rollouts_per_query // query_parallel_degree, 1)
-    return max(configured, local_rollouts)
+    return max(int(args.vllm_max_num_seqs), 1)
+
+
+def resolve_rollout_generation_batch_size(args: argparse.Namespace, repeat_count: int) -> int:
+    """Number of rollout requests to submit to vLLM at once.
+
+    ``rollouts_per_query`` can be larger than vLLM's active sequence capacity.
+    In that case we generate in blocking chunks: each chunk waits for the
+    previous one to finish before submitting more requests.
+    """
+    configured = resolve_effective_vllm_max_num_seqs(args)
+    return max(1, min(int(repeat_count), configured))
 
 
 def configure_query_parallel_runtime(runtime: DistributedRuntime, algorithm: AlgorithmSpec) -> None:
@@ -3643,6 +3641,44 @@ def build_rollout_multimodal_cache(model: Any, query: PreparedQuery, repeat_coun
     return align_multimodal_cache_to_input_ids(repeated_cache, repeated_input_ids, model)
 
 
+def generate_rollouts_with_waiting_slots(
+    model: Any,
+    query: PreparedQuery,
+    repeat_count: int,
+    sampling: SamplingSpec,
+    *,
+    seed: int,
+    max_active_rollouts: int,
+) -> List[str]:
+    """Generate rollouts in blocking chunks when vLLM has fewer active slots."""
+    outputs: List[str] = []
+    total = max(int(repeat_count), 0)
+    chunk_size = max(int(max_active_rollouts), 1)
+    for start_idx in range(0, total, chunk_size):
+        current_count = min(chunk_size, total - start_idx)
+        rollout_batch = repeat_query_for_rollouts(query, current_count, query.input_ids.device)
+        rollout_multimodal_cache = build_rollout_multimodal_cache(model, query, current_count)
+        chunk_outputs = model.generate(
+            input_ids=rollout_batch["input_ids"],
+            attention_mask=rollout_batch["attention_mask"],
+            protein_sequences=None,
+            batch_idx_map=None,
+            structure_coords=None,
+            go_aspects=None,
+            multimodal_cache=rollout_multimodal_cache,
+            temperature=float(sampling.temperature),
+            top_k=int(sampling.top_k),
+            top_p=float(sampling.top_p),
+            min_p=float(sampling.min_p),
+            repetition_penalty=float(sampling.repetition_penalty),
+            max_new_tokens=int(sampling.max_new_tokens),
+            seed=int(seed) + start_idx,
+            stop=ROLLOUT_STOP_MARKERS,
+        )
+        outputs.extend(normalize_text(output).strip() for output in chunk_outputs)
+    return outputs
+
+
 def tokenize_completion_texts(tokenizer: Any, completions: Sequence[str], device: Any) -> List[Any]:
     require_torch()
     encoded: List[Any] = []
@@ -4055,28 +4091,13 @@ def rollout_worker_process_main(connection: Any, bootstrap: Mapping[str, Any]) -
                     sleeping = False
                 query = query_from_rollout_payload(message["query"])
                 sampling = SamplingSpec(**dict(message["sampling"]))
-                rollout_batch = repeat_query_for_rollouts(query, int(message["repeat_count"]), query.input_ids.device)
-                rollout_multimodal_cache = build_rollout_multimodal_cache(
+                outputs = generate_rollouts_with_waiting_slots(
                     model,
                     query,
                     int(message["repeat_count"]),
-                )
-                outputs = model.generate(
-                    input_ids=rollout_batch["input_ids"],
-                    attention_mask=rollout_batch["attention_mask"],
-                    protein_sequences=None,
-                    batch_idx_map=None,
-                    structure_coords=None,
-                    go_aspects=None,
-                    multimodal_cache=rollout_multimodal_cache,
-                    temperature=float(sampling.temperature),
-                    top_k=int(sampling.top_k),
-                    top_p=float(sampling.top_p),
-                    min_p=float(sampling.min_p),
-                    repetition_penalty=float(sampling.repetition_penalty),
-                    max_new_tokens=int(sampling.max_new_tokens),
+                    sampling,
                     seed=int(message.get("seed", getattr(args, "seed", 0))),
-                    stop=ROLLOUT_STOP_MARKERS,
+                    max_active_rollouts=resolve_rollout_generation_batch_size(args, int(message["repeat_count"])),
                 )
                 if resolve_effective_vllm_sleep_mode(args) and hasattr(model, "sleep"):
                     model.sleep(level=int(args.vllm_sleep_level))
@@ -4314,24 +4335,13 @@ class VLLMRolloutWorker:
             return [normalize_text(output).strip() for output in response.get("outputs", [])]
         if self.model is None:
             self._load(self.checkpoint_dir)
-        rollout_batch = repeat_query_for_rollouts(query, repeat_count, query.input_ids.device)
-        rollout_multimodal_cache = build_rollout_multimodal_cache(self.model, query, repeat_count)
-        outputs = self.model.generate(
-            input_ids=rollout_batch["input_ids"],
-            attention_mask=rollout_batch["attention_mask"],
-            protein_sequences=None,
-            batch_idx_map=None,
-            structure_coords=None,
-            go_aspects=None,
-            multimodal_cache=rollout_multimodal_cache,
-            temperature=float(sampling.temperature),
-            top_k=int(sampling.top_k),
-            top_p=float(sampling.top_p),
-            min_p=float(sampling.min_p),
-            repetition_penalty=float(sampling.repetition_penalty),
-            max_new_tokens=int(sampling.max_new_tokens),
+        outputs = generate_rollouts_with_waiting_slots(
+            self.model,
+            query,
+            repeat_count,
+            sampling,
             seed=generation_seed,
-            stop=ROLLOUT_STOP_MARKERS,
+            max_active_rollouts=resolve_rollout_generation_batch_size(self.args, repeat_count),
         )
         return [normalize_text(output).strip() for output in outputs]
 
@@ -5602,7 +5612,7 @@ def build_backend_train_command(
         "--vllm_max_model_len",
         os.environ.get("SENPAI_VLLM_MAX_MODEL_LEN", "12288"),
         "--vllm_max_num_seqs",
-        os.environ.get("SENPAI_VLLM_MAX_NUM_SEQS", "24"),
+        os.environ.get("SENPAI_VLLM_MAX_NUM_SEQS", "8"),
         "--vllm_swap_space_gb",
         os.environ.get("SENPAI_VLLM_SWAP_SPACE_GB", "16"),
         "--weave_trace_budget",

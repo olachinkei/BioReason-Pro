@@ -114,6 +114,10 @@ shape, while using a slightly shorter completion budget for memory headroom.
 - The Senpai wrapper launches the backend with the paper rollout shape:
   8 queries, 24 rollouts per query, 6 optimizer microbatch, and 4 accumulation
   steps.
+- The 24 rollouts are generated through a smaller active vLLM window by default:
+  `SENPAI_VLLM_MAX_NUM_SEQS=8`. The trainer submits rollout chunks
+  sequentially, waiting for a chunk to finish before using the freed slots for
+  the next chunk.
 - The local prompt path includes the paper's main biological context slots:
   organism, InterPro, PPI, and GO-GPT predictions.
 - GO IDs are extracted from the final-answer region and propagated through the
@@ -126,9 +130,10 @@ shape, while using a slightly shorter completion budget for memory headroom.
 
 ### Intentional Senpai Deviations
 
-- Senpai mode defaults `SENPAI_MAX_NEW_TOKENS=8192` and
-  `SENPAI_VLLM_MAX_MODEL_LEN=12288`, below the paper's 10,000-token completion
-  setting but near enough to preserve long reasoning while reducing OOM risk.
+- Senpai mode defaults `SENPAI_MAX_NEW_TOKENS=8192`,
+  `SENPAI_VLLM_MAX_MODEL_LEN=12288`, and active vLLM slots of 8. The completion
+  budget is below the paper's 10,000-token setting but near enough to preserve
+  long reasoning while reducing OOM risk.
 - The branch is fixed to 1 node x 8 GPU. The paper reports 8 H100 GPUs across 2
   nodes; the algorithmic world size is still 8 ranks, but the hardware topology
   differs.
