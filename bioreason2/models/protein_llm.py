@@ -301,7 +301,7 @@ class ProteinLLMModel(nn.Module):
         )
 
         # Initialize all models in eval mode with frozen parameters by default
-        # Training setup will be handled by train_protein_llm.py
+        # Training setup is handled by the root train.py entrypoint.
         self._setup_default_eval_mode()
 
         # Create processor for handling inputs
@@ -310,7 +310,7 @@ class ProteinLLMModel(nn.Module):
     def _setup_default_eval_mode(self):
         """
         Set all model components to eval mode with frozen parameters by default.
-        Training setup will be handled by train_protein_llm.py.
+        Training setup is handled by the root train.py entrypoint.
         """
         # Text model: eval mode, frozen
         self.text_model.eval()

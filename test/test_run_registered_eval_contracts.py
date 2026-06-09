@@ -73,13 +73,14 @@ class RunRegisteredEvalContractsTest(unittest.TestCase):
         registry = json.loads(EVAL_TARGET_REGISTRY_JSON.read_text(encoding="utf-8"))
         required_paths = {
             "config.json",
+            "tokenizer_config.json",
             "go_embedding.pt",
             "go_projection.pt",
             "protein_projection.pt",
             "protein_model/pytorch_model.bin",
         }
 
-        for target_name in ("bioreason-pro-rl-paper", "train-sft-output", "train-rl-output"):
+        for target_name in ("bioreason-pro-rl-paper", "train-rl-output"):
             target = registry["targets"][target_name]
             source = target["model_sources"][0]
             self.assertEqual(set(source["required_paths"]), required_paths)

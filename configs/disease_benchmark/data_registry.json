@@ -2,7 +2,7 @@
   "default_bundle": "main_production",
   "bundles": {
     "main_production": {
-      "display_name": "213-start main production bundle",
+      "display_name": "Senpai production validation bundle",
       "benchmark_version": "train=213->225, future=225->228, dev=200, holdout=400",
       "benchmark_alias": "213.221.225.228",
       "shortlist_mode": "high-confidence",
@@ -30,40 +30,6 @@
       "ia_file": {
         "wandb_registry_path": "${BIOREASON_MAIN_IA_REGISTRY_PATH}",
         "local_dir": "data/artifacts/benchmarks/213_221_225_228/temporal_split",
-        "required_paths": [
-          "IA.txt"
-        ]
-      }
-    },
-    "comparison_214_start": {
-      "display_name": "214-start comparison bundle",
-      "benchmark_version": "214 -> 221 -> 225 -> 228",
-      "benchmark_alias": "214.221.225.228",
-      "shortlist_mode": "high-confidence",
-      "shortlist_query": "reviewed:true AND organism_id:9606 AND cc_disease:* AND (xref:mim-* OR xref:orphanet-*) AND (go_exp:* OR go_ida:* OR go_ipi:* OR go_igi:* OR go_imp:* OR go_iep:* OR go_ic:* OR go_tas:*)",
-      "releases": {
-        "train_start": 214,
-        "train_end": 221,
-        "dev_end": 225,
-        "test_end": 228
-      },
-      "temporal_split_artifact": {
-        "wandb_registry_path": "${BIOREASON_COMPARISON_TEMPORAL_SPLIT_REGISTRY_PATH}",
-        "local_dir": "data/artifacts/benchmarks/214_221_225_228/temporal_split",
-        "required_paths": [
-          "summary.json",
-          "report.md"
-        ]
-      },
-      "reasoning_dataset": {
-        "wandb_registry_path": "${BIOREASON_COMPARISON_REASONING_DATASET_REGISTRY_PATH}",
-        "local_dir": "data/artifacts/datasets/disease_temporal_hc_reasoning_v2/214_221_225_228",
-        "dataset_source": "wanglab/cafa5",
-        "dataset_name": "disease_temporal_hc_reasoning_v2"
-      },
-      "ia_file": {
-        "wandb_registry_path": "${BIOREASON_COMPARISON_IA_REGISTRY_PATH}",
-        "local_dir": "data/artifacts/benchmarks/214_221_225_228/temporal_split",
         "required_paths": [
           "IA.txt"
         ]
