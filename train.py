@@ -5349,6 +5349,8 @@ def configure_senpai_runtime_env(args: argparse.Namespace) -> Dict[str, str]:
     env.setdefault("HF_DATASETS_CACHE", str(cache_root / "huggingface" / "datasets"))
     env.setdefault("XDG_CACHE_HOME", str(cache_root / "xdg"))
     env.setdefault("TRITON_CACHE_DIR", str(cache_root / "triton"))
+    env.setdefault("TORCHINDUCTOR_CACHE_DIR", str(cache_root / "torch_inductor"))
+    env.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "4")
     env.setdefault("TMPDIR", str(runtime_root / "tmp"))
     for key in (
         "BIOREASON_ARTIFACTS_ROOT",
@@ -5360,6 +5362,7 @@ def configure_senpai_runtime_env(args: argparse.Namespace) -> Dict[str, str]:
         "HF_DATASETS_CACHE",
         "XDG_CACHE_HOME",
         "TRITON_CACHE_DIR",
+        "TORCHINDUCTOR_CACHE_DIR",
         "TMPDIR",
     ):
         Path(env[key]).mkdir(parents=True, exist_ok=True)
