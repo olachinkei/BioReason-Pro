@@ -16,4 +16,4 @@ Do not copy the global skill into this repository.
 
 ## Consequences
 
-The repo documents operational steps in `docs/coreweave-implementation.md`, while reusable cluster behavior stays global. This avoids polluting the Senpai target with local agent skill files.
+The repo documents operational steps in `docs/runbooks/coreweave-implementation.md`, while reusable cluster behavior stays global. This avoids polluting the Senpai target with local agent skill files.

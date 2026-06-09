@@ -13,7 +13,7 @@ artifacts were generated.
 ## Decision
 
 Keep data-generation code under `scripts/data_generation/` and document its
-usage in `docs/data-generation.md`. The scripts rebuild generated artifacts but
+usage in `docs/design-docs/data-generation.md`. The scripts rebuild generated artifacts but
 do not act as training launchers.
 
 ## Consequences
