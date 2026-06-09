@@ -56,6 +56,8 @@ class TrainSenpaiContractsTest(unittest.TestCase):
             def fake_eval(**kwargs):
                 payload = eval_payloads.pop(0)
                 metrics_path = Path(kwargs["output_dir"]) / "cafa_metrics" / "metrics_summary.json"
+                if payload == "raise_eval_error":
+                    raise TRAIN.SenpaiEvalPhaseError("validation failed before metrics", metrics_path)
                 metrics_path.parent.mkdir(parents=True, exist_ok=True)
                 metrics_path.write_text(json.dumps(payload), encoding="utf-8")
                 return payload, metrics_path
@@ -145,6 +147,21 @@ class TrainSenpaiContractsTest(unittest.TestCase):
         self.assertEqual(result["train_calls"], 1)
         self.assertFalse(result["summary"]["improved_after_gate"])
         self.assertIsNone(result["summary"]["gate_value"])
+        self.assertEqual(result["result"]["primary_metric"]["value"], 0.0)
+
+    def test_gate_eval_failure_without_metrics_is_terminal_negative_result(self):
+        result = self.run_senpai(
+            [],
+            eval_payloads=[
+                {"overall_mean_fmax": 0.50},
+                "raise_eval_error",
+            ],
+            train_payloads=[{"run_id": "gate123"}],
+        )
+        self.assertEqual(result["train_calls"], 1)
+        self.assertFalse(result["summary"]["improved_after_gate"])
+        self.assertIsNone(result["summary"]["gate_value"])
+        self.assertIn("gate_eval_error", result["summary"])
         self.assertEqual(result["result"]["primary_metric"]["value"], 0.0)
 
     def test_checkpoint_export_mode_is_available_to_backend(self):

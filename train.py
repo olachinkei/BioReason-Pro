@@ -5397,6 +5397,12 @@ def run_capture(command: Sequence[str], env: Mapping[str, str]) -> str:
     return output.splitlines()[-1].strip() if output else ""
 
 
+class SenpaiEvalPhaseError(RuntimeError):
+    def __init__(self, message: str, metrics_path: Path):
+        super().__init__(message)
+        self.metrics_path = metrics_path
+
+
 def resolve_senpai_assets(args: argparse.Namespace, env: Mapping[str, str]) -> Dict[str, str]:
     maybe_load_registry_env(args)
     resolver_env = dict(env)
@@ -5550,7 +5556,16 @@ def run_eval_phase(
         metrics_path.parent.mkdir(parents=True, exist_ok=True)
         save_json(metrics_path, {args.primary_metric: 0.0, "dry_run": True})
     else:
-        subprocess.run(["bash", "scripts/sh_eval.sh"], cwd=Path.cwd(), env=eval_env, check=True)
+        try:
+            subprocess.run(["bash", "scripts/sh_eval.sh"], cwd=Path.cwd(), env=eval_env, check=True)
+        except subprocess.CalledProcessError as exc:
+            metrics_path = find_metrics_summary(output_dir)
+            if metrics_path.exists():
+                return load_metrics_file(metrics_path), metrics_path
+            raise SenpaiEvalPhaseError(
+                f"Validation subprocess failed before writing metrics: {metrics_path}",
+                metrics_path,
+            ) from exc
     metrics_path = find_metrics_summary(output_dir)
     return load_metrics_file(metrics_path), metrics_path
 
@@ -5788,15 +5803,21 @@ def senpai_main(argv: Optional[Sequence[str]] = None) -> None:
         save_every_n_steps=int(args.gate_steps),
         output_dir=gate_output_dir,
     )
-    gate_metrics, gate_metrics_path = run_eval_phase(
-        args=args,
-        env=env,
-        assets=assets,
-        model_path=gate_checkpoint / "inference_export",
-        output_dir=run_root / "eval-gate",
-        run_name=f"{args.wandb_name}-gate-val",
-        model_name=f"{args.wandb_name}-gate",
-    )
+    gate_eval_error = ""
+    try:
+        gate_metrics, gate_metrics_path = run_eval_phase(
+            args=args,
+            env=env,
+            assets=assets,
+            model_path=gate_checkpoint / "inference_export",
+            output_dir=run_root / "eval-gate",
+            run_name=f"{args.wandb_name}-gate-val",
+            model_name=f"{args.wandb_name}-gate",
+        )
+    except SenpaiEvalPhaseError as exc:
+        gate_metrics = {}
+        gate_metrics_path = exc.metrics_path
+        gate_eval_error = str(exc)
     gate_value = read_metric(gate_metrics, args.primary_metric)
     improved = gate_value is not None and gate_value > baseline_value
     run_ids = [gate_run_id] if gate_run_id else []
@@ -5809,6 +5830,8 @@ def senpai_main(argv: Optional[Sequence[str]] = None) -> None:
         "primary_metric": args.primary_metric,
         "improved_after_gate": improved,
     }
+    if gate_eval_error:
+        summary["gate_eval_error"] = gate_eval_error
 
     if args.mode == "gate" or not improved or int(args.continue_steps) <= 0:
         save_json(run_root / "senpai_summary.json", summary)
@@ -5837,15 +5860,21 @@ def senpai_main(argv: Optional[Sequence[str]] = None) -> None:
     )
     if continue_run_id:
         run_ids.append(continue_run_id)
-    continue_metrics, continue_metrics_path = run_eval_phase(
-        args=args,
-        env=env,
-        assets=assets,
-        model_path=continue_checkpoint / "inference_export",
-        output_dir=run_root / "eval-continue",
-        run_name=f"{args.wandb_name}-continue-val",
-        model_name=f"{args.wandb_name}-continue",
-    )
+    continue_eval_error = ""
+    try:
+        continue_metrics, continue_metrics_path = run_eval_phase(
+            args=args,
+            env=env,
+            assets=assets,
+            model_path=continue_checkpoint / "inference_export",
+            output_dir=run_root / "eval-continue",
+            run_name=f"{args.wandb_name}-continue-val",
+            model_name=f"{args.wandb_name}-continue",
+        )
+    except SenpaiEvalPhaseError as exc:
+        continue_metrics = {}
+        continue_metrics_path = exc.metrics_path
+        continue_eval_error = str(exc)
     continue_value = read_metric(continue_metrics, args.primary_metric)
     best_value = max(value for value in (gate_value, continue_value) if value is not None)
     summary.update(
@@ -5857,6 +5886,8 @@ def senpai_main(argv: Optional[Sequence[str]] = None) -> None:
             "best_step": total_steps if continue_value is not None and continue_value >= (gate_value or -1.0) else int(args.gate_steps),
         }
     )
+    if continue_eval_error:
+        summary["continue_eval_error"] = continue_eval_error
     save_json(run_root / "senpai_summary.json", summary)
     emit_senpai_result(
         terminal=True,
