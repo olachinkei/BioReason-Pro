@@ -1843,69 +1843,6 @@ def compute_per_aspect_weighted_f1_components(
     return component_scores
 
 
-def compute_per_aspect_weighted_f1_components(
-    predicted: Iterable[str],
-    target: Iterable[str],
-    ia_weights: Mapping[str, float],
-    go_aspects: Mapping[str, str],
-) -> Dict[str, Optional[float]]:
-    """Return per-aspect IA-weighted F1 components for BP/MF/CC."""
-    predicted_set = set(predicted)
-    target_set = set(target)
-    component_scores: Dict[str, Optional[float]] = {}
-    for aspect in GO_ASPECTS:
-        aspect_key = GO_ASPECT_SHORT_KEYS[aspect]
-        aspect_pred = {gid for gid in predicted_set if go_aspects.get(gid) == aspect}
-        aspect_target = {gid for gid in target_set if go_aspects.get(gid) == aspect}
-        if not aspect_target:
-            component_scores[aspect_key] = None
-            continue
-        component_scores[aspect_key] = compute_weighted_f1(aspect_pred, aspect_target, ia_weights)
-    return component_scores
-
-
-def compute_per_aspect_weighted_f1_components(
-    predicted: Iterable[str],
-    target: Iterable[str],
-    ia_weights: Mapping[str, float],
-    go_aspects: Mapping[str, str],
-) -> Dict[str, Optional[float]]:
-    """Return per-aspect IA-weighted F1 components for BP/MF/CC."""
-    predicted_set = set(predicted)
-    target_set = set(target)
-    component_scores: Dict[str, Optional[float]] = {}
-    for aspect in GO_ASPECTS:
-        aspect_key = GO_ASPECT_SHORT_KEYS[aspect]
-        aspect_pred = {gid for gid in predicted_set if go_aspects.get(gid) == aspect}
-        aspect_target = {gid for gid in target_set if go_aspects.get(gid) == aspect}
-        if not aspect_target:
-            component_scores[aspect_key] = None
-            continue
-        component_scores[aspect_key] = compute_weighted_f1(aspect_pred, aspect_target, ia_weights)
-    return component_scores
-
-
-def compute_per_aspect_weighted_f1_components(
-    predicted: Iterable[str],
-    target: Iterable[str],
-    ia_weights: Mapping[str, float],
-    go_aspects: Mapping[str, str],
-) -> Dict[str, Optional[float]]:
-    """Return per-aspect IA-weighted F1 components for BP/MF/CC."""
-    predicted_set = set(predicted)
-    target_set = set(target)
-    component_scores: Dict[str, Optional[float]] = {}
-    for aspect in GO_ASPECTS:
-        aspect_key = GO_ASPECT_SHORT_KEYS[aspect]
-        aspect_pred = {gid for gid in predicted_set if go_aspects.get(gid) == aspect}
-        aspect_target = {gid for gid in target_set if go_aspects.get(gid) == aspect}
-        if not aspect_target:
-            component_scores[aspect_key] = None
-            continue
-        component_scores[aspect_key] = compute_weighted_f1(aspect_pred, aspect_target, ia_weights)
-    return component_scores
-
-
 def compute_ancestor_jaccard(predicted: Iterable[str], target: Iterable[str]) -> float:
     """Jaccard similarity of two (propagated) GO term sets.
 

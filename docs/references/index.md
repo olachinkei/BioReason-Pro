@@ -5,6 +5,7 @@ Use this directory to connect external sources to local implementation surfaces.
 ## External Sources
 
 - `bioreason-pro-paper.md`: full paper and DOI reference.
+- `paper-algorithm-details.md`: paper-derived algorithm details and local audit.
 - `upstream-inference.md`: upstream public inference repository reference.
 
 ## Local Mapping

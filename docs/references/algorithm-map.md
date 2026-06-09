@@ -8,7 +8,7 @@ branch, read the local files.
 
 | Concept | External Reference | Local Surface |
 | --- | --- | --- |
-| BioReason-Pro method and evaluation | `docs/references/bioreason-pro-paper.md` | `train.py`, `eval.py`, `evals/` |
+| BioReason-Pro method and evaluation | `docs/references/bioreason-pro-paper.md`, `docs/references/paper-algorithm-details.md` | `train.py`, `eval.py`, `evals/` |
 | Upstream inference path | `docs/references/upstream-inference.md` | Not packaged here; local evaluation uses `eval.py` and `scripts/sh_eval.sh`. |
 | GO-GPT predictions as prompt context | Full paper and upstream inference repo | Dataset columns such as `go_pred`; prompt formatting in `bioreason2/dataset/cafa5/load.py`. |
 | Biological context slots | Full paper | `interpro_formatted`, `ppi_formatted`, and related prompt formatting in `bioreason2/dataset/cafa5/load.py`. |
@@ -18,6 +18,13 @@ branch, read the local files.
 | Disease temporal split artifact | Local reproducibility code | `scripts/data_generation/build_temporal_split_artifact.py`. |
 | IA weights | CAFA-style metric framing | `scripts/data_generation/build_ia_weights.py`, `evals/`, `train.py`. |
 | CoreWeave runtime boundary | Local operational decision | `docs/runbooks/coreweave-implementation.md`, `docs/adr/0003-coreweave-runtime-boundary.md`. |
+
+## Paper Audit Summary
+
+Use `paper-algorithm-details.md` for the section-level algorithm notes. The
+current finding is that the backend RL path matches the paper's DR-GRPO knobs,
+while the Senpai wrapper intentionally reduces rollout count, generated length,
+and microbatching to fit the 1 node x 8 GPU screening target.
 
 ## Local To External
 
