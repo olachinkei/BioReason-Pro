@@ -1,0 +1,48 @@
+# Local secrets and editor files
+.env
+configs/disease_benchmark/wandb_registry_paths.env
+configs/disease_benchmark/wandb_asset_sources.env
+.DS_Store
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+.venv*/
+env/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage*
+
+# Senpai / BioReason runtime outputs
+data/artifacts/
+wandb/
+runtime_logs/
+checkpoints/
+eval_outputs/
+evals/results/
+trainer_output/
+outputs/
+tmp/
+tmp_wandb_*/
+
+# Caches and generated model/data artifacts
+*cache*/
+*.pt
+*.safetensors
+*.arrow
+*.gaf
+*.tsv
+*.out
+*.err
+_unsloth_temporary_saved_buffers/
+
+# Node/npm leftovers
+node_modules/
+.npm-cache/
